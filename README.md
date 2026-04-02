@@ -4,19 +4,6 @@ Lightweight experiment tracking — drop-in compatible with TensorBoard and W&B 
 
 No cloud. No account. No signup. Just a single SQLite file.
 
-## Why vibetrack?
-
-| | TensorBoard | W&B | vibetrack |
-|---|---|---|---|
-| Storage | tfevents files | Cloud (paid tiers) | Single SQLite DB |
-| Account required | No | Yes | No |
-| AI agent integration (MCP) | No | No | Built-in |
-| Distributed torchrun support | Manual | Manual | Automatic (rank-0 only) |
-| Single-port server (web + API + ingest) | No | N/A | Yes |
-| Viewer backends | Web only | Web only | Web, Gradio, Telegram, Console, MCP |
-| System metrics | Via plugin | Built-in | Built-in (CPU, GPU, memory, disk) |
-| Remote HTTP logging | No | Yes (cloud) | Yes (self-hosted, token auth) |
-| Zero mandatory dependencies | No | No | Yes |
 
 ## Install
 
@@ -134,17 +121,6 @@ compare_scalars(experiments, "loss", smoothing="ema", weight=0.6)
 
 # Side-by-side hyperparameter comparison
 compare_hparams(experiments)
-```
-
-### Smoothing
-
-```python
-from vibetrack import smooth, ema, moving_average, gaussian
-
-smoothed = ema(values, weight=0.6)           # Exponential moving average
-smoothed = moving_average(values, window=10)  # Uniform window
-smoothed = gaussian(values, sigma=2.0)        # Gaussian kernel
-smoothed = smooth(values, method="ema", weight=0.6)  # Unified dispatcher
 ```
 
 ## Distributed training (torchrun)

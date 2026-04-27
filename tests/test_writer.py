@@ -1,6 +1,7 @@
 """Tests for SummaryWriter — TensorBoard & W&B API compatibility."""
 
 import os
+import time
 import threading
 from pathlib import Path
 from unittest import mock
@@ -112,7 +113,9 @@ class TestSummaryWriter:
 
     def test_buffering(self, log_dir):
         """Scalars are buffered and flushed in bulk."""
-        w = SummaryWriter(log_dir, max_queue=5, project_folder=str(Path(log_dir).parent))
+        w = SummaryWriter(
+            log_dir, max_queue=5, project_folder=str(Path(log_dir).parent)
+        )
         for i in range(4):
             w.add_scalar("x", float(i), i)
         db = _open_project_db(log_dir)
@@ -158,7 +161,9 @@ class TestSummaryWriter:
 
     def test_flush_is_compatibility_noop(self, log_dir):
         """flush() should not force buffered scalars into the DB."""
-        w = SummaryWriter(log_dir, max_queue=1000, project_folder=str(Path(log_dir).parent))
+        w = SummaryWriter(
+            log_dir, max_queue=1000, project_folder=str(Path(log_dir).parent)
+        )
         for i in range(5):
             w.add_scalar("loss", float(i), i)
         w.flush()
@@ -169,6 +174,25 @@ class TestSummaryWriter:
         w.close()
         rows = db.get_scalars(exp["id"], "loss")
         assert len(rows) == 5
+        db.close()
+
+    def test_flush_timer_writes_buffered_scalars(self, log_dir):
+        """Periodic flush should persist buffered scalars without close()."""
+        w = SummaryWriter(
+            log_dir,
+            max_queue=1000,
+            flush_secs=0.1,
+            project_folder=str(Path(log_dir).parent),
+        )
+        w.add_scalar("loss", 1.0, 0)
+        time.sleep(0.3)
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("test_run")
+        rows = db.get_scalars(exp["id"], "loss")
+        assert len(rows) == 1
+        assert rows[0]["value"] == 1.0
+        w.close()
         db.close()
 
     def test_global_step_per_tag_independent(self, log_dir):
@@ -316,7 +340,9 @@ class TestPrecacheWriter:
 
 
 class TestModuleAPI:
-    def test_init_log_finish_uses_central_db_for_current_project(self, tmp_path, monkeypatch):
+    def test_init_log_finish_uses_central_db_for_current_project(
+        self, tmp_path, monkeypatch
+    ):
         import vibetrack
 
         central_db = tmp_path / ".vibetrack" / "vibetrack.db"
@@ -427,3 +453,189 @@ class TestModuleAPI:
         _cleanup_active_writer(vibetrack)
         vibetrack.finish()
         vibetrack.log({"loss": 0.5})
+
+
+class TestResumeRestart:
+    """Test hybrid resume/restart detection for same-name experiments."""
+
+    def test_restart_detection(self, tmp_path):
+        """Same name + overlapping steps → auto-rename to 'exp (2)'."""
+        pf = str(tmp_path)
+        w1 = SummaryWriter(
+            str(tmp_path / "exp"),
+            name="exp",
+            project_folder=pf,
+            system_metrics_interval=0,
+        )
+        for i in range(5):
+            w1.add_scalar("loss", 1.0 / (i + 1), i)
+        w1.close()
+
+        w2 = SummaryWriter(
+            str(tmp_path / "exp"),
+            name="exp",
+            project_folder=pf,
+            system_metrics_interval=0,
+        )
+        w2.add_scalar("loss", 0.9, 0)  # step 0 <= max existing step 4 → restart
+        w2.close()
+
+        assert w2.run_name == "exp (2)"
+
+        reader = RunReader(pf)
+        names = {e.name for e in reader.experiments()}
+        assert names == {"exp", "exp (2)"}
+        reader.close()
+
+    def test_resume_detection(self, tmp_path):
+        """Same name + non-overlapping steps → resume (append)."""
+        pf = str(tmp_path)
+        w1 = SummaryWriter(
+            str(tmp_path / "exp"),
+            name="exp",
+            project_folder=pf,
+            system_metrics_interval=0,
+        )
+        for i in range(5):
+            w1.add_scalar("loss", 1.0 / (i + 1), i)
+        w1.close()
+
+        w2 = SummaryWriter(
+            str(tmp_path / "exp"),
+            name="exp",
+            project_folder=pf,
+            system_metrics_interval=0,
+        )
+        w2.add_scalar("loss", 0.05, 5)  # step 5 > max existing step 4 → resume
+        w2.close()
+
+        assert w2.run_name == "exp"
+
+        reader = RunReader(pf)
+        names = {e.name for e in reader.experiments()}
+        assert names == {"exp"}
+        exp = next(e for e in reader.experiments() if e.name == "exp")
+        rows = exp.scalars("loss")
+        assert len(rows) == 6  # 5 from w1 + 1 from w2
+        reader.close()
+
+    def test_restart_suffix_increment(self, tmp_path):
+        """Multiple restarts increment suffix: exp, exp (2), exp (3)."""
+        pf = str(tmp_path)
+        for _ in range(3):
+            w = SummaryWriter(
+                str(tmp_path / "exp"),
+                name="exp",
+                project_folder=pf,
+                system_metrics_interval=0,
+            )
+            w.add_scalar("loss", 0.5, 0)
+            w.close()
+
+        reader = RunReader(pf)
+        names = sorted(e.name for e in reader.experiments())
+        assert names == ["exp", "exp (2)", "exp (3)"]
+        reader.close()
+
+    def test_resume_empty_experiment(self, tmp_path):
+        """Existing experiment with no data → resume (not restart)."""
+        pf = str(tmp_path)
+        w1 = SummaryWriter(
+            str(tmp_path / "exp"),
+            name="exp",
+            project_folder=pf,
+            system_metrics_interval=0,
+        )
+        # Don't write any data, just create the experiment row
+        w1.close()
+
+        w2 = SummaryWriter(
+            str(tmp_path / "exp"),
+            name="exp",
+            project_folder=pf,
+            system_metrics_interval=0,
+        )
+        w2.add_scalar("loss", 0.5, 0)
+        w2.close()
+
+        assert w2.run_name == "exp"
+
+        reader = RunReader(pf)
+        names = {e.name for e in reader.experiments()}
+        assert names == {"exp"}
+        reader.close()
+
+    def test_restart_uses_isolated_log_dir(self, tmp_path):
+        """Restart must write media into its own log_dir, not the sibling's.
+
+        Otherwise deleting one sibling in the web UI would rmtree the other's
+        files, and same-step writes (e.g. image at step=0) would collide.
+        """
+        import shutil
+
+        pf = str(tmp_path)
+        src = tmp_path / "seed.png"
+        src.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+        # First run: log an image at step 0
+        w1 = SummaryWriter(
+            str(tmp_path / "exp"),
+            name="exp",
+            project_folder=pf,
+            system_metrics_interval=0,
+        )
+        w1.add_image("samples", str(src), global_step=0)
+        w1.close()
+
+        first_file = tmp_path / "exp" / "media" / "samples" / "0.png"
+        assert first_file.exists()
+
+        # Second run: same name + same step → restart ("exp (2)")
+        w2 = SummaryWriter(
+            str(tmp_path / "exp"),
+            name="exp",
+            project_folder=pf,
+            system_metrics_interval=0,
+        )
+        w2.add_image("samples", str(src), global_step=0)
+        w2.close()
+
+        assert w2.run_name == "exp (2)"
+        assert w2.log_dir.endswith("exp (2)")
+
+        # Each experiment has its own log_dir and its own media folder
+        second_file = (
+            Path(str(tmp_path / "exp") + " (2)") / "media" / "samples" / "0.png"
+        )
+        assert second_file.exists()
+        assert first_file.exists()  # original untouched
+
+        # Simulate web UI deleting the first experiment: rmtree its media dir
+        shutil.rmtree(str(tmp_path / "exp" / "media"))
+
+        # The sibling's files must still be there
+        assert second_file.exists()
+
+    def test_restart_suffix_follows_name(self, tmp_path):
+        """Third restart → log_dir should be 'exp (3)', mirroring the name."""
+        pf = str(tmp_path)
+        for _ in range(3):
+            w = SummaryWriter(
+                str(tmp_path / "exp"),
+                name="exp",
+                project_folder=pf,
+                system_metrics_interval=0,
+            )
+            w.add_scalar("loss", 0.5, 0)
+            w.close()
+
+        # Names are "exp", "exp (2)", "exp (3)"; log_dirs should match
+        log_dirs = {
+            str(tmp_path / "exp"),
+            str(tmp_path / "exp") + " (2)",
+            str(tmp_path / "exp") + " (3)",
+        }
+        reader = RunReader(pf)
+        actual = {e.log_dir for e in reader.experiments()}
+        assert actual == log_dirs
+        reader.close()

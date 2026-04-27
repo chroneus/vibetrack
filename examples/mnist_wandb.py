@@ -15,16 +15,23 @@ from torch.utils.data import DataLoader
 import vibetrack as wandb
 
 
-run = wandb.init(project="mnist",config={"lr": 1e-3, "batch_size": 64, "epochs": 5, "optimizer": "AdamW"})
+run = wandb.init(
+    project="mnist",
+    config={"lr": 1e-3, "batch_size": 64, "epochs": 5, "optimizer": "AdamW"},
+)
 
 
 # 2. Data
-transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
+transform = transforms.Compose(
+    [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+)
 train_dataset = datasets.MNIST("./data", train=True, download=True, transform=transform)
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 
 # 3. Model
-model = nn.Sequential(nn.Flatten(), nn.Linear(28 * 28, 128), nn.ReLU(), nn.Linear(128, 10))
+model = nn.Sequential(
+    nn.Flatten(), nn.Linear(28 * 28, 128), nn.ReLU(), nn.Linear(128, 10)
+)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
@@ -52,10 +59,12 @@ for epoch in range(5):
                 preds = output[:8].argmax(dim=1)
                 grid = make_grid(data[:8].cpu(), nrow=4, normalize=True)
                 caption = "preds: " + " ".join(str(p.item()) for p in preds)
-                run.log({
-                    "train/samples": wandb.Image(grid),
-                    "train/predictions": caption,
-                })
+                run.log(
+                    {
+                        "train/samples": wandb.Image(grid),
+                        "train/predictions": caption,
+                    }
+                )
 
     print(f"Epoch {epoch+1}/5 done")
 

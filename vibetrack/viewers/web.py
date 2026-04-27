@@ -1,23 +1,43 @@
 """Standalone web UI with interactive Chart.js graphs and media viewers.
 
-Requires: ``pip install vibetrack[web]``  (fastapi, uvicorn)
+Requires the base ``vibetrack`` install. MCP mounting is enabled when the
+optional MCP dependency is installed via ``vibetrack[all]`` on Python 3.10+.
+
+The browser-facing assets live under ``viewers/web/``:
+
+- ``index.html``  — HTML shell (placeholders for injected JSON)
+- ``css/style.css``
+- ``js/*.js``     — split into core/charts/pills/media/settings/main
+
+They are served as static files at ``/static/*``; the index template has three
+string placeholders (``__DATA_JSON__``, ``__PROJECT_JSON__``, ``__PROJECTS_JSON__``)
+replaced at render time.
 """
 
+import functools
+import hmac
 import json
+import logging
 import os
+import shutil
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from ..compare import find_all_tags
+from ..compare import find_all_tags  # noqa: F401  (re-exported for tests)
 from ..config import load_config, save_config
-from ..reader import RunReader
+from ..reader import ExperimentReader, RunReader
 from .base import BaseOutput
 
-_TEMPLATE_PATH = Path(__file__).parent / "web.html"
+_WEB_DIR = Path(__file__).parent / "web"
+_INDEX_PATH = _WEB_DIR / "index.html"
+
+_SYSTEM_PREFIXES = ("system/", "gpu/")
 
 
+@functools.lru_cache(maxsize=1)
 def _load_template() -> str:
-    return _TEMPLATE_PATH.read_text(encoding="utf-8")
+    return _INDEX_PATH.read_text(encoding="utf-8")
 
 
 def _json_for_html(obj: Any) -> str:
@@ -25,7 +45,18 @@ def _json_for_html(obj: Any) -> str:
     return json.dumps(obj).replace("</", r"\u003c/")
 
 
-_SYSTEM_PREFIXES = ("system/", "gpu/")
+def _render(
+    data: list,
+    project: Optional[str],
+    projects: Sequence[str],
+) -> str:
+    """Render the index template with JSON-safe replacements."""
+    return (
+        _load_template()
+        .replace("__DATA_JSON__", _json_for_html(data))
+        .replace("__PROJECT_JSON__", _json_for_html(project))
+        .replace("__PROJECTS_JSON__", _json_for_html(list(projects)))
+    )
 
 
 def _resolve_host(host: str) -> str:
@@ -33,6 +64,7 @@ def _resolve_host(host: str) -> str:
     if host != "0.0.0.0":
         return host
     import socket
+
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("10.255.255.255", 1))
@@ -52,108 +84,107 @@ def _resolve_media_path(log_dir: str, rel_path: str) -> str:
     return rel_path
 
 
-def _build_data(
-    output: "WebOutput",
-    experiments: Optional[Sequence[str]],
-) -> list:
-    exps = output._resolve_experiments(experiments)
-    data = []
-    for exp in exps:
-        log_dir = exp.log_dir
-        # Scalars — split into regular and system
-        all_tags = exp.scalar_tags()
-        regular_tags = [t for t in all_tags if not t.startswith(_SYSTEM_PREFIXES)]
-        system_tags = [t for t in all_tags if t.startswith(_SYSTEM_PREFIXES)]
+def _scalar_series(exp: ExperimentReader, tag: str) -> Dict[str, list]:
+    rows = exp.scalars(tag)
+    return {
+        "steps": [r["step"] for r in rows],
+        "values": [r["value"] for r in rows],
+        "wall_times": [r["wall_time"] for r in rows],
+    }
 
-        scalars: Dict[str, Any] = {}
-        for tag in regular_tags:
-            rows = exp.scalars(tag)
-            scalars[tag] = {
-                "steps": [r["step"] for r in rows],
-                "values": [r["value"] for r in rows],
+
+def _serialize_experiment(exp: ExperimentReader) -> Dict[str, Any]:
+    """Build the JSON-ready dict for a single experiment."""
+    log_dir = exp.log_dir
+
+    all_tags = exp.scalar_tags()
+    regular_tags = [t for t in all_tags if not t.startswith(_SYSTEM_PREFIXES)]
+    system_tags = [t for t in all_tags if t.startswith(_SYSTEM_PREFIXES)]
+    scalars = {tag: _scalar_series(exp, tag) for tag in regular_tags}
+    system_scalars = {tag: _scalar_series(exp, tag) for tag in system_tags}
+
+    images = {
+        tag: [
+            {"step": r["step"], "path": _resolve_media_path(log_dir, r["path"])}
+            for r in exp.images(tag)
+        ]
+        for tag in exp.image_tags()
+    }
+    audio_data = {
+        tag: [
+            {"step": r["step"], "path": _resolve_media_path(log_dir, r["path"])}
+            for r in exp.audio(tag)
+        ]
+        for tag in exp.audio_tags()
+    }
+    video_data = {
+        tag: [
+            {"step": r["step"], "path": _resolve_media_path(log_dir, r["path"])}
+            for r in exp.video(tag)
+        ]
+        for tag in exp.video_tags()
+    }
+    artifacts = {
+        tag: [
+            {
+                "step": r["step"],
+                "path": _resolve_media_path(log_dir, r["path"]),
+                "metadata": r["metadata"],
             }
+            for r in exp.artifacts(tag)
+        ]
+        for tag in exp.artifact_tags()
+    }
+    text_data = {
+        tag: [{"step": r["step"], "value": r["value"]} for r in exp.texts(tag)]
+        for tag in exp.text_tags()
+    }
+    histogram_data = {
+        tag: [
+            {"step": r["step"], "bins": r["bins"], "counts": r["counts"]}
+            for r in exp.histograms(tag)
+        ]
+        for tag in exp.histogram_tags()
+    }
 
-        system_scalars: Dict[str, Any] = {}
-        for tag in system_tags:
-            rows = exp.scalars(tag)
-            system_scalars[tag] = {
-                "steps": [r["step"] for r in rows],
-                "values": [r["value"] for r in rows],
-            }
+    return {
+        "name": exp.name,
+        "project": exp.project,
+        "log_dir": log_dir,
+        "tags": regular_tags,
+        "scalars": scalars,
+        "system_tags": system_tags,
+        "system_scalars": system_scalars,
+        "image_tags": list(images),
+        "images": images,
+        "audio_tags": list(audio_data),
+        "audio_data": audio_data,
+        "video_tags": list(video_data),
+        "video_data": video_data,
+        "artifact_tags": list(artifacts),
+        "artifacts": artifacts,
+        "text_tags": list(text_data),
+        "text_data": text_data,
+        "histogram_tags": list(histogram_data),
+        "histogram_data": histogram_data,
+        "hparams": exp.hparams(),
+    }
 
-        # Images
-        img_tags = exp.image_tags()
-        images: Dict[str, list] = {}
-        for tag in img_tags:
-            rows = exp.images(tag)
-            images[tag] = [{"step": r["step"], "path": _resolve_media_path(log_dir, r["path"])} for r in rows]
 
-        # Audio
-        aud_tags = exp.audio_tags()
-        audio_data: Dict[str, list] = {}
-        for tag in aud_tags:
-            rows = exp.audio(tag)
-            audio_data[tag] = [{"step": r["step"], "path": _resolve_media_path(log_dir, r["path"])} for r in rows]
+def _build_data(exps: Sequence[ExperimentReader]) -> list:
+    return [_serialize_experiment(exp) for exp in exps]
 
-        # Video
-        vid_tags = exp.video_tags()
-        video_data: Dict[str, list] = {}
-        for tag in vid_tags:
-            rows = exp.video(tag)
-            video_data[tag] = [{"step": r["step"], "path": _resolve_media_path(log_dir, r["path"])} for r in rows]
 
-        # Artifacts
-        art_tags = exp.artifact_tags()
-        artifacts: Dict[str, list] = {}
-        for tag in art_tags:
-            rows = exp.artifacts(tag)
-            artifacts[tag] = [
-                {"step": r["step"], "path": _resolve_media_path(log_dir, r["path"]), "metadata": r["metadata"]}
-                for r in rows
-            ]
-
-        # Texts
-        txt_tags = exp.text_tags()
-        text_data: Dict[str, list] = {}
-        for tag in txt_tags:
-            rows = exp.texts(tag)
-            text_data[tag] = [{"step": r["step"], "value": r["value"]} for r in rows]
-
-        # Histograms
-        hist_tags = exp.histogram_tags()
-        histogram_data: Dict[str, list] = {}
-        for tag in hist_tags:
-            rows = exp.histograms(tag)
-            histogram_data[tag] = [
-                {"step": r["step"], "bins": r["bins"], "counts": r["counts"]}
-                for r in rows
-            ]
-
-        # Hparams
-        hparams = exp.hparams()
-
-        data.append({
-            "name": exp.name,
-            "log_dir": log_dir,
-            "tags": regular_tags,
-            "scalars": scalars,
-            "system_tags": system_tags,
-            "system_scalars": system_scalars,
-            "image_tags": img_tags,
-            "images": images,
-            "audio_tags": aud_tags,
-            "audio_data": audio_data,
-            "video_tags": vid_tags,
-            "video_data": video_data,
-            "artifact_tags": art_tags,
-            "artifacts": artifacts,
-            "text_tags": txt_tags,
-            "text_data": text_data,
-            "histogram_tags": hist_tags,
-            "histogram_data": histogram_data,
-            "hparams": hparams,
-        })
-    return data
+def _experiments_for_project(
+    db: Any,
+    project: str,
+    names: Optional[Sequence[str]] = None,
+) -> List[ExperimentReader]:
+    rows = db.list_experiments(project=project)
+    if names is not None:
+        allowed = set(names)
+        rows = [r for r in rows if r["name"] in allowed]
+    return [ExperimentReader(db, r["id"], r["name"], row=r) for r in rows]
 
 
 def _get_media_roots(reader: RunReader, project: Optional[str] = None) -> List[str]:
@@ -170,50 +201,96 @@ def _get_media_roots(reader: RunReader, project: Optional[str] = None) -> List[s
     return list(roots)
 
 
-def _build_project_data(
+def _cleanup_experiment_files(log_dir: str) -> None:
+    """Remove media and the run directory if they are now empty."""
+    if not log_dir:
+        return
+    shutil.rmtree(os.path.join(log_dir, "media"), ignore_errors=True)
+    with suppress(OSError):
+        os.rmdir(log_dir)
+
+
+# ── Route handlers (extracted from closures) ────────────────────────────
+
+
+def _handle_rename(
     db: Any,
-    project: str,
-    experiments: Optional[Sequence[str]] = None,
-) -> list:
-    """Build data for a specific project from the DB directly."""
-    from ..reader import ExperimentReader
-    rows = db.list_experiments(project=project)
-    exps = [ExperimentReader(db, r["id"], r["name"], row=r) for r in rows]
-    if experiments is not None:
-        name_set = set(experiments)
-        exps = [e for e in exps if e.name in name_set]
-    data = []
-    for exp in exps:
-        ld = exp.log_dir
-        all_tags = exp.scalar_tags()
-        regular_tags = [t for t in all_tags if not t.startswith(_SYSTEM_PREFIXES)]
-        system_tags = [t for t in all_tags if t.startswith(_SYSTEM_PREFIXES)]
-        scalars: Dict[str, Any] = {}
-        for tag in regular_tags:
-            rows_s = exp.scalars(tag)
-            scalars[tag] = {"steps": [r["step"] for r in rows_s], "values": [r["value"] for r in rows_s]}
-        system_scalars: Dict[str, Any] = {}
-        for tag in system_tags:
-            rows_s = exp.scalars(tag)
-            system_scalars[tag] = {"steps": [r["step"] for r in rows_s], "values": [r["value"] for r in rows_s]}
-        images: Dict[str, list] = {tag: [{"step": r["step"], "path": _resolve_media_path(ld, r["path"])} for r in exp.images(tag)] for tag in exp.image_tags()}
-        audio_d: Dict[str, list] = {tag: [{"step": r["step"], "path": _resolve_media_path(ld, r["path"])} for r in exp.audio(tag)] for tag in exp.audio_tags()}
-        video_d: Dict[str, list] = {tag: [{"step": r["step"], "path": _resolve_media_path(ld, r["path"])} for r in exp.video(tag)] for tag in exp.video_tags()}
-        artifacts: Dict[str, list] = {tag: [{"step": r["step"], "path": _resolve_media_path(ld, r["path"]), "metadata": r["metadata"]} for r in exp.artifacts(tag)] for tag in exp.artifact_tags()}
-        text_d: Dict[str, list] = {tag: [{"step": r["step"], "value": r["value"]} for r in exp.texts(tag)] for tag in exp.text_tags()}
-        hist_d: Dict[str, list] = {tag: [{"step": r["step"], "bins": r["bins"], "counts": r["counts"]} for r in exp.histograms(tag)] for tag in exp.histogram_tags()}
-        data.append({
-            "name": exp.name, "log_dir": ld, "tags": regular_tags, "scalars": scalars,
-            "system_tags": system_tags, "system_scalars": system_scalars,
-            "image_tags": list(images), "images": images,
-            "audio_tags": list(audio_d), "audio_data": audio_d,
-            "video_tags": list(video_d), "video_data": video_d,
-            "artifact_tags": list(artifacts), "artifacts": artifacts,
-            "text_tags": list(text_d), "text_data": text_d,
-            "histogram_tags": list(hist_d), "histogram_data": hist_d,
-            "hparams": exp.hparams(),
-        })
-    return data
+    old_name: str,
+    new_name: str,
+    project: Optional[str],
+) -> Tuple[dict, int]:
+    """Rename an experiment; returns ``(body, status)``."""
+    new_name = new_name.strip()
+    if not new_name:
+        return {"error": "name cannot be empty"}, 400
+    if db is None:
+        return {"error": "no database"}, 500
+    for exp_row in db.list_experiments(project=project):
+        if exp_row["name"] == old_name:
+            if not db.rename_experiment(exp_row["id"], new_name):
+                return {"error": "name already exists"}, 409
+            return {"ok": True, "new_name": new_name}, 200
+    return {"error": "experiment not found"}, 404
+
+
+def _handle_delete_experiment(
+    db: Any,
+    name: str,
+    project: Optional[str],
+) -> Tuple[dict, int]:
+    if not name:
+        return {"error": "name required"}, 400
+    if db is None:
+        return {"error": "no database"}, 500
+    row = db.get_experiment_by_name(name, project=project)
+    if row is None:
+        return {"error": "experiment not found"}, 404
+    log_dir = db.delete_experiment(int(row["id"]))
+    _cleanup_experiment_files(log_dir or "")
+    return {"ok": True}, 200
+
+
+def _handle_move_logdir(db: Any, old_dir: str, new_dir: str) -> Tuple[dict, int]:
+    if not old_dir or not new_dir:
+        return {"error": "old and new required"}, 400
+    old_path = Path(old_dir).expanduser().resolve()
+    new_path = Path(new_dir).expanduser().resolve()
+    if old_path == new_path:
+        return {"ok": True}, 200
+    if db is None:
+        return {"error": "no database"}, 500
+
+    # Source must be EXACTLY a known experiment log_dir.
+    known = [
+        Path(r["log_dir"]).expanduser().resolve()
+        for r in db.list_experiments()
+        if r["log_dir"]
+    ]
+    if old_path not in known:
+        return {"error": "not a known log directory"}, 403
+    if not old_path.is_dir():
+        return {"error": "source directory not found"}, 404
+    if new_path.exists():
+        return {"error": "destination already exists"}, 409
+
+    try:
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(old_path), str(new_path))
+    except OSError:
+        return {"error": "move failed"}, 500
+
+    # Update all experiments whose log_dir is under the moved directory.
+    for row in db.list_experiments():
+        ld = row["log_dir"]
+        if not ld:
+            continue
+        ld_path = Path(ld).expanduser().resolve()
+        try:
+            rel = ld_path.relative_to(old_path)
+        except ValueError:
+            continue
+        db.update_log_dir(int(row["id"]), str((new_path / rel).resolve()))
+    return {"ok": True}, 200
 
 
 class WebOutput(BaseOutput):
@@ -266,31 +343,48 @@ class WebOutput(BaseOutput):
         token: Optional[str] = None,
     ) -> Any:
         """Build and return the FastAPI app (without running it)."""
-        from fastapi import FastAPI, Request
-        from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-        import logging
+        from contextlib import asynccontextmanager
+
+        from fastapi import (
+            Depends,
+            FastAPI,
+            File,
+            Form,
+            HTTPException,
+            Request,
+            UploadFile,
+        )
+        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+        from fastapi.staticfiles import StaticFiles
+
+        from ..cli import _ALLOWED_SUFFIXES, _write_upload_to_tempfile
+        from ..writer import SummaryWriter
 
         logging.getLogger("uvicorn.error").addFilter(
-            type("_F", (logging.Filter,), {"filter": lambda self, r: "Invalid HTTP request received" not in r.getMessage()})()
+            type(
+                "_F",
+                (logging.Filter,),
+                {
+                    "filter": lambda self, r: "Invalid HTTP request received"
+                    not in r.getMessage()
+                },
+            )()
         )
-
-        import shutil
 
         host = _resolve_host(host)
 
-        # Build MCP sub-app early so we can wire its lifespan
+        # Build MCP sub-app early so we can wire its lifespan.
         _mcp_asgi = None
+        _mcp_session_manager = None
         try:
             from .mcp import MCPOutput, _suppress_streamable_http_startup_log
+
             _mcp_output = MCPOutput(self.project_folder)
             _mcp_output._build_mcp()
             _mcp_asgi = _mcp_output._mcp.streamable_http_app()
             _mcp_session_manager = _mcp_output._mcp._session_manager
         except ImportError:
-            _mcp_output = None
-            _mcp_session_manager = None
-
-        from contextlib import asynccontextmanager
+            pass
 
         @asynccontextmanager
         async def _lifespan(app):
@@ -302,15 +396,21 @@ class WebOutput(BaseOutput):
                 yield
 
         app = FastAPI(title="vibetrack", lifespan=_lifespan)
+        app.mount("/static", StaticFiles(directory=str(_WEB_DIR)), name="static")
+
         config_project = self.config_project()
         is_central = self.project_folder is None
+
+        def _all_projects() -> List[str]:
+            db = self._reader._db
+            return [p for p in (db.list_projects() if db else []) if p]
+
+        # ── Index / data ──────────────────────────────────────
 
         @app.get("/")
         def index() -> HTMLResponse:
             if is_central and self.project is None:
-                # Central mode: redirect to last active project
-                db = self._reader._db
-                projects = [p for p in (db.list_projects() if db else []) if p]
+                projects = _all_projects()
                 if not projects:
                     return HTMLResponse(
                         "<!DOCTYPE html><html><head>"
@@ -319,28 +419,41 @@ class WebOutput(BaseOutput):
                         "<h1>vibetrack</h1><p>No projects yet.</p>"
                         "</body></html>"
                     )
+                # Projects are returned most-recent-first; make that choice
+                # browser-visible so stale localStorage cannot steal the
+                # landing page from the current latest project.
+                projects_json = _json_for_html(projects)
                 return HTMLResponse(
-                    "<!DOCTYPE html><html><head><script>"
-                    f"const projects={json.dumps(projects)};"
-                    "const last=localStorage.getItem('vt_last_project');"
-                    "if(last&&projects.includes(last))window.location.replace('/'+last);"
-                    "else window.location.replace('/'+projects[0]);"
-                    "</script></head><body></body></html>"
+                    "<!DOCTYPE html><html><head>"
+                    "<title>vibetrack</title>"
+                    "</head><body>"
+                    "<script>"
+                    f"const projects = {projects_json};"
+                    "const targetProject = projects[0];"
+                    "if (targetProject) {"
+                    "try {"
+                    "localStorage.setItem('vt_last_project', targetProject);"
+                    "} catch (e) {}"
+                    "window.location.replace('/' + encodeURIComponent(targetProject));"
+                    "}"
+                    "</script>"
+                    "</body></html>"
                 )
-            data = _build_data(self, experiments)
-            html = _load_template().replace("__DATA_JSON__", _json_for_html(data))
-            return HTMLResponse(content=html)
+            data = _build_data(self._resolve_experiments(experiments))
+            return HTMLResponse(_render(data, None, []))
 
         @app.get("/api/data")
         def api_data() -> list:
-            return _build_data(self, experiments)
+            return _build_data(self._resolve_experiments(experiments))
 
         @app.get("/api/data/{project}")
         def api_data_project(project: str) -> Any:
             db = self._reader._db
             if db is None or not db.list_experiments(project=project):
                 return JSONResponse({"error": "not found"}, status_code=404)
-            return _build_project_data(db, project)
+            return _build_data(_experiments_for_project(db, project))
+
+        # ── Config ────────────────────────────────────────────
 
         @app.get("/api/config")
         def get_config() -> dict:
@@ -362,53 +475,41 @@ class WebOutput(BaseOutput):
             save_config(data, project=project)
             return load_config(project=project)
 
+        # ── Rename / delete / move ────────────────────────────
+
         @app.post("/api/rename")
         async def rename_exp(request: Request) -> JSONResponse:
-            return await _do_rename(request, self._reader.project)
+            body = await request.json()
+            project = body.get("project") or self._reader.project
+            data, status = _handle_rename(
+                self._reader._db,
+                body.get("old_name", ""),
+                body.get("new_name", ""),
+                project,
+            )
+            return JSONResponse(data, status_code=status)
 
         @app.post("/api/rename/{project}")
         async def rename_exp_project(request: Request, project: str) -> JSONResponse:
-            return await _do_rename(request, project)
-
-        async def _do_rename(request: Request, project: Optional[str]) -> JSONResponse:
             body = await request.json()
-            old_name = body.get("old_name", "")
-            new_name = body.get("new_name", "").strip()
-            if not new_name:
-                return JSONResponse({"error": "name cannot be empty"}, status_code=400)
-            db = self._reader._db
-            if db is None:
-                return JSONResponse({"error": "no database"}, status_code=500)
-            for exp_row in db.list_experiments(project=project):
-                if exp_row["name"] == old_name:
-                    if not db.rename_experiment(exp_row["id"], new_name):
-                        return JSONResponse(
-                            {"error": "name already exists"},
-                            status_code=409,
-                        )
-                    return JSONResponse({"ok": True, "new_name": new_name})
-            return JSONResponse({"error": "experiment not found"}, status_code=404)
+            data, status = _handle_rename(
+                self._reader._db,
+                body.get("old_name", ""),
+                body.get("new_name", ""),
+                body.get("project") or project,
+            )
+            return JSONResponse(data, status_code=status)
 
         @app.delete("/api/experiment")
         async def delete_exp(request: Request) -> JSONResponse:
             body = await request.json()
-            name = body.get("name", "")
-            if not name:
-                return JSONResponse({"error": "name required"}, status_code=400)
-            db = self._reader._db
-            if db is None:
-                return JSONResponse({"error": "no database"}, status_code=500)
-            project = self._reader.project
-            row = db.get_experiment_by_name(name, project=project)
-            if row is None:
-                return JSONResponse({"error": "experiment not found"}, status_code=404)
-            log_dir = db.delete_experiment(int(row["id"]))
-            # Clean up media directory if empty after delete
-            if log_dir:
-                md = os.path.join(log_dir, "media")
-                if os.path.isdir(md):
-                    shutil.rmtree(md, ignore_errors=True)
-            return JSONResponse({"ok": True})
+            project = body.get("project") or self._reader.project
+            data, status = _handle_delete_experiment(
+                self._reader._db,
+                body.get("name", ""),
+                project,
+            )
+            return JSONResponse(data, status_code=status)
 
         @app.delete("/api/project/{project}")
         def delete_project(project: str) -> JSONResponse:
@@ -418,81 +519,24 @@ class WebOutput(BaseOutput):
             rows = db.list_experiments(project=project)
             if not rows:
                 return JSONResponse({"error": "not found"}, status_code=404)
-            # Collect media dirs to clean up
-            media_dirs: set[str] = set()
+            db.delete_experiments_by_project(project)
             for row in rows:
                 log_dir = row["log_dir"] if hasattr(row, "__getitem__") else ""
                 if log_dir:
-                    md = os.path.join(log_dir, "media")
-                    if os.path.isdir(md):
-                        media_dirs.add(md)
-            # Delete experiment rows and all associated data
-            db.delete_experiments_by_project(project)
-            # Remove media directories
-            for md in media_dirs:
-                shutil.rmtree(md, ignore_errors=True)
+                    _cleanup_experiment_files(str(log_dir))
             return JSONResponse({"ok": True})
 
         @app.post("/api/move-logdir")
         async def move_logdir(request: Request) -> JSONResponse:
             body = await request.json()
-            old_dir = body.get("old", "")
-            new_dir = body.get("new", "")
-            if not old_dir or not new_dir:
-                return JSONResponse({"error": "old and new required"}, status_code=400)
-            old_path = Path(old_dir).expanduser().resolve()
-            new_path = Path(new_dir).expanduser().resolve()
-            if old_path == new_path:
-                return JSONResponse({"ok": True})
-            db = self._reader._db
-            if db is None:
-                return JSONResponse({"error": "no database"}, status_code=500)
+            data, status = _handle_move_logdir(
+                self._reader._db,
+                body.get("old", ""),
+                body.get("new", ""),
+            )
+            return JSONResponse(data, status_code=status)
 
-            def _row_log_dir(row: Any) -> str:
-                if isinstance(row, dict):
-                    return str(row.get("log_dir", ""))
-                try:
-                    return str(row["log_dir"])
-                except Exception:
-                    return ""
-
-            def _normalize_path(value: str) -> Path:
-                return Path(value).expanduser().resolve()
-
-            def _is_under_or_equal(parent: Path, child: Path) -> bool:
-                try:
-                    child.relative_to(parent)
-                    return True
-                except ValueError:
-                    return False
-
-            # Validate source is EXACTLY a known experiment log_dir.
-            known = [
-                _normalize_path(_row_log_dir(r))
-                for r in db.list_experiments() if _row_log_dir(r)
-            ]
-            if old_path not in known:
-                return JSONResponse({"error": "not a known log directory"}, status_code=403)
-            if not old_path.is_dir():
-                return JSONResponse({"error": "source directory not found"}, status_code=404)
-            if new_path.exists():
-                return JSONResponse({"error": "destination already exists"}, status_code=409)
-            # Move the directory
-            try:
-                new_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(old_path), str(new_path))
-            except OSError:
-                return JSONResponse({"error": "move failed"}, status_code=500)
-            # Update all experiments whose log_dir is under the moved directory
-            for row in db.list_experiments():
-                ld_raw = _row_log_dir(row)
-                if not ld_raw:
-                    continue
-                ld_path = _normalize_path(ld_raw)
-                if _is_under_or_equal(old_path, ld_path):
-                    rel = ld_path.relative_to(old_path)
-                    db.update_log_dir(int(row["id"]), str((new_path / rel).resolve()))
-            return JSONResponse({"ok": True})
+        # ── Media ─────────────────────────────────────────────
 
         @app.get("/media")
         def serve_media(path: str = ""):  # type: ignore[no-untyped-def]
@@ -508,26 +552,25 @@ class WebOutput(BaseOutput):
             return JSONResponse({"error": "not found"}, status_code=404)
 
         # ── Ingest (listen) routes ────────────────────────────
-        from fastapi import Depends, File, Form, HTTPException, UploadFile
-        from ..cli import _write_upload_to_tempfile, _MAX_UPLOAD_BYTES, _ALLOWED_SUFFIXES
-        from ..writer import SummaryWriter
-        import hmac
 
         normalized_pf = (
             str(Path(self.project_folder).resolve())
-            if self.project_folder is not None else None
+            if self.project_folder is not None
+            else None
         )
 
         def _new_writer(name: str, project_name: Optional[str] = None) -> SummaryWriter:
             if normalized_pf is not None:
                 log_dir = Path(normalized_pf) / name
                 return SummaryWriter(
-                    str(log_dir), name=name,
+                    str(log_dir),
+                    name=name,
                     project_folder=normalized_pf,
                     system_metrics_interval=0,
                 )
             return SummaryWriter(
-                str(Path.cwd() / name), name=name,
+                str(Path.cwd() / name),
+                name=name,
                 project=project_name,
                 system_metrics_interval=0,
             )
@@ -539,7 +582,9 @@ class WebOutput(BaseOutput):
                     raise HTTPException(status_code=401, detail="unauthorized")
 
         @app.post("/{project}/listen/log")
-        async def listen_log(project: str, request: Request, _=Depends(_check_listen_auth)) -> dict:
+        async def listen_log(
+            project: str, request: Request, _=Depends(_check_listen_auth)
+        ) -> dict:
             data = await request.json()
             experiment = data.get("experiment", "default")
             step = data.get("step", 0)
@@ -568,14 +613,20 @@ class WebOutput(BaseOutput):
             try:
                 raw_suffix = os.path.splitext(file.filename or "")[1].lower()
                 if type not in {"image", "audio", "video", "artifact"}:
-                    raise HTTPException(status_code=400, detail=f"Unsupported upload type {type!r}")
+                    raise HTTPException(
+                        status_code=400, detail=f"Unsupported upload type {type!r}"
+                    )
                 allowed = _ALLOWED_SUFFIXES.get(type)
                 if allowed is not None and raw_suffix not in allowed:
-                    raise HTTPException(status_code=400, detail=f"Unsupported file type for {type!r}")
+                    raise HTTPException(
+                        status_code=400, detail=f"Unsupported file type for {type!r}"
+                    )
                 try:
                     tmp_path = await _write_upload_to_tempfile(file, suffix=raw_suffix)
                 except ValueError:
-                    raise HTTPException(status_code=413, detail="File too large (max 1 GB)")
+                    raise HTTPException(
+                        status_code=413, detail="File too large (max 1 GB)"
+                    )
                 writer = _new_writer(experiment, project)
                 if type == "image":
                     writer.add_image(tag, tmp_path, step)
@@ -594,30 +645,19 @@ class WebOutput(BaseOutput):
                 await file.close()
 
         # ── MCP sub-app mount ─────────────────────────────────
+
         if _mcp_asgi is not None:
             app.mount("/vibetrack_mcp", _mcp_asgi)
 
+        # ── Project-scoped index (must be registered last so fixed
+        #     paths above take precedence over ``/{project}``) ──
+
         @app.get("/{project}")
         def project_index(project: str) -> HTMLResponse:
-            """Serve project-scoped dashboard."""
             db = self._reader._db
             if db is None:
                 return HTMLResponse("no database", status_code=500)
-            data = _build_project_data(db, project)
-            all_projects = [p for p in db.list_projects() if p]
-            html = _load_template().replace("__DATA_JSON__", _json_for_html(data))
-            # Inject project context for frontend
-            html = html.replace(
-                "</head>",
-                f"<script>"
-                f"window.VT_PROJECT={json.dumps(project)};"
-                f"window.VT_PROJECTS={json.dumps(all_projects)};"
-                f"</script></head>",
-            )
-            # Rewrite API paths to project-scoped versions
-            html = html.replace("/api/data", f"/api/data/{project}")
-            html = html.replace("/api/rename", f"/api/rename/{project}")
-            html = html.replace("/api/config", f"/api/config/{project}")
-            return HTMLResponse(content=html)
+            data = _build_data(_experiments_for_project(db, project))
+            return HTMLResponse(_render(data, project, _all_projects()))
 
         return app

@@ -24,7 +24,9 @@ from typing import Any, Dict, Optional, Tuple
 
 def _sanitize_tag(tag: str) -> str:
     """Make *tag* filesystem-safe (replace ``/`` with ``_``)."""
-    return tag.replace("\x00", "").replace("/", "_").replace("\\", "_").replace(":", "_")
+    return (
+        tag.replace("\x00", "").replace("/", "_").replace("\\", "_").replace(":", "_")
+    )
 
 
 def _ensure_dir(path: Path) -> Path:

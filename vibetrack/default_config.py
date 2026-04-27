@@ -19,6 +19,7 @@ SYSTEM_METRICS_INTERVAL = 3600  # seconds (1 hour)
 WEB_THEME = "light"
 WEB_AUTO_REFRESH = 5  # seconds
 WEB_IMAGE_PLAY_FPS = 4
+WEB_RAW_SCALAR_OPACITY = 0.17
 
 # ── Composite config (used by config.py) ─────────────────────────
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -29,6 +30,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "theme": WEB_THEME,
         "auto_refresh": WEB_AUTO_REFRESH,
         "image_play_fps": WEB_IMAGE_PLAY_FPS,
+        "raw_scalar_opacity": WEB_RAW_SCALAR_OPACITY,
+        "x_axis_mode": "step",
     },
     "gradio": {
         "share": False,

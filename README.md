@@ -1,15 +1,23 @@
 # vibetrack
 
-Lightweight experiment tracking — drop-in compatible with TensorBoard and W&B APIs.
+Lightweight experiment tracking.
 
-No cloud. No account. No signup. Just a single SQLite file.
+Key features:
+    Run locally but could receive experiment data over network via REST API. 
+    Open formats: store experiment data in sqlite and local files. 
+    Image2image comparison. 
+    Rich UI.
+    Send experiment results to Gradio/Telegram/Slack
+    TensorBoard or W&B drop-in API replacement 
+    MCP server with results
+
 
 
 ## Install
 
 ```bash
-pip install vibetrack          # default
-pip install vibetrack[all]     # all optional backends
+pip install vibetrack          # default with web
+pip install vibetrack[all]     # all optional backends+dev; MCP on Python >=3.10
 ```
 
 ## Quick start
@@ -37,11 +45,53 @@ for step in range(100):
 vibetrack.finish()
 ```
 
+### Send events to Telegram, Slack, console, gradio
+
+Every `add_*` and `log()` call returns a handle with `.to(name, **creds)` for
+ad-hoc dispatch, and `writer.to(name, every=...)` registers a persistent
+destination. Fire-and-forget: adapter exceptions never bubble up to the
+training loop.
+
+```python
+from vibetrack import SummaryWriter
+
+writer = SummaryWriter("runs/exp1", project_folder="my_project")
+
+# Register destinations; chainable, one per call.
+writer = (
+    writer
+    .to("console")                          # every event -> stdout
+    .to("telegram", every=100)              # every 100 events
+    .to("slack", every="15m")               # time-based digest
+)
+
+for step in range(1000):
+    writer.add_scalar("loss", 1.0 / (step + 1), step)
+
+# Per-event one-shot: send just this event, independent of registration.
+writer.add_image("samples", "out.png", step=999).to("telegram")
+
+writer.close()
+```
+
+`every=` accepts `None` (every event), an `int` (N events), or a duration
+string (`"5s"`, `"15m"`, `"1h"`, `"2d"`).
+
+**Adapters** (under `vibetrack/viewers/`):
+- `"telegram"` — needs `VIBETRACK_TELEGRAM_TOKEN` + `VIBETRACK_TELEGRAM_CHAT_ID` (or `token=` / `chat_id=`)
+- `"slack"` — needs `SLACK_WEBHOOK_URL` (or `webhook=`)
+- `"console"` — prints one line per event to stdout
+- `"gradio"` — buffers events for a running Gradio dashboard
+- The built-in web dashboard / SQLite store is always active; `.to(...)` adds *additional* destinations.
+
+W&B-style equivalent: `vibetrack.init(..., to=["console", "telegram"])`.
+
 ### Launch the dashboard
 
 ```bash
 vibetrack 
-# -> Web UI + MCP server + ingest endpoint on http://0.0.0.0:6006
+# -> Web UI + ingest endpoint on http://0.0.0.0:6006
+# -> MCP is also mounted when installed with vibetrack[all] on Python 3.10+
 ```
 
 ## API reference
@@ -191,7 +241,7 @@ Collected metrics: `system/cpu_percent`, `system/mem_used_gb`, `system/disk_free
 
 ## MCP server (AI agent integration)
 
-The web dashboard includes an MCP (Model Context Protocol) server at `/vibetrack_mcp`, enabling AI agents like Claude to query your experiment data directly.
+When installed with `vibetrack[all]` on Python 3.10+, the web dashboard includes an MCP (Model Context Protocol) server at `/vibetrack_mcp`, enabling AI agents like Claude to query your experiment data directly.
 
 **Available MCP tools:** `list_experiments`, `get_experiment_tags`, `get_scalars`, `get_texts`, `get_images`, `get_audio`, `get_hparams`, `get_histograms`, `summary`, `compare_hparams_tool`
 
@@ -200,6 +250,7 @@ The web dashboard includes an MCP (Model Context Protocol) server at `/vibetrack
 Standalone MCP server:
 
 ```bash
+pip install vibetrack[all]
 vibetrack --viewer mcp --project-folder my_project/
 ```
 
@@ -209,7 +260,7 @@ vibetrack --viewer mcp --project-folder my_project/
 
 ```bash
 vibetrack                           # default  
-vibetrack [PROJECT_FOLDER]          # Launch dashboard (web + MCP + ingest)
+vibetrack [PROJECT_FOLDER]          # Launch dashboard (web + ingest; MCP with vibetrack[all] on Python 3.10+)
 vibetrack --port 8080               # Custom port
 vibetrack --host 127.0.0.1          # Bind to localhost only (by default it is open on LAN IP)
 vibetrack --token SECRET            # Protect ingest endpoints
@@ -229,7 +280,8 @@ Settings are stored in `~/.vibetrack/config.json` (global) or per-project via th
   "web": {
     "theme": "light",
     "auto_refresh": 5,
-    "image_play_fps": 2
+    "image_play_fps": 2,
+    "original_values_opacity": 0.17
   }
 }
 ```

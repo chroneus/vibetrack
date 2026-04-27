@@ -24,7 +24,7 @@ from .base import BaseOutput
 
 __all__ = ["BaseOutput", "discover_viewers", "load_viewer"]
 
-_EXCLUDED = {"__init__.py", "base.py"}
+_EXCLUDED = {"__init__.py", "base.py", "event.py"}
 
 
 def _viewer_name(filename: str) -> str:
@@ -62,6 +62,4 @@ def load_viewer(name: str) -> Type[BaseOutput]:
     for _attr_name, obj in inspect.getmembers(module, inspect.isclass):
         if issubclass(obj, BaseOutput) and obj is not BaseOutput:
             return obj
-    raise ImportError(
-        f"No BaseOutput subclass found in {viewers[name]}"
-    )
+    raise ImportError(f"No BaseOutput subclass found in {viewers[name]}")

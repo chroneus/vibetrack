@@ -127,6 +127,7 @@ def open_central_db() -> "Database":
     """Open (or create) the system-wide central database."""
     return Database(central_db_path())
 
+
 class Database:
     """Thread-safe SQLite database with WAL mode and bulk insert support.
 
@@ -169,14 +170,14 @@ class Database:
         # video: (exp_id, tag, step, path, wall_time)
         self._cache_video: List[Tuple[int, str, int, str, float]] = []
         # artifacts: (exp_id, tag, step, path, metadata_json, wall_time)
-        self._cache_artifacts: List[Tuple[int, str, int, str, Optional[str], float]] = []
+        self._cache_artifacts: List[Tuple[int, str, int, str, Optional[str], float]] = (
+            []
+        )
         self._next_synthetic_id = -1
 
         if self._precache_active:
             # Start daemon timer — won't prevent process exit
-            self._precache_timer = threading.Timer(
-                precache_secs, self._materialize
-            )
+            self._precache_timer = threading.Timer(precache_secs, self._materialize)
             self._precache_timer.daemon = True
             self._precache_timer.start()
         else:
@@ -192,9 +193,7 @@ class Database:
         self._next_synthetic_id -= 1
         return eid
 
-    def register_remap_callback(
-        self, cb: Callable[[Dict[int, int]], None]
-    ) -> None:
+    def register_remap_callback(self, cb: Callable[[Dict[int, int]], None]) -> None:
         """Register a callback invoked with {synthetic_id: real_id} after materialize."""
         self._remap_callbacks.append(cb)
 
@@ -217,7 +216,8 @@ class Database:
             for exp in self._cache_experiments:
                 config = json.loads(exp["config"]) if exp["config"] else None
                 real_id = self.create_experiment(
-                    exp["name"], config,
+                    exp["name"],
+                    config,
                     project=exp.get("project", ""),
                     log_dir=exp.get("log_dir", ""),
                 )
@@ -235,14 +235,20 @@ class Database:
             for row in self._cache_texts:
                 self.add_text(
                     id_remap.get(row[0], row[0]),
-                    row[1], row[3], row[2], row[4],
+                    row[1],
+                    row[3],
+                    row[2],
+                    row[4],
                 )
 
             # 6. Replay images
             for row in self._cache_images:
                 self.add_image(
                     id_remap.get(row[0], row[0]),
-                    row[1], row[3], row[2], row[4],
+                    row[1],
+                    row[3],
+                    row[2],
+                    row[4],
                 )
 
             # 7. Replay histograms (bins/counts already JSON strings)
@@ -252,8 +258,14 @@ class Database:
                         "INSERT INTO histograms"
                         "(experiment_id, tag, step, bins, counts, wall_time) "
                         "VALUES (?, ?, ?, ?, ?, ?)",
-                        (id_remap.get(row[0], row[0]),
-                         row[1], row[2], row[3], row[4], row[5]),
+                        (
+                            id_remap.get(row[0], row[0]),
+                            row[1],
+                            row[2],
+                            row[3],
+                            row[4],
+                            row[5],
+                        ),
                     )
 
             # 8. Replay hparams (value already JSON string)
@@ -269,21 +281,32 @@ class Database:
             for row in self._cache_audio:
                 self.add_audio(
                     id_remap.get(row[0], row[0]),
-                    row[1], row[3], row[2], row[4], row[5],
+                    row[1],
+                    row[3],
+                    row[2],
+                    row[4],
+                    row[5],
                 )
 
             # 10. Replay video
             for row in self._cache_video:
                 self.add_video(
                     id_remap.get(row[0], row[0]),
-                    row[1], row[3], row[2], row[4],
+                    row[1],
+                    row[3],
+                    row[2],
+                    row[4],
                 )
 
             # 11. Replay artifacts
             for row in self._cache_artifacts:
                 self.add_artifact(
                     id_remap.get(row[0], row[0]),
-                    row[1], row[3], row[4], row[2], row[5],
+                    row[1],
+                    row[3],
+                    row[4],
+                    row[2],
+                    row[5],
                 )
 
             # 12. Fire callbacks
@@ -407,14 +430,16 @@ class Database:
                         pass  # fall through to SQLite
                     else:
                         eid = self._alloc_synthetic_id()
-                        self._cache_experiments.append({
-                            "id": eid,
-                            "name": name,
-                            "project": project,
-                            "log_dir": log_dir,
-                            "config": config_json,
-                            "created_at": time.time(),
-                        })
+                        self._cache_experiments.append(
+                            {
+                                "id": eid,
+                                "name": name,
+                                "project": project,
+                                "log_dir": log_dir,
+                                "config": config_json,
+                                "created_at": time.time(),
+                            }
+                        )
                         return eid
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -454,7 +479,9 @@ class Database:
             ).fetchone()
 
     def get_experiment_by_name(
-        self, name: str, project: Optional[str] = None,
+        self,
+        name: str,
+        project: Optional[str] = None,
     ) -> Optional[Any]:
         if self._precache_active:
             with self._lock:
@@ -490,10 +517,7 @@ class Database:
                     else:
                         exps = self._cache_experiments
                         if project is not None:
-                            exps = [
-                                e for e in exps
-                                if e.get("project", "") == project
-                            ]
+                            exps = [e for e in exps if e.get("project", "") == project]
                         return sorted(
                             exps,
                             key=lambda e: e["created_at"],
@@ -511,21 +535,105 @@ class Database:
             ).fetchall()
 
     def list_projects(self) -> List[str]:
-        """Return all distinct project names."""
+        """Return distinct project names ordered by most recent activity first."""
         if self._precache_active:
             with self._lock:
                 if self._precache_active:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        return sorted({
-                            e.get("project", "") for e in self._cache_experiments
-                        })
+                        latest: Dict[str, float] = {}
+                        for e in self._cache_experiments:
+                            p = e.get("project", "")
+                            ts = e.get("created_at", 0) or 0
+                            if p not in latest or ts > latest[p]:
+                                latest[p] = ts
+                        return [
+                            p for p, _ in sorted(
+                                latest.items(), key=lambda kv: kv[1], reverse=True
+                            )
+                        ]
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT project FROM experiments ORDER BY project"
+                "SELECT project, MAX(created_at) AS last_active "
+                "FROM experiments GROUP BY project ORDER BY last_active DESC"
             ).fetchall()
             return [r["project"] for r in rows]
+
+    def get_max_step(self, experiment_id: int) -> Optional[int]:
+        """Return the maximum step across all data tables, or None if no data."""
+        _DATA_TABLES = (
+            "scalars",
+            "texts",
+            "images",
+            "audio",
+            "video",
+            "artifacts",
+            "histograms",
+        )
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if self._check_and_maybe_materialize():
+                        pass  # fall through to SQLite
+                    else:
+                        max_step: Optional[int] = None
+                        for cache, step_idx in [
+                            (self._cache_scalars, 2),
+                            (self._cache_texts, 2),
+                            (self._cache_images, 2),
+                            (self._cache_audio, 2),
+                            (self._cache_video, 2),
+                            (self._cache_artifacts, 2),
+                            (self._cache_histograms, 2),
+                        ]:
+                            for row in cache:
+                                if row[0] == experiment_id:
+                                    s = row[step_idx]
+                                    if max_step is None or s > max_step:
+                                        max_step = s
+                        return max_step
+        with self._connect() as conn:
+            parts = [
+                f"SELECT MAX(step) AS m FROM {t} WHERE experiment_id=?"
+                for t in _DATA_TABLES
+            ]
+            sql = f"SELECT MAX(m) AS max_step FROM ({' UNION ALL '.join(parts)})"
+            row = conn.execute(sql, (experiment_id,) * len(_DATA_TABLES)).fetchone()
+            return row["max_step"] if row and row["max_step"] is not None else None
+
+    def find_next_suffix_name(self, base_name: str, project: str = "") -> str:
+        """Given 'exp', return 'exp (2)' or 'exp (3)' — next available suffix."""
+        import re
+
+        pattern = re.compile(r"^" + re.escape(base_name) + r" \((\d+)\)$")
+        max_n = 1  # base_name itself counts as 1
+
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if self._check_and_maybe_materialize():
+                        pass  # fall through
+                    else:
+                        for exp in self._cache_experiments:
+                            if exp.get("project", "") != project:
+                                continue
+                            m = pattern.match(exp["name"])
+                            if m:
+                                max_n = max(max_n, int(m.group(1)))
+                        return f"{base_name} ({max_n + 1})"
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT name FROM experiments WHERE project=? AND "
+                "(name=? OR name LIKE ?)",
+                (project, base_name, f"{base_name} (%"),
+            ).fetchall()
+            for row in rows:
+                m = pattern.match(row["name"])
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+        return f"{base_name} ({max_n + 1})"
 
     def delete_project(self, project: str) -> Optional[List[str]]:
         """Delete a project's experiments and all associated rows.
@@ -546,11 +654,7 @@ class Database:
                 return None
 
             exp_ids = [int(row["id"]) for row in rows]
-            log_dirs = sorted({
-                str(row["log_dir"])
-                for row in rows
-                if row["log_dir"]
-            })
+            log_dirs = sorted({str(row["log_dir"]) for row in rows if row["log_dir"]})
             placeholders = ",".join("?" for _ in exp_ids)
             params = tuple(exp_ids)
 
@@ -591,15 +695,22 @@ class Database:
                 return None
             log_dir = str(row["log_dir"]) if row["log_dir"] else ""
             for table in [
-                "scalars", "texts", "images", "histograms",
-                "hparams", "audio", "video", "artifacts",
+                "scalars",
+                "texts",
+                "images",
+                "histograms",
+                "hparams",
+                "audio",
+                "video",
+                "artifacts",
             ]:
                 conn.execute(
                     f"DELETE FROM {table} WHERE experiment_id=?",
                     (experiment_id,),
                 )
             conn.execute(
-                "DELETE FROM experiments WHERE id=?", (experiment_id,),
+                "DELETE FROM experiments WHERE id=?",
+                (experiment_id,),
             )
             return log_dir
 
@@ -716,10 +827,9 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        tags = sorted({
-                            r[1] for r in self._cache_scalars
-                            if r[0] == experiment_id
-                        })
+                        tags = sorted(
+                            {r[1] for r in self._cache_scalars if r[0] == experiment_id}
+                        )
                         return tags
         with self._connect() as conn:
             rows = conn.execute(
@@ -745,9 +855,7 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        self._cache_texts.append(
-                            (experiment_id, tag, step, value, wt)
-                        )
+                        self._cache_texts.append((experiment_id, tag, step, value, wt))
                         return
         with self._connect() as conn:
             conn.execute(
@@ -788,10 +896,9 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        return sorted({
-                            r[1] for r in self._cache_texts
-                            if r[0] == experiment_id
-                        })
+                        return sorted(
+                            {r[1] for r in self._cache_texts if r[0] == experiment_id}
+                        )
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT tag FROM texts WHERE experiment_id=? ORDER BY tag",
@@ -816,9 +923,7 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        self._cache_images.append(
-                            (experiment_id, tag, step, path, wt)
-                        )
+                        self._cache_images.append((experiment_id, tag, step, path, wt))
                         return
         with self._connect() as conn:
             conn.execute(
@@ -859,10 +964,9 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        return sorted({
-                            r[1] for r in self._cache_images
-                            if r[0] == experiment_id
-                        })
+                        return sorted(
+                            {r[1] for r in self._cache_images if r[0] == experiment_id}
+                        )
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT tag FROM images WHERE experiment_id=? ORDER BY tag",
@@ -911,8 +1015,12 @@ class Database:
                         pass  # fall through
                     else:
                         results = [
-                            {"step": r[2], "path": r[3],
-                             "sample_rate": r[4], "wall_time": r[5]}
+                            {
+                                "step": r[2],
+                                "path": r[3],
+                                "sample_rate": r[4],
+                                "wall_time": r[5],
+                            }
                             for r in self._cache_audio
                             if r[0] == experiment_id and r[1] == tag
                         ]
@@ -932,10 +1040,9 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        return sorted({
-                            r[1] for r in self._cache_audio
-                            if r[0] == experiment_id
-                        })
+                        return sorted(
+                            {r[1] for r in self._cache_audio if r[0] == experiment_id}
+                        )
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT tag FROM audio WHERE experiment_id=? ORDER BY tag",
@@ -960,9 +1067,7 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        self._cache_video.append(
-                            (experiment_id, tag, step, path, wt)
-                        )
+                        self._cache_video.append((experiment_id, tag, step, path, wt))
                         return
         with self._connect() as conn:
             conn.execute(
@@ -1003,10 +1108,9 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        return sorted({
-                            r[1] for r in self._cache_video
-                            if r[0] == experiment_id
-                        })
+                        return sorted(
+                            {r[1] for r in self._cache_video if r[0] == experiment_id}
+                        )
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT tag FROM video WHERE experiment_id=? ORDER BY tag",
@@ -1056,8 +1160,12 @@ class Database:
                         pass  # fall through
                     else:
                         results = [
-                            {"step": r[2], "path": r[3],
-                             "metadata": r[4], "wall_time": r[5]}
+                            {
+                                "step": r[2],
+                                "path": r[3],
+                                "metadata": r[4],
+                                "wall_time": r[5],
+                            }
                             for r in self._cache_artifacts
                             if r[0] == experiment_id and r[1] == tag
                         ]
@@ -1077,10 +1185,13 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        return sorted({
-                            r[1] for r in self._cache_artifacts
-                            if r[0] == experiment_id
-                        })
+                        return sorted(
+                            {
+                                r[1]
+                                for r in self._cache_artifacts
+                                if r[0] == experiment_id
+                            }
+                        )
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT tag FROM artifacts WHERE experiment_id=? ORDER BY tag",
@@ -1106,10 +1217,16 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        self._cache_histograms.append((
-                            experiment_id, tag, step,
-                            json.dumps(bins), json.dumps(counts), wt,
-                        ))
+                        self._cache_histograms.append(
+                            (
+                                experiment_id,
+                                tag,
+                                step,
+                                json.dumps(bins),
+                                json.dumps(counts),
+                                wt,
+                            )
+                        )
                         return
         with self._connect() as conn:
             conn.execute(
@@ -1164,10 +1281,13 @@ class Database:
                     if self._check_and_maybe_materialize():
                         pass  # fall through
                     else:
-                        return sorted({
-                            r[1] for r in self._cache_histograms
-                            if r[0] == experiment_id
-                        })
+                        return sorted(
+                            {
+                                r[1]
+                                for r in self._cache_histograms
+                                if r[0] == experiment_id
+                            }
+                        )
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT tag FROM histograms WHERE experiment_id=? ORDER BY tag",
@@ -1191,7 +1311,8 @@ class Database:
                         for k, v in hparams.items():
                             # Upsert: remove old entry if exists
                             self._cache_hparams = [
-                                r for r in self._cache_hparams
+                                r
+                                for r in self._cache_hparams
                                 if not (r[0] == experiment_id and r[1] == k)
                             ]
                             self._cache_hparams.append(
@@ -1240,15 +1361,22 @@ class Database:
                 return 0
             placeholders = ",".join("?" * len(ids))
             for table in (
-                "scalars", "texts", "images", "audio", "video",
-                "artifacts", "histograms", "hparams",
+                "scalars",
+                "texts",
+                "images",
+                "audio",
+                "video",
+                "artifacts",
+                "histograms",
+                "hparams",
             ):
                 conn.execute(
                     f"DELETE FROM {table} WHERE experiment_id IN ({placeholders})",
                     ids,
                 )
             conn.execute(
-                f"DELETE FROM experiments WHERE id IN ({placeholders})", ids,
+                f"DELETE FROM experiments WHERE id IN ({placeholders})",
+                ids,
             )
             return len(ids)
 

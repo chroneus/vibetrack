@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from typing import List, Sequence
 
@@ -108,4 +109,12 @@ def smooth(
             f"Unknown smoothing method {method!r}. "
             f"Choose from {list(dispatch.keys())}"
         )
-    return fn(values, **kwargs)
+    sig = inspect.signature(fn)
+    accepts_var_kw = any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if accepts_var_kw:
+        filtered = kwargs
+    else:
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    return fn(values, **filtered)

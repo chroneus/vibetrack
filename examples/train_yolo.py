@@ -36,6 +36,7 @@ writer = SummaryWriter("runs/yolo")
 
 # ── Callbacks ────────────────────────────────────────────────────
 
+
 def on_fit_epoch_end(trainer):
     """Log scalars at the end of each train+val epoch."""
     epoch = trainer.epoch
@@ -61,13 +62,15 @@ def on_train_end(trainer):
     datasets_dir = Path.home() / "datasets" / "coco8" / "images" / "val"
     if not datasets_dir.exists():
         from ultralytics.utils import DATASETS_DIR
+
         datasets_dir = Path(DATASETS_DIR) / "coco8" / "images" / "val"
 
     if not datasets_dir.exists():
         return
 
     img_files = sorted(
-        f for f in datasets_dir.iterdir()
+        f
+        for f in datasets_dir.iterdir()
         if f.suffix.lower() in (".jpg", ".jpeg", ".png")
     )[:8]
 

@@ -5,15 +5,36 @@ Requires: ``pip install vibetrack[gradio]``
 
 from __future__ import annotations
 
+import logging
 from typing import Any, List, Optional, Sequence
 
 from ..compare import compare_scalars, find_all_tags
 from ..config import load_config
 from .base import BaseOutput
 
+_log = logging.getLogger(__name__)
+
 
 class GradioOutput(BaseOutput):
     """Interactive Gradio dashboard with smoothing controls."""
+
+    # Events pushed via ``writer.to("gradio")`` accumulate here; the running
+    # dashboard (if any) polls this buffer on refresh.  When no dashboard is
+    # live the buffer simply keeps the most recent events.
+    _live_buffer: List[Any] = []
+    _live_buffer_max: int = 1024
+
+    def send(self, events: Sequence[Any]) -> None:
+        """Stage events for the live Gradio dashboard to pick up on next poll.
+
+        When no dashboard is running, events are kept (up to a cap) so that a
+        dashboard launched later can show recent history.
+        """
+        buf = GradioOutput._live_buffer
+        buf.extend(events)
+        overflow = len(buf) - GradioOutput._live_buffer_max
+        if overflow > 0:
+            del buf[:overflow]
 
     def show(self, **kwargs: Any) -> Any:
         tags: Optional[Sequence[str]] = kwargs.get("tags")
@@ -28,9 +49,7 @@ class GradioOutput(BaseOutput):
             tags = find_all_tags(exps)
 
         def make_plot(tag: str, smooth_w: float) -> dict:
-            comparison = compare_scalars(
-                exps, tag, smoothing="ema", weight=smooth_w
-            )
+            comparison = compare_scalars(exps, tag, smoothing="ema", weight=smooth_w)
             traces = []
             for entry in comparison:
                 import plotly.graph_objects as go  # type: ignore[import-untyped]
@@ -67,7 +86,9 @@ class GradioOutput(BaseOutput):
         def _resolve_media_path(rel_path: str) -> str:
             return rel_path
 
-        with gr.Blocks(title="vibetrack", theme=gr.themes.Soft(primary_hue="blue")) as demo:
+        with gr.Blocks(
+            title="vibetrack", theme=gr.themes.Soft(primary_hue="blue")
+        ) as demo:
             gr.Markdown("## vibetrack")
 
             if tags:
@@ -94,9 +115,7 @@ class GradioOutput(BaseOutput):
                                 gallery_items: List[Any] = []
                                 for r in rows:
                                     path = _resolve_media_path(r["abs_path"])
-                                    gallery_items.append(
-                                        (path, f"step {r['step']}")
-                                    )
+                                    gallery_items.append((path, f"step {r['step']}"))
                                 gr.Gallery(
                                     value=gallery_items,
                                     label=f"{exp.name}/{tag}",

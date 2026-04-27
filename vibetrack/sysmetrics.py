@@ -3,7 +3,7 @@
 Zero runtime dependencies at core.  Uses stdlib where possible and
 falls back gracefully when tools are unavailable.
 
-Optional: ``pip install vibetrack[system]``  (psutil) for richer CPU/memory.
+Optional: ``pip install vibetrack[all]``  (psutil) for richer CPU/memory.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 def _try_import_psutil() -> bool:
     try:
         import psutil  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -79,6 +80,7 @@ class SystemMetricsCollector:
         # CPU
         if self._has_psutil:
             import psutil
+
             psutil.cpu_percent(interval=0.1)  # prime the counter
             collectors.append(self._collect_cpu_psutil)
         elif hasattr(os, "getloadavg"):
@@ -111,7 +113,9 @@ class SystemMetricsCollector:
         # CPU
         ncpu = os.cpu_count() or "?"
         if "system/cpu_percent" in metrics:
-            lines.append(f"  CPU: {ncpu} cores, {metrics['system/cpu_percent']:.0f}% used")
+            lines.append(
+                f"  CPU: {ncpu} cores, {metrics['system/cpu_percent']:.0f}% used"
+            )
         elif "system/cpu_load_1m" in metrics:
             lines.append(
                 f"  CPU: {ncpu} cores, load {metrics['system/cpu_load_1m']:.2f} "
@@ -126,14 +130,18 @@ class SystemMetricsCollector:
             total = metrics["system/memory_total_gb"]
             avail = metrics.get("system/memory_available_gb", 0)
             pct = metrics.get("system/memory_used_percent", 0)
-            lines.append(f"  Mem: {total:.1f}G total, {avail:.1f}G free ({pct:.0f}% used)")
+            lines.append(
+                f"  Mem: {total:.1f}G total, {avail:.1f}G free ({pct:.0f}% used)"
+            )
 
         # Disk
         if "system/disk_total_gb" in metrics:
             total = metrics["system/disk_total_gb"]
             free = metrics["system/disk_free_gb"]
             pct = metrics["system/disk_used_percent"]
-            lines.append(f"  Disk: {total:.0f}G total, {free:.1f}G free ({pct:.0f}% used)")
+            lines.append(
+                f"  Disk: {total:.0f}G total, {free:.1f}G free ({pct:.0f}% used)"
+            )
 
         # GPU
         gpu_idx = 0
@@ -184,7 +192,9 @@ class SystemMetricsCollector:
             msg = "\n".join(alerts)
             print(f"\033[91m{msg}\033[0m")  # red text
             self._writer.add_text(
-                "system/alerts", msg, global_step=self._step,
+                "system/alerts",
+                msg,
+                global_step=self._step,
             )
 
         return alerts
@@ -231,21 +241,24 @@ class SystemMetricsCollector:
         except OSError:
             usage = shutil.disk_usage("/")
         return {
-            "system/disk_total_gb": usage.total / (1024 ** 3),
-            "system/disk_used_gb": usage.used / (1024 ** 3),
-            "system/disk_free_gb": usage.free / (1024 ** 3),
-            "system/disk_used_percent": (usage.used / usage.total) * 100 if usage.total else 0,
+            "system/disk_total_gb": usage.total / (1024**3),
+            "system/disk_used_gb": usage.used / (1024**3),
+            "system/disk_free_gb": usage.free / (1024**3),
+            "system/disk_used_percent": (
+                (usage.used / usage.total) * 100 if usage.total else 0
+            ),
         }
 
     # ── Memory (psutil) ────────────────────────────────────────
 
     def _collect_memory_psutil(self) -> Dict[str, float]:
         import psutil
+
         mem = psutil.virtual_memory()
         return {
-            "system/memory_total_gb": mem.total / (1024 ** 3),
-            "system/memory_used_gb": mem.used / (1024 ** 3),
-            "system/memory_available_gb": mem.available / (1024 ** 3),
+            "system/memory_total_gb": mem.total / (1024**3),
+            "system/memory_used_gb": mem.used / (1024**3),
+            "system/memory_available_gb": mem.available / (1024**3),
             "system/memory_used_percent": mem.percent,
         }
 
@@ -276,7 +289,10 @@ class SystemMetricsCollector:
         total_bytes = page_size * total_pages
 
         result = subprocess.run(
-            ["vm_stat"], capture_output=True, text=True, timeout=5,
+            ["vm_stat"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if result.returncode != 0:
             return {}
@@ -296,16 +312,19 @@ class SystemMetricsCollector:
         used_bytes = total_bytes - available_bytes
 
         return {
-            "system/memory_total_gb": total_bytes / (1024 ** 3),
-            "system/memory_used_gb": used_bytes / (1024 ** 3),
-            "system/memory_available_gb": available_bytes / (1024 ** 3),
-            "system/memory_used_percent": (used_bytes / total_bytes * 100) if total_bytes else 0,
+            "system/memory_total_gb": total_bytes / (1024**3),
+            "system/memory_used_gb": used_bytes / (1024**3),
+            "system/memory_available_gb": available_bytes / (1024**3),
+            "system/memory_used_percent": (
+                (used_bytes / total_bytes * 100) if total_bytes else 0
+            ),
         }
 
     # ── CPU (psutil) ────────────────────────────────────────────
 
     def _collect_cpu_psutil(self) -> Dict[str, float]:
         import psutil
+
         return {
             "system/cpu_percent": psutil.cpu_percent(interval=None),
             "system/cpu_count": float(os.cpu_count() or 1),
@@ -364,7 +383,13 @@ class SystemMetricsCollector:
 
 def get_resource_snapshot() -> Dict[str, Any]:
     """Return a structured snapshot of system resources for the web UI."""
-    result: Dict[str, Any] = {"cpu": {}, "memory": {}, "disk": {}, "gpus": [], "alerts": []}
+    result: Dict[str, Any] = {
+        "cpu": {},
+        "memory": {},
+        "disk": {},
+        "gpus": [],
+        "alerts": [],
+    }
 
     # CPU
     ncpu = os.cpu_count() or 0
@@ -381,11 +406,12 @@ def get_resource_snapshot() -> Dict[str, Any]:
     mem_free_gb: Optional[float] = None
     if _try_import_psutil():
         import psutil
+
         mem = psutil.virtual_memory()
-        mem_free_gb = mem.available / (1024 ** 3)
+        mem_free_gb = mem.available / (1024**3)
         result["memory"] = {
-            "total_gb": round(mem.total / (1024 ** 3), 1),
-            "used_gb": round(mem.used / (1024 ** 3), 1),
+            "total_gb": round(mem.total / (1024**3), 1),
+            "used_gb": round(mem.used / (1024**3), 1),
             "free_gb": round(mem_free_gb, 1),
             "percent": mem.percent,
         }
@@ -412,10 +438,10 @@ def get_resource_snapshot() -> Dict[str, Any]:
     disk_free_gb: Optional[float] = None
     try:
         usage = shutil.disk_usage(".")
-        disk_free_gb = usage.free / (1024 ** 3)
+        disk_free_gb = usage.free / (1024**3)
         result["disk"] = {
-            "total_gb": round(usage.total / (1024 ** 3), 1),
-            "used_gb": round(usage.used / (1024 ** 3), 1),
+            "total_gb": round(usage.total / (1024**3), 1),
+            "used_gb": round(usage.used / (1024**3), 1),
             "free_gb": round(disk_free_gb, 1),
             "percent": round(usage.used / usage.total * 100, 1) if usage.total else 0,
         }
@@ -426,23 +452,29 @@ def get_resource_snapshot() -> Dict[str, Any]:
     if shutil.which("nvidia-smi"):
         try:
             r = subprocess.run(
-                ["nvidia-smi",
-                 "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if r.returncode == 0 and r.stdout.strip():
                 for row in r.stdout.strip().splitlines():
                     parts = [p.strip() for p in row.split(",")]
                     if len(parts) >= 6:
-                        result["gpus"].append({
-                            "index": parts[0],
-                            "name": parts[1],
-                            "util_percent": float(parts[2]),
-                            "mem_used_mb": float(parts[3]),
-                            "mem_total_mb": float(parts[4]),
-                            "temp_c": float(parts[5]),
-                        })
+                        result["gpus"].append(
+                            {
+                                "index": parts[0],
+                                "name": parts[1],
+                                "util_percent": float(parts[2]),
+                                "mem_used_mb": float(parts[3]),
+                                "mem_total_mb": float(parts[4]),
+                                "temp_c": float(parts[5]),
+                            }
+                        )
         except Exception:
             pass
 
@@ -460,6 +492,7 @@ def get_resource_snapshot() -> Dict[str, Any]:
 
 # ── Standalone resource check (used when no writer/collector exists) ──────────
 
+
 def check_resources() -> str:
     """Run nvidia-smi, free, df, and CPU load; return a formatted report with alerts."""
     lines: List[str] = ["=== System resources ==="]
@@ -470,9 +503,14 @@ def check_resources() -> str:
     if shutil.which("nvidia-smi"):
         try:
             r = subprocess.run(
-                ["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if r.returncode == 0 and r.stdout.strip():
                 lines.append("--- GPU ---")
@@ -495,7 +533,9 @@ def check_resources() -> str:
     mem_free_gb: Optional[float] = None
     if shutil.which("free"):
         try:
-            r = subprocess.run(["free", "-h"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run(
+                ["free", "-h"], capture_output=True, text=True, timeout=5
+            )
             if r.returncode == 0:
                 lines.append("--- Memory ---")
                 lines.extend("  " + l for l in r.stdout.strip().splitlines())
@@ -508,11 +548,15 @@ def check_resources() -> str:
                 for line in f:
                     parts = line.split()
                     info[parts[0].rstrip(":")] = int(parts[1])
-            mem_free_gb = info.get("MemAvailable", info.get("MemFree", 0)) / (1024 * 1024)
+            mem_free_gb = info.get("MemAvailable", info.get("MemFree", 0)) / (
+                1024 * 1024
+            )
             if not shutil.which("free"):
                 total_gb = info.get("MemTotal", 0) / (1024 * 1024)
                 lines.append("--- Memory ---")
-                lines.append(f"  Total: {total_gb:.1f} GB, Available: {mem_free_gb:.1f} GB")
+                lines.append(
+                    f"  Total: {total_gb:.1f} GB, Available: {mem_free_gb:.1f} GB"
+                )
         except Exception:
             pass
 
@@ -520,7 +564,7 @@ def check_resources() -> str:
     disk_free_gb: Optional[float] = None
     try:
         usage = shutil.disk_usage(".")
-        disk_free_gb = usage.free / (1024 ** 3)
+        disk_free_gb = usage.free / (1024**3)
         lines.append("--- Disk (.) ---")
         lines.append(
             f"  Total: {usage.total / (1024 ** 3):.0f}G, "

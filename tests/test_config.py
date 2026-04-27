@@ -22,7 +22,9 @@ def _isolate_config(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "vibetrack.config.config_path", lambda: fake_dir / "config.json"
     )
-    monkeypatch.setattr("vibetrack.config._OLD_CONFIG_DIR", tmp_path / "legacy_cfg")
+    monkeypatch.setattr(
+        "vibetrack.config.VIBETRACK_CONFIG_DIR", tmp_path / "legacy_cfg"
+    )
 
 
 class TestDefaults:
@@ -32,12 +34,18 @@ class TestDefaults:
         assert cfg["smooth_weight"] == 0.6
         assert cfg["web"]["theme"] == "light"
         assert cfg["web"]["auto_refresh"] == 5
+        assert cfg["web"]["raw_scalar_opacity"] == 0.17
+        assert cfg["web"]["x_axis_mode"] == "step"
         assert cfg["gradio"]["share"] is False
 
 
 class TestSaveAndLoad:
     def test_roundtrip(self, tmp_path):
-        custom = {"smoothing": "gaussian", "smooth_weight": 0.3, "web": {"theme": "light", "auto_refresh": 10}}
+        custom = {
+            "smoothing": "gaussian",
+            "smooth_weight": 0.3,
+            "web": {"theme": "light", "auto_refresh": 10},
+        }
         save_config(custom)
         loaded = load_config()
         assert loaded["smoothing"] == "gaussian"
@@ -58,10 +66,13 @@ class TestSaveAndLoad:
         assert loaded["smoothing"] == "none"
         assert loaded["smooth_weight"] == 0.6
         assert loaded["web"]["theme"] == "light"
+        assert loaded["web"]["raw_scalar_opacity"] == 0.17
         assert loaded["gradio"]["share"] is False
 
     def test_viewer_specific_section(self, tmp_path):
-        save_config({"gradio": {"share": True}, "web": {"theme": "light", "auto_refresh": 5}})
+        save_config(
+            {"gradio": {"share": True}, "web": {"theme": "light", "auto_refresh": 5}}
+        )
         loaded = load_config()
         assert loaded["gradio"]["share"] is True
         assert loaded["web"]["theme"] == "light"

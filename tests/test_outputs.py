@@ -3,6 +3,7 @@
 import asyncio
 import io
 import inspect
+import importlib.util
 import logging
 from pathlib import Path
 from unittest import mock
@@ -62,7 +63,9 @@ def populated_project(tmp_path):
     project_folder = tmp_path / "project"
     for name, lr in [("run_a", 0.01), ("run_b", 0.001)]:
         run_dir = project_folder / name
-        with SummaryWriter(str(run_dir), name=name, project_folder=str(project_folder)) as w:
+        with SummaryWriter(
+            str(run_dir), name=name, project_folder=str(project_folder)
+        ) as w:
             for i in range(30):
                 w.add_scalar("loss", lr * 10 / (i + 1), i)
                 w.add_scalar("acc", 1.0 - lr * 10 / (i + 1), i)
@@ -124,7 +127,7 @@ class TestConsoleOutput:
 
 class TestCLI:
     def test_no_args_defaults_to_web(self, tmp_path, monkeypatch):
-        """vibetrack with no args should default to the 'web' viewer (web+mcp+ingest on one port)."""
+        """vibetrack with no args should default to the 'web' viewer."""
         from vibetrack.cli import main
 
         central_path = tmp_path / ".vibetrack" / "vibetrack.db"
@@ -151,23 +154,44 @@ class TestCLI:
         """--listen should start the ingest server thread."""
         from vibetrack.cli import main
 
-        with mock.patch("vibetrack.cli._start_listen_server") as mock_listen, \
-             mock.patch("vibetrack.viewers.web.WebOutput.show"):
-            main(["--project-folder", populated_project, "--viewer", "web", "--listen", "0.0.0.0:9009"])
-            mock_listen.assert_called_once_with(populated_project, "0.0.0.0", 9009, None)
+        with mock.patch(
+            "vibetrack.cli._start_listen_server"
+        ) as mock_listen, mock.patch("vibetrack.viewers.web.WebOutput.show"):
+            main(
+                [
+                    "--project-folder",
+                    populated_project,
+                    "--viewer",
+                    "web",
+                    "--listen",
+                    "0.0.0.0:9009",
+                ]
+            )
+            mock_listen.assert_called_once_with(
+                populated_project, "0.0.0.0", 9009, None
+            )
 
     def test_listen_with_token(self, populated_project):
         from vibetrack.cli import main
 
-        with mock.patch("vibetrack.cli._start_listen_server") as mock_listen, \
-             mock.patch("vibetrack.viewers.web.WebOutput.show"):
-            main([
-                "--project-folder", populated_project,
-                "--viewer", "web",
-                "--listen", "0.0.0.0:9009",
-                "--token", "abc",
-            ])
-            mock_listen.assert_called_once_with(populated_project, "0.0.0.0", 9009, "abc")
+        with mock.patch(
+            "vibetrack.cli._start_listen_server"
+        ) as mock_listen, mock.patch("vibetrack.viewers.web.WebOutput.show"):
+            main(
+                [
+                    "--project-folder",
+                    populated_project,
+                    "--viewer",
+                    "web",
+                    "--listen",
+                    "0.0.0.0:9009",
+                    "--token",
+                    "abc",
+                ]
+            )
+            mock_listen.assert_called_once_with(
+                populated_project, "0.0.0.0", 9009, "abc"
+            )
 
     def test_migrate_command(self, tmp_path):
         from vibetrack.cli import main
@@ -178,7 +202,9 @@ class TestCLI:
             run_dir = project_folder / name
             run_dir.mkdir()
             db = Database(run_dir / "vibetrack.db")
-            exp_id = db.create_experiment(name, project=project_folder.name, log_dir=str(run_dir))
+            exp_id = db.create_experiment(
+                name, project=project_folder.name, log_dir=str(run_dir)
+            )
             db.add_scalar(exp_id, "loss", 0.5, 0)
             db.close()
 
@@ -277,11 +303,14 @@ class TestListenServer:
 
     def test_log_scalars(self, listen_app):
         client, project_folder = listen_app
-        resp = client.post("/log", json={
-            "experiment": "remote_run",
-            "step": 0,
-            "scalars": {"loss": 0.5, "acc": 0.9},
-        })
+        resp = client.post(
+            "/log",
+            json={
+                "experiment": "remote_run",
+                "step": 0,
+                "scalars": {"loss": 0.5, "acc": 0.9},
+            },
+        )
         assert resp.status_code == 200
 
         reader = RunReader(str(project_folder))
@@ -294,11 +323,14 @@ class TestListenServer:
 
     def test_log_texts(self, listen_app):
         client, project_folder = listen_app
-        resp = client.post("/log", json={
-            "experiment": "text_run",
-            "step": 0,
-            "texts": {"note": "hello world"},
-        })
+        resp = client.post(
+            "/log",
+            json={
+                "experiment": "text_run",
+                "step": 0,
+                "texts": {"note": "hello world"},
+            },
+        )
         assert resp.status_code == 200
 
         reader = RunReader(str(project_folder))
@@ -308,9 +340,14 @@ class TestListenServer:
         reader.close()
 
     def test_token_rejects_unauthorized(self, listen_app_with_token):
-        resp = listen_app_with_token.post("/log", json={
-            "experiment": "x", "step": 0, "scalars": {},
-        })
+        resp = listen_app_with_token.post(
+            "/log",
+            json={
+                "experiment": "x",
+                "step": 0,
+                "scalars": {},
+            },
+        )
         assert resp.status_code == 401
 
     def test_token_accepts_authorized(self, listen_app_with_token):
@@ -327,8 +364,19 @@ class TestListenServer:
         client = _ASGIClient(_create_listen_app(str(tmp_path), token=None))
         resp = client.post(
             "/media",
-            data={"experiment": "media_run", "tag": "sample", "step": "0", "type": "artifact"},
-            files={"file": ("test.bin", io.BytesIO(b"fake data"), "application/octet-stream")},
+            data={
+                "experiment": "media_run",
+                "tag": "sample",
+                "step": "0",
+                "type": "artifact",
+            },
+            files={
+                "file": (
+                    "test.bin",
+                    io.BytesIO(b"fake data"),
+                    "application/octet-stream",
+                )
+            },
         )
         assert resp.status_code == 200
 
@@ -356,7 +404,13 @@ class TestUploadSecurity:
         resp = client.post(
             "/media",
             data={"experiment": "e", "tag": "t", "step": "0", "type": "image"},
-            files={"file": ("evil.exe", io.BytesIO(b"MZ\x90\x00"), "application/octet-stream")},
+            files={
+                "file": (
+                    "evil.exe",
+                    io.BytesIO(b"MZ\x90\x00"),
+                    "application/octet-stream",
+                )
+            },
         )
         assert resp.status_code == 400
 
@@ -364,7 +418,9 @@ class TestUploadSecurity:
         resp = client.post(
             "/media",
             data={"experiment": "e", "tag": "t", "step": "0", "type": "image"},
-            files={"file": ("photo.png", io.BytesIO(b"\x89PNG\r\n\x1a\nfake"), "image/png")},
+            files={
+                "file": ("photo.png", io.BytesIO(b"\x89PNG\r\n\x1a\nfake"), "image/png")
+            },
         )
         assert resp.status_code == 200
 
@@ -373,7 +429,9 @@ class TestUploadSecurity:
         resp = client.post(
             "/media",
             data={"experiment": "e", "tag": "t", "step": "0", "type": "artifact"},
-            files={"file": ("model.pkl", io.BytesIO(b"data"), "application/octet-stream")},
+            files={
+                "file": ("model.pkl", io.BytesIO(b"data"), "application/octet-stream")
+            },
         )
         assert resp.status_code == 200
 
@@ -407,7 +465,9 @@ class TestUploadHelpers:
         upload = self._FakeUpload([b"abc", b"def"])
         with pytest.raises(ValueError, match="File too large"):
             asyncio.run(
-                _write_upload_to_tempfile(upload, suffix=".bin", max_bytes=5, chunk_size=3)
+                _write_upload_to_tempfile(
+                    upload, suffix=".bin", max_bytes=5, chunk_size=3
+                )
             )
 
 
@@ -419,6 +479,22 @@ class TestWebSerialization:
         serialized = _json_for_html(payload)
         assert "</script>" not in serialized
         assert "\\u003c/script>" in serialized
+
+
+class TestWallTimesInPayload:
+    def test_scalar_data_includes_wall_times(self, populated_project):
+        from vibetrack.viewers.web import _build_data, WebOutput
+
+        output = WebOutput(populated_project)
+        exps = output._resolve_experiments()
+        data = _build_data(exps)
+        assert len(data) > 0
+        exp = data[0]
+        for tag, scalar_data in exp["scalars"].items():
+            assert "wall_times" in scalar_data
+            assert len(scalar_data["wall_times"]) == len(scalar_data["steps"])
+            assert all(isinstance(t, float) for t in scalar_data["wall_times"])
+        output.close()
 
 
 class TestMediaPathTraversal:
@@ -459,7 +535,17 @@ class TestMediaPathTraversal:
 
     def test_nested_traversal_rejected(self, web_app):
         client, project_folder = web_app
-        attempted = project_folder / "run_a" / "media" / "samples" / ".." / ".." / ".." / "etc" / "shadow"
+        attempted = (
+            project_folder
+            / "run_a"
+            / "media"
+            / "samples"
+            / ".."
+            / ".."
+            / ".."
+            / "etc"
+            / "shadow"
+        )
         resp = _call_app_route(client._app, "/media", path=str(attempted))
         assert resp.status_code in (403, 404)
 
@@ -498,7 +584,9 @@ class TestWebProjectRouting:
 
         monkeypatch.setattr("vibetrack.reader.central_db_path", lambda: central_db)
         monkeypatch.setattr("vibetrack.config.config_dir", lambda: config_root)
-        monkeypatch.setattr("vibetrack.config.config_path", lambda: config_root / "config.json")
+        monkeypatch.setattr(
+            "vibetrack.config.config_path", lambda: config_root / "config.json"
+        )
 
         captured: dict = {}
 
@@ -524,23 +612,39 @@ class TestWebProjectRouting:
         resp = _call_app_route(central_web_app._app, "/{project}", project="alpha")
         assert resp.status_code == 200
         body = resp.body.decode()
-        assert "/api/data/alpha" in body
-        assert "/api/rename/alpha" in body
-        assert "/api/config/alpha" in body
+        # Project is injected into the template as window.VT_PROJECT; the JS
+        # apiUrl() helper suffixes it onto /api/* calls at runtime.
+        assert 'window.VT_PROJECT = "alpha"' in body
         assert "run_a" in body
         assert "run_b" not in body
 
     def test_project_api_returns_only_selected_project(self, central_web_app):
-        data = _call_app_route(central_web_app._app, "/api/data/{project}", project="alpha")
+        data = _call_app_route(
+            central_web_app._app, "/api/data/{project}", project="alpha"
+        )
         assert [item["name"] for item in data] == ["run_a"]
 
     def test_project_settings_are_isolated(self, central_web_app):
-        alpha = central_web_app.post("/api/config/alpha", json={"web": {"theme": "light"}})
-        beta = central_web_app.post("/api/config/beta", json={"web": {"theme": "orange"}})
+        alpha = central_web_app.post(
+            "/api/config/alpha", json={"web": {"theme": "light"}}
+        )
+        beta = central_web_app.post(
+            "/api/config/beta", json={"web": {"theme": "orange"}}
+        )
         assert alpha.status_code == 200
         assert beta.status_code == 200
-        assert _call_app_route(central_web_app._app, "/api/config/{project}", project="alpha")["web"]["theme"] == "light"
-        assert _call_app_route(central_web_app._app, "/api/config/{project}", project="beta")["web"]["theme"] == "orange"
+        assert (
+            _call_app_route(
+                central_web_app._app, "/api/config/{project}", project="alpha"
+            )["web"]["theme"]
+            == "light"
+        )
+        assert (
+            _call_app_route(
+                central_web_app._app, "/api/config/{project}", project="beta"
+            )["web"]["theme"]
+            == "orange"
+        )
 
     @pytest.fixture
     def movable_web_app(self, tmp_path, monkeypatch):
@@ -555,7 +659,9 @@ class TestWebProjectRouting:
         monkeypatch.setattr("vibetrack.writer.central_db_path", lambda: central_db)
         monkeypatch.setattr("vibetrack.reader.central_db_path", lambda: central_db)
         monkeypatch.setattr("vibetrack.config.config_dir", lambda: config_root)
-        monkeypatch.setattr("vibetrack.config.config_path", lambda: config_root / "config.json")
+        monkeypatch.setattr(
+            "vibetrack.config.config_path", lambda: config_root / "config.json"
+        )
 
         old_dir = tmp_path / "alpha" / "runs" / "run_a"
         with SummaryWriter(
@@ -601,8 +707,6 @@ class TestWebProjectRouting:
         assert exp["log_dir"] == str(new_dir)
         db.close()
 
-
-
     @pytest.fixture
     def deletable_central_web_app(self, tmp_path, monkeypatch):
         pytest.importorskip("fastapi")
@@ -616,7 +720,9 @@ class TestWebProjectRouting:
         monkeypatch.setattr("vibetrack.writer.central_db_path", lambda: central_db)
         monkeypatch.setattr("vibetrack.reader.central_db_path", lambda: central_db)
         monkeypatch.setattr("vibetrack.config.config_dir", lambda: config_root)
-        monkeypatch.setattr("vibetrack.config.config_path", lambda: config_root / "config.json")
+        monkeypatch.setattr(
+            "vibetrack.config.config_path", lambda: config_root / "config.json"
+        )
 
         seed = tmp_path / "seed.bin"
         seed.write_bytes(b"checkpoint")
@@ -650,14 +756,21 @@ class TestWebProjectRouting:
         with mock.patch.object(uvicorn, "run", side_effect=_capture):
             output._serve_uvicorn(None, "127.0.0.1", 6006)
 
-        return _ASGIClient(captured["app"]), central_db, alpha_run / "media", beta_run / "media"
+        return (
+            _ASGIClient(captured["app"]),
+            central_db,
+            alpha_run / "media",
+            beta_run / "media",
+        )
 
     def test_delete_project_removes_rows_and_artifacts(self, deletable_central_web_app):
         client, central_db, alpha_media, beta_media = deletable_central_web_app
         assert alpha_media.exists()
         assert beta_media.exists()
 
-        resp = _call_app_route(client._app, "/api/project/{project}", method="DELETE", project="alpha")
+        resp = _call_app_route(
+            client._app, "/api/project/{project}", method="DELETE", project="alpha"
+        )
         assert resp.status_code == 200
         assert resp.body and b'"ok":true' in resp.body
 
@@ -669,7 +782,12 @@ class TestWebProjectRouting:
 
         assert not alpha_media.exists()
         assert beta_media.exists()
-        assert _call_app_route(client._app, "/api/data/{project}", project="alpha").status_code == 404
+        assert (
+            _call_app_route(
+                client._app, "/api/data/{project}", project="alpha"
+            ).status_code
+            == 404
+        )
 
 
 class TestUnifiedServer:
@@ -686,7 +804,9 @@ class TestUnifiedServer:
         project_folder = tmp_path / "project"
         for name in ["run_a"]:
             run_dir = project_folder / name
-            with SummaryWriter(str(run_dir), name=name, project_folder=str(project_folder)) as w:
+            with SummaryWriter(
+                str(run_dir), name=name, project_folder=str(project_folder)
+            ) as w:
                 for i in range(5):
                     w.add_scalar("loss", 1.0 / (i + 1), i)
 
@@ -701,13 +821,15 @@ class TestUnifiedServer:
 
         return _ASGIClient(captured["app"]), project_folder
 
+    @pytest.mark.skipif(
+        importlib.util.find_spec("mcp") is None,
+        reason="MCP optional dependency not installed",
+    )
     def test_mcp_mounted(self, unified_app):
         """MCP sub-app should be mounted at /vibetrack_mcp."""
         client, _ = unified_app
         app = client._app
-        mount_paths = [
-            getattr(route, "path", None) for route in app.routes
-        ]
+        mount_paths = [getattr(route, "path", None) for route in app.routes]
         assert "/vibetrack_mcp" in mount_paths
 
     def test_listen_log(self, unified_app):
@@ -769,7 +891,18 @@ class TestUnifiedServer:
         project_name = project_folder.name
         resp = client.post(
             f"/{project_name}/listen/media",
-            data={"experiment": "media_run", "tag": "sample", "step": "0", "type": "artifact"},
-            files={"file": ("test.bin", io.BytesIO(b"fake data"), "application/octet-stream")},
+            data={
+                "experiment": "media_run",
+                "tag": "sample",
+                "step": "0",
+                "type": "artifact",
+            },
+            files={
+                "file": (
+                    "test.bin",
+                    io.BytesIO(b"fake data"),
+                    "application/octet-stream",
+                )
+            },
         )
         assert resp.status_code == 200

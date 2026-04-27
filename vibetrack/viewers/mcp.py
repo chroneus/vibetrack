@@ -1,6 +1,5 @@
-"""MCP server — expose experiment data as MCP tools and resources.
+"""MCP server — expose experiment data as MCP tools and resources."""
 
-"""
 from __future__ import annotations
 
 import contextlib
@@ -67,16 +66,18 @@ class MCPOutput(BaseOutput):
             if not exps:
                 return json.dumps({"error": f"Experiment {experiment!r} not found"})
             exp = exps[0]
-            return json.dumps({
-                "name": exp.name,
-                "scalars": exp.scalar_tags(),
-                "texts": exp.text_tags(),
-                "images": exp.image_tags(),
-                "audio": exp.audio_tags(),
-                "video": exp.video_tags(),
-                "artifacts": exp.artifact_tags(),
-                "histograms": exp.histogram_tags(),
-            })
+            return json.dumps(
+                {
+                    "name": exp.name,
+                    "scalars": exp.scalar_tags(),
+                    "texts": exp.text_tags(),
+                    "images": exp.image_tags(),
+                    "audio": exp.audio_tags(),
+                    "video": exp.video_tags(),
+                    "artifacts": exp.artifact_tags(),
+                    "histograms": exp.histogram_tags(),
+                }
+            )
 
         @mcp.tool()
         def get_scalars(experiment: str, tag: str) -> str:
@@ -169,19 +170,21 @@ class MCPOutput(BaseOutput):
             if not exps:
                 return json.dumps({"error": f"Experiment {name!r} not found"})
             exp = exps[0]
-            return json.dumps({
-                "name": exp.name,
-                "experiment_id": exp.experiment_id,
-                "scalars": exp.scalar_tags(),
-                "texts": exp.text_tags(),
-                "images": exp.image_tags(),
-                "audio": exp.audio_tags(),
-                "video": exp.video_tags(),
-                "artifacts": exp.artifact_tags(),
-                "histograms": exp.histogram_tags(),
-                "hparams": exp.hparams(),
-                "config": exp.config(),
-            })
+            return json.dumps(
+                {
+                    "name": exp.name,
+                    "experiment_id": exp.experiment_id,
+                    "scalars": exp.scalar_tags(),
+                    "texts": exp.text_tags(),
+                    "images": exp.image_tags(),
+                    "audio": exp.audio_tags(),
+                    "video": exp.video_tags(),
+                    "artifacts": exp.artifact_tags(),
+                    "histograms": exp.histogram_tags(),
+                    "hparams": exp.hparams(),
+                    "config": exp.config(),
+                }
+            )
 
         @mcp.resource("vibetrack://experiments/{name}/scalars/{tag}")
         def experiment_scalars(name: str, tag: str) -> str:
@@ -254,10 +257,13 @@ class MCPOutput(BaseOutput):
         path = "/mcp" if transport == "streamable-http" else "/sse"
         print(f"vibetrack MCP server: http://{host}:{port}{path}")
         if transport == "streamable-http":
+
             def _run() -> None:
                 with _suppress_streamable_http_startup_log():
                     self._mcp.run(transport=transport)
+
         else:
+
             def _run() -> None:
                 self._mcp.run(transport=transport)
 
@@ -274,7 +280,8 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=6006, help="Port (default: 6006)")
     parser.add_argument(
-        "--transport", default="streamable-http",
+        "--transport",
+        default="streamable-http",
         choices=["streamable-http", "sse"],
         help="MCP transport (default: streamable-http)",
     )

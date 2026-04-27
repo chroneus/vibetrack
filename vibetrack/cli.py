@@ -76,7 +76,8 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
     normalized_project_folder = _normalize_project_folder(project_folder)
     project_root = (
         Path(normalized_project_folder).resolve()
-        if normalized_project_folder is not None else None
+        if normalized_project_folder is not None
+        else None
     )
 
     def _new_writer(name: str) -> SummaryWriter:
@@ -130,15 +131,32 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
         try:
             raw_suffix = os.path.splitext(file.filename or "")[1].lower()
             if type not in {"image", "audio", "video", "artifact"}:
-                raise HTTPException(status_code=400, detail=f"Unsupported upload type {type!r}")
+                raise HTTPException(
+                    status_code=400, detail=f"Unsupported upload type {type!r}"
+                )
 
             if type == "artifact":
-                if raw_suffix in {".html", ".htm", ".js", ".svg", ".php", ".sh", ".exe", ".cgi", ".pl"}:
-                    raise HTTPException(status_code=400, detail="Refusing to serve potentially dangerous file extension")
+                if raw_suffix in {
+                    ".html",
+                    ".htm",
+                    ".js",
+                    ".svg",
+                    ".php",
+                    ".sh",
+                    ".exe",
+                    ".cgi",
+                    ".pl",
+                }:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Refusing to serve potentially dangerous file extension",
+                    )
             else:
                 allowed = _ALLOWED_SUFFIXES.get(type)
                 if allowed is not None and raw_suffix not in allowed:
-                    raise HTTPException(status_code=400, detail=f"Unsupported file type for {type!r}")
+                    raise HTTPException(
+                        status_code=400, detail=f"Unsupported file type for {type!r}"
+                    )
 
             try:
                 tmp_path = await _write_upload_to_tempfile(file, suffix=raw_suffix)
@@ -184,16 +202,18 @@ def _start_listen_server(
 
 
 def _experiment_has_data(db: Database, experiment_id: int) -> bool:
-    return any([
-        db.get_scalar_tags(experiment_id),
-        db.get_text_tags(experiment_id),
-        db.get_image_tags(experiment_id),
-        db.get_audio_tags(experiment_id),
-        db.get_video_tags(experiment_id),
-        db.get_artifact_tags(experiment_id),
-        db.get_histogram_tags(experiment_id),
-        db.get_hparams(experiment_id),
-    ])
+    return any(
+        [
+            db.get_scalar_tags(experiment_id),
+            db.get_text_tags(experiment_id),
+            db.get_image_tags(experiment_id),
+            db.get_audio_tags(experiment_id),
+            db.get_video_tags(experiment_id),
+            db.get_artifact_tags(experiment_id),
+            db.get_histogram_tags(experiment_id),
+            db.get_hparams(experiment_id),
+        ]
+    )
 
 
 def _migrate_experiment(
@@ -303,13 +323,15 @@ def migrate_project(project_folder: str) -> int:
     """Merge legacy per-run DBs into the project-level DB."""
     project_root = Path(project_folder).resolve()
     if not project_root.exists():
-        print(f"Error: project folder {str(project_root)!r} does not exist.", file=sys.stderr)
+        print(
+            f"Error: project folder {str(project_root)!r} does not exist.",
+            file=sys.stderr,
+        )
         return 1
 
     target_db_path = project_root / "vibetrack.db"
     legacy_dbs = sorted(
-        path for path in project_root.rglob("vibetrack.db")
-        if path != target_db_path
+        path for path in project_root.rglob("vibetrack.db") if path != target_db_path
     )
     if not legacy_dbs:
         print(f"No legacy run databases found under {project_root}.")
@@ -380,7 +402,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--viewer",
         default="web",
-        help="Viewer backend (default: web). Web includes MCP + ingest. Use 'mcp', 'console', etc. for standalone.",
+        help=(
+            "Viewer backend (default: web). Web includes ingest, and MCP when "
+            "installed via vibetrack[all]. Use 'mcp', 'console', etc. for standalone."
+        ),
     )
     parser.add_argument(
         "--listen",
@@ -431,19 +456,39 @@ def main(argv: Optional[List[str]] = None) -> None:
         try:
             listen_host, listen_port = _parse_listen(args.listen)
         except ValueError:
-            print(f"Invalid --listen value: {args.listen!r}. Use HOST:PORT or PORT.", file=sys.stderr)
+            print(
+                f"Invalid --listen value: {args.listen!r}. Use HOST:PORT or PORT.",
+                file=sys.stderr,
+            )
             sys.exit(1)
         try:
             _start_listen_server(project_folder, listen_host, listen_port, args.token)
         except ImportError:
-            print("FastAPI/uvicorn required for --listen. Install with: pip install vibetrack[web]", file=sys.stderr)
+            print(
+                "FastAPI/uvicorn required for --listen. Install with: pip install vibetrack",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
     from .viewers import load_viewer
 
     viewer_cls = load_viewer(args.viewer)
     viewer = viewer_cls(project_folder)
-    viewer.show(host=args.host, port=args.port, token=args.token, mcp_transport=args.mcp_transport)
+    try:
+        viewer.show(
+            host=args.host,
+            port=args.port,
+            token=args.token,
+            mcp_transport=args.mcp_transport,
+        )
+    except ImportError:
+        if args.viewer == "mcp":
+            print(
+                "MCP viewer requires the optional MCP dependency. Install with: pip install vibetrack[all]",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":

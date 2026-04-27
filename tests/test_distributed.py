@@ -79,7 +79,9 @@ class TestRankZeroLogs:
     def test_rank_zero_writes_to_db(self, tmp_path):
         pf = tmp_path / "project"
         w = SummaryWriter(
-            str(tmp_path / "run1"), project="test", rank=0,
+            str(tmp_path / "run1"),
+            project="test",
+            rank=0,
             project_folder=str(pf),
         )
         w.add_scalar("loss", 0.5, 0)
@@ -91,7 +93,9 @@ class TestRankZeroLogs:
         monkeypatch.setenv("RANK", "3")
         pf = tmp_path / "project"
         w = SummaryWriter(
-            str(tmp_path / "run1"), project="test", rank="all",
+            str(tmp_path / "run1"),
+            project="test",
+            rank="all",
             project_folder=str(pf),
         )
         assert w._enabled
@@ -104,9 +108,12 @@ class TestRankZeroLogs:
 class TestInitModuleAPI:
     def test_init_with_rank(self, tmp_path):
         import vibetrack
+
         w = vibetrack.init(
-            project="test", name="noop_run",
-            log_dir=str(tmp_path / "run1"), rank=1,
+            project="test",
+            name="noop_run",
+            log_dir=str(tmp_path / "run1"),
+            rank=1,
         )
         assert not w._enabled
         vibetrack.log({"loss": 0.5})  # should not crash

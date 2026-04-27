@@ -35,12 +35,36 @@ def _sparkline(values: Sequence[float], width: int = 40) -> str:
 class ConsoleOutput(BaseOutput):
     """Print experiment summaries and sparkline charts to the terminal."""
 
+    def send(self, events: Sequence[Any]) -> None:
+        """Print a one-line summary per event — used by ``writer.to("console")``."""
+        for ev in events:
+            step_s = f"step={ev.step}" if ev.step is not None else "—"
+            if ev.kind == "scalar":
+                line = f"[{step_s}] {ev.tag}={ev.value:.6g}"
+            elif ev.kind == "text":
+                body = str(ev.value)
+                if len(body) > 160:
+                    body = body[:160] + "…"
+                line = f"[{step_s}] {ev.tag}: {body}"
+            elif ev.kind in ("image", "audio", "video", "artifact"):
+                line = f"[{step_s}] {ev.kind} {ev.tag} -> {ev.value}"
+            elif ev.kind == "histogram":
+                line = f"[{step_s}] histogram {ev.tag}"
+            elif ev.kind == "hparams":
+                hp = ev.value if isinstance(ev.value, dict) else {}
+                line = f"hparams: {hp}"
+            else:
+                line = f"[{step_s}] {ev.kind} {ev.tag}"
+            print(line, file=sys.stdout, flush=True)
+
     def show(self, **kwargs: Any) -> str:
         tags: Optional[Sequence[str]] = kwargs.get("tags")
         experiments: Optional[Sequence[str]] = kwargs.get("experiments")
         cfg = load_config(self.config_project())
         smoothing: str = kwargs.get("smoothing", cfg.get("smoothing", "ema"))
-        smooth_weight: float = kwargs.get("smooth_weight", cfg.get("smooth_weight", 0.6))
+        smooth_weight: float = kwargs.get(
+            "smooth_weight", cfg.get("smooth_weight", 0.6)
+        )
         exps = self._resolve_experiments(experiments)
         if not exps:
             return "No experiments found."
@@ -49,7 +73,9 @@ class ConsoleOutput(BaseOutput):
             tags = find_all_tags(exps)
 
         lines: List[str] = []
-        lines.append(f"{'Experiment':<25} {'Tag':<25} {'Last':>10} {'Min':>10} {'Max':>10}  Trend")
+        lines.append(
+            f"{'Experiment':<25} {'Tag':<25} {'Last':>10} {'Min':>10} {'Max':>10}  Trend"
+        )
         lines.append("─" * 120)
 
         for exp in exps:

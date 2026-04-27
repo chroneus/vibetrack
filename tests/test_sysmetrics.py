@@ -48,7 +48,10 @@ class TestDiskCollector:
         m = collector._collect_disk()
 
         # used + free <= total always holds; free is non-root-available space
-        assert m["system/disk_used_gb"] + m["system/disk_free_gb"] <= m["system/disk_total_gb"] + 0.01
+        assert (
+            m["system/disk_used_gb"] + m["system/disk_free_gb"]
+            <= m["system/disk_total_gb"] + 0.01
+        )
 
         collector.stop()
         w.close()
@@ -119,6 +122,7 @@ class TestCPUCollector:
     def test_cpu_load_normalized_bounded(self, tmp_path):
         """Normalized load = load_1m / cpu_count; must be >= 0 and finite."""
         import math
+
         run_dir = tmp_path / "runs" / "cpunorm"
         w = SummaryWriter(str(run_dir), project_folder=_project_folder_for(run_dir))
         collector = SystemMetricsCollector(writer=w, interval=60)
@@ -216,7 +220,11 @@ class TestWriterIntegration:
     def test_system_metrics_logged(self, tmp_path):
         """System metrics appear as scalars after running for a bit."""
         log_dir = str(tmp_path / "runs" / "sysint")
-        w = SummaryWriter(log_dir, system_metrics_interval=0.3, project_folder=str(Path(log_dir).parent))
+        w = SummaryWriter(
+            log_dir,
+            system_metrics_interval=0.3,
+            project_folder=str(Path(log_dir).parent),
+        )
 
         time.sleep(1.0)
         w.close()
@@ -225,13 +233,17 @@ class TestWriterIntegration:
         exp = db.get_experiment_by_name("sysint")
         tags = db.get_scalar_tags(exp["id"])
 
-        assert any("system/disk" in t for t in tags), f"Expected system/disk tags, got: {tags}"
+        assert any(
+            "system/disk" in t for t in tags
+        ), f"Expected system/disk tags, got: {tags}"
         db.close()
 
     def test_disabled_when_zero(self, tmp_path):
         """No system/* tags when system_metrics_interval=0."""
         log_dir = str(tmp_path / "runs" / "nosys")
-        with SummaryWriter(log_dir, system_metrics_interval=0, project_folder=str(Path(log_dir).parent)) as w:
+        with SummaryWriter(
+            log_dir, system_metrics_interval=0, project_folder=str(Path(log_dir).parent)
+        ) as w:
             w.add_scalar("loss", 0.5, 0)
 
         db = Database(Path(log_dir).parent / "vibetrack.db")
@@ -243,7 +255,11 @@ class TestWriterIntegration:
     def test_close_stops_thread(self, tmp_path):
         """Thread should be alive during collection, dead after close()."""
         log_dir = str(tmp_path / "runs" / "threadstop")
-        w = SummaryWriter(log_dir, system_metrics_interval=0.5, project_folder=str(Path(log_dir).parent))
+        w = SummaryWriter(
+            log_dir,
+            system_metrics_interval=0.5,
+            project_folder=str(Path(log_dir).parent),
+        )
 
         assert w._sysmetrics is not None
         assert w._sysmetrics._thread is not None
@@ -259,8 +275,10 @@ class TestWriterIntegration:
         db_file = Path(log_dir).parent / "vibetrack.db"
 
         w = SummaryWriter(
-            log_dir, name="precache_sys",
-            precache_secs=60, system_metrics_interval=0.3,
+            log_dir,
+            name="precache_sys",
+            precache_secs=60,
+            system_metrics_interval=0.3,
             project_folder=str(Path(log_dir).parent),
         )
         w.add_scalar("loss", 0.5, 0)
@@ -282,7 +300,11 @@ class TestWriterIntegration:
     def test_metrics_accumulate_over_multiple_intervals(self, tmp_path):
         """Running for multiple collection intervals must produce multiple rows per tag."""
         log_dir = str(tmp_path / "runs" / "multiinterval")
-        w = SummaryWriter(log_dir, system_metrics_interval=0.2, project_folder=str(Path(log_dir).parent))
+        w = SummaryWriter(
+            log_dir,
+            system_metrics_interval=0.2,
+            project_folder=str(Path(log_dir).parent),
+        )
 
         time.sleep(0.9)  # ~4 intervals
         w.close()
@@ -294,7 +316,7 @@ class TestWriterIntegration:
         assert disk_tags, "No disk tags found"
 
         rows = db.get_scalars(exp["id"], disk_tags[0])
-        assert len(rows) >= 2, (
-            f"Expected >=2 disk metric rows after multiple intervals, got {len(rows)}"
-        )
+        assert (
+            len(rows) >= 2
+        ), f"Expected >=2 disk metric rows after multiple intervals, got {len(rows)}"
         db.close()

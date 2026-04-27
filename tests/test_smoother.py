@@ -57,7 +57,7 @@ class TestEMA:
         s = 0.0
         for t, v in enumerate(vals, start=1):
             s = beta * s + (1 - beta) * v
-            expected = s / (1 - beta ** t)
+            expected = s / (1 - beta**t)
             assert abs(result[t - 1] - expected) < 1e-12, f"Mismatch at step {t}"
 
     def test_monotone_on_increasing_input(self):
@@ -88,7 +88,7 @@ class TestEMA:
         s = 0.0
         for t, v in enumerate(vals, start=1):
             s = beta * s + (1 - beta) * v
-            expected = s / (1 - beta ** t)
+            expected = s / (1 - beta**t)
             assert abs(result[t - 1] - expected) < 1e-10
 
 
@@ -175,7 +175,7 @@ class TestGaussian:
         vals = [0.0] * 10 + [10.0] + [0.0] * 10
         result = gaussian(vals, sigma=2.0)
         assert result[10] < 10.0  # peak reduced
-        assert result[9] > 0.0    # neighbors raised
+        assert result[9] > 0.0  # neighbors raised
         assert result[11] > 0.0
 
     def test_symmetry_around_spike(self):
@@ -262,4 +262,6 @@ class TestSmoothDispatch:
             ("gaussian", {"sigma": 5.0}),
         ]:
             result = smooth(vals, method=method, **kwargs)
-            assert all(math.isfinite(v) for v in result), f"method={method} has non-finite"
+            assert all(
+                math.isfinite(v) for v in result
+            ), f"method={method} has non-finite"

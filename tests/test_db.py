@@ -212,9 +212,9 @@ class TestConcurrency:
         assert not errors, f"Concurrent write errors: {errors}"
         for i in range(n_threads):
             rows = db.get_scalars(exp_id, f"metric_{i}")
-            assert len(rows) == steps_per_thread, (
-                f"metric_{i}: expected {steps_per_thread} rows, got {len(rows)}"
-            )
+            assert (
+                len(rows) == steps_per_thread
+            ), f"metric_{i}: expected {steps_per_thread} rows, got {len(rows)}"
         db.close()
 
     def test_concurrent_create_same_name_reuses_existing_row(self, tmp_path):
@@ -392,5 +392,7 @@ class TestPrecache:
         db2 = Database(db_path)
         exp = db2.get_experiment_by_name("run")
         result = db2.get_scalars(exp["id"], "loss")
-        assert len(result) == 200, f"Expected 200 rows, got {len(result)} (possible duplication)"
+        assert (
+            len(result) == 200
+        ), f"Expected 200 rows, got {len(result)} (possible duplication)"
         db2.close()

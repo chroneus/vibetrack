@@ -33,20 +33,23 @@ MCP_PORT = 16006
 # ── Architecture candidates ───────────────────────────────────────────────────
 
 ARCHS = [
-    {"name": "tiny",   "layers": [16],          "lr": 0.05},
-    {"name": "small",  "layers": [32, 16],       "lr": 0.01},
-    {"name": "medium", "layers": [64, 32],       "lr": 0.01},
-    {"name": "deep",   "layers": [32, 32, 32],   "lr": 0.005},
-    {"name": "wide",   "layers": [128, 64],      "lr": 0.001},
+    {"name": "tiny", "layers": [16], "lr": 0.05},
+    {"name": "small", "layers": [32, 16], "lr": 0.01},
+    {"name": "medium", "layers": [64, 32], "lr": 0.01},
+    {"name": "deep", "layers": [32, 32, 32], "lr": 0.005},
+    {"name": "wide", "layers": [128, 64], "lr": 0.001},
 ]
 
 # ── Tiny numpy MLP ────────────────────────────────────────────────────────────
 
+
 def relu(x: np.ndarray) -> np.ndarray:
     return np.maximum(0.0, x)
 
+
 def relu_grad(x: np.ndarray) -> np.ndarray:
     return (x > 0).astype(float)
+
 
 def train(cfg: dict, epochs: int = 300) -> list[tuple[int, float, float]]:
     """Train a tiny MLP on y = sin(x) with SGD; return (epoch, train_loss, val_loss) tuples."""
@@ -58,7 +61,10 @@ def train(cfg: dict, epochs: int = 300) -> list[tuple[int, float, float]]:
     y_va = np.sin(X_va)
 
     layer_sizes = [1] + cfg["layers"] + [1]
-    Ws = [np.random.randn(a, b) * np.sqrt(2.0 / a) for a, b in zip(layer_sizes, layer_sizes[1:])]
+    Ws = [
+        np.random.randn(a, b) * np.sqrt(2.0 / a)
+        for a, b in zip(layer_sizes, layer_sizes[1:])
+    ]
     bs = [np.zeros((1, b)) for b in layer_sizes[1:]]
 
     lr = cfg["lr"]
@@ -74,7 +80,7 @@ def train(cfg: dict, epochs: int = 300) -> list[tuple[int, float, float]]:
     for epoch in range(epochs):
         acts = forward(X_tr)
         diff = acts[-1] - y_tr
-        train_loss = float(np.mean(diff ** 2))
+        train_loss = float(np.mean(diff**2))
 
         delta = 2 * diff / len(y_tr)
         for i in range(len(Ws) - 1, -1, -1):
@@ -92,13 +98,19 @@ def train(cfg: dict, epochs: int = 300) -> list[tuple[int, float, float]]:
 
     return history
 
+
 # ── Step 1: run experiments ───────────────────────────────────────────────────
+
 
 def run_experiments() -> None:
     print("=== Step 1: Training architectures ===")
     for cfg in ARCHS:
         n_params = sum(a * b for a, b in zip([1] + cfg["layers"], cfg["layers"] + [1]))
-        print(f"  {cfg['name']:8s}  layers={cfg['layers']}  lr={cfg['lr']}  params={n_params}", end="", flush=True)
+        print(
+            f"  {cfg['name']:8s}  layers={cfg['layers']}  lr={cfg['lr']}  params={n_params}",
+            end="",
+            flush=True,
+        )
 
         history = train(cfg)
 
@@ -106,11 +118,15 @@ def run_experiments() -> None:
             log_dir=f"{PROJECT_FOLDER}/{cfg['name']}",
             name=cfg["name"],
             project_folder=PROJECT_FOLDER,
-            config={"layers": str(cfg["layers"]), "lr": cfg["lr"], "n_params": n_params},
+            config={
+                "layers": str(cfg["layers"]),
+                "lr": cfg["lr"],
+                "n_params": n_params,
+            },
         )
         for epoch, train_loss, val_loss in history:
             writer.add_scalar("loss/train", train_loss, epoch)
-            writer.add_scalar("loss/val",   val_loss,   epoch)
+            writer.add_scalar("loss/val", val_loss, epoch)
         writer.close()
 
         final_val = history[-1][2]
@@ -118,20 +134,29 @@ def run_experiments() -> None:
 
     print(f"\n  Logs saved to {PROJECT_FOLDER}\n")
 
+
 # ── Step 2: start the MCP server ──────────────────────────────────────────────
+
 
 def start_mcp_server() -> subprocess.Popen:
     print(f"=== Step 2: Starting vibetrack MCP server (port {MCP_PORT}) ===")
     proc = subprocess.Popen(
-        [sys.executable, "-m", "vibetrack.viewers.mcp",
-         "--project-folder", PROJECT_FOLDER,
-         "--port",   str(MCP_PORT)],
+        [
+            sys.executable,
+            "-m",
+            "vibetrack.viewers.mcp",
+            "--project-folder",
+            PROJECT_FOLDER,
+            "--port",
+            str(MCP_PORT),
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     time.sleep(2)
     print(f"  Ready at http://127.0.0.1:{MCP_PORT}/mcp\n")
     return proc
+
 
 # ── Step 3: ask Claude via MCP ────────────────────────────────────────────────
 
@@ -148,6 +173,7 @@ Use the available MCP tools to:
 
 Focus on val_loss. Keep your final answer under 200 words.
 """
+
 
 async def ask_claude() -> None:
     from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
@@ -170,7 +196,9 @@ async def ask_claude() -> None:
         if isinstance(message, ResultMessage):
             print(message.result)
 
+
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     run_experiments()
@@ -181,6 +209,7 @@ def main() -> None:
     finally:
         proc.terminate()
         print("\n=== Done ===")
+
 
 if __name__ == "__main__":
     main()

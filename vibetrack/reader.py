@@ -52,7 +52,10 @@ class ExperimentReader:
         resolved = (Path(log_dir) / path).resolve()
         # Reject path traversal attempts
         log_dir_resolved = str(Path(log_dir).resolve())
-        if not str(resolved).startswith(log_dir_resolved + os.sep) and str(resolved) != log_dir_resolved:
+        if (
+            not str(resolved).startswith(log_dir_resolved + os.sep)
+            and str(resolved) != log_dir_resolved
+        ):
             return ""
         return str(resolved)
 
@@ -164,7 +167,8 @@ class RunReader:
     ) -> None:
         self.project_folder = (
             self._resolve_project_folder(project_folder)
-            if project_folder is not None else None
+            if project_folder is not None
+            else None
         )
         self.project = self._resolve_project(project_folder, project)
         self.db_path = self._resolve_db_path(project_folder)
@@ -215,8 +219,7 @@ class RunReader:
             return []
         rows = self._db.list_experiments(project=self.project)
         return [
-            ExperimentReader(self._db, row["id"], row["name"], row=row)
-            for row in rows
+            ExperimentReader(self._db, row["id"], row["name"], row=row) for row in rows
         ]
 
     def experiment(self, name: str) -> Optional[ExperimentReader]:

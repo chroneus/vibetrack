@@ -15,7 +15,9 @@ def multi_run_dir(tmp_path):
     project_folder = tmp_path
     for name in ["exp_a", "exp_b", "exp_c"]:
         run_dir = project_folder / name
-        with SummaryWriter(str(run_dir), name=name, project_folder=str(project_folder)) as w:
+        with SummaryWriter(
+            str(run_dir), name=name, project_folder=str(project_folder)
+        ) as w:
             for i in range(20):
                 w.add_scalar("loss", 1.0 / (i + 1), i)
                 w.add_scalar("acc", i / 20.0, i)
@@ -29,8 +31,12 @@ class TestRunReader:
     def test_central_db_defaults_to_current_project(self, tmp_path, monkeypatch):
         central_db = tmp_path / ".vibetrack" / "vibetrack.db"
         db = Database(central_db)
-        db.create_experiment("run_a", project="project_a", log_dir=str(tmp_path / "a" / "run_a"))
-        db.create_experiment("run_b", project="project_b", log_dir=str(tmp_path / "b" / "run_b"))
+        db.create_experiment(
+            "run_a", project="project_a", log_dir=str(tmp_path / "a" / "run_a")
+        )
+        db.create_experiment(
+            "run_b", project="project_b", log_dir=str(tmp_path / "b" / "run_b")
+        )
         db.close()
 
         monkeypatch.setattr("vibetrack.reader.central_db_path", lambda: central_db)

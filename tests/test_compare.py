@@ -24,7 +24,9 @@ def experiments(tmp_path):
     ]
     for name, cfg in configs:
         run_dir = project_folder / name
-        with SummaryWriter(str(run_dir), name=name, config=cfg, project_folder=str(project_folder)) as w:
+        with SummaryWriter(
+            str(run_dir), name=name, config=cfg, project_folder=str(project_folder)
+        ) as w:
             for i in range(50):
                 loss = cfg["lr"] * 10 / (i + 1)
                 w.add_scalar("loss", loss, i)
@@ -68,7 +70,9 @@ class TestCompareScalars:
         project_folder = tmp_path
         for name, n_steps in [("short", 10), ("long", 40)]:
             run_dir = project_folder / name
-            with SummaryWriter(str(run_dir), name=name, project_folder=str(project_folder)) as w:
+            with SummaryWriter(
+                str(run_dir), name=name, project_folder=str(project_folder)
+            ) as w:
                 for i in range(n_steps):
                     w.add_scalar("loss", 1.0 / (i + 1), i)
 
@@ -99,7 +103,11 @@ class TestSummaryTable:
     def test_last_value_used(self, tmp_path):
         """summary_table should report the *last* logged value for each tag."""
         project_folder = tmp_path
-        with SummaryWriter(str(project_folder / "run1"), name="run1", project_folder=str(project_folder)) as w:
+        with SummaryWriter(
+            str(project_folder / "run1"),
+            name="run1",
+            project_folder=str(project_folder),
+        ) as w:
             for i in range(10):
                 w.add_scalar("loss", float(10 - i), i)
 
@@ -125,4 +133,8 @@ class TestSummaryTable:
 class TestCompareHparams:
     def test_basic(self, experiments):
         result = compare_hparams(experiments)
-        assert {entry["name"] for entry in result} == {"fast_lr", "slow_lr", "medium_lr"}
+        assert {entry["name"] for entry in result} == {
+            "fast_lr",
+            "slow_lr",
+            "medium_lr",
+        }

@@ -43,14 +43,18 @@ def main():
 
     for cfg in CONFIGS:
         log_dir = f"{project_folder}/{cfg['name']}"
-        with SummaryWriter(log_dir, config=cfg, project_folder=project_folder) as writer:
+        with SummaryWriter(
+            log_dir, config=cfg, project_folder=project_folder
+        ) as writer:
             data = simulate_training(cfg["lr"], STEPS)
             for step, (loss, acc) in enumerate(data):
                 writer.add_scalar("loss", loss, step)
                 writer.add_scalar("acc", acc, step)
             writer.add_hparams(cfg, {"loss": data[-1][0], "acc": data[-1][1]})
 
-        print(f"  {cfg['name']:>10s}: final loss={data[-1][0]:.4f}, acc={data[-1][1]:.4f}")
+        print(
+            f"  {cfg['name']:>10s}: final loss={data[-1][0]:.4f}, acc={data[-1][1]:.4f}"
+        )
 
     print()
 

@@ -11,14 +11,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-from .defaults import DEFAULT_CONFIG  # noqa: F401 — re-exported
+from .default_config import DEFAULT_CONFIG  # noqa: F401 — re-exported
 
-_OLD_CONFIG_DIR = Path.home() / ".cache" / "vibetrack"
+VIBETRACK_CONFIG_DIR = Path.home() / ".cache" / "vibetrack"
 
 
 def config_dir() -> Path:
     """Return ``~/.vibetrack``."""
     from .db import central_db_dir
+
     return central_db_dir()
 
 
@@ -29,7 +30,7 @@ def config_path() -> Path:
 def _read_config_file() -> Optional[Dict[str, Any]]:
     path = config_path()
     if not path.exists():
-        old = _OLD_CONFIG_DIR / "config.json"
+        old = VIBETRACK_CONFIG_DIR / "config.json"
         if old.exists():
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,7 +74,9 @@ def load_config(project: Optional[str] = None) -> Dict[str, Any]:
         return _deep_merge(DEFAULT_CONFIG, data)
 
     default_cfg = data.get("default", {})
-    result = _deep_merge(DEFAULT_CONFIG, default_cfg if isinstance(default_cfg, dict) else {})
+    result = _deep_merge(
+        DEFAULT_CONFIG, default_cfg if isinstance(default_cfg, dict) else {}
+    )
     if project:
         projects = data.get("projects", {})
         project_cfg = projects.get(project, {}) if isinstance(projects, dict) else {}

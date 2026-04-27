@@ -52,7 +52,10 @@ class TestSaveImageFromPath:
         assert not Path(rel).is_absolute()
         assert rel.endswith(os.path.join("samples", "0.png"))
         assert os.path.isfile(os.path.join(log_dir, rel))
-        assert open(os.path.join(log_dir, rel), "rb").read() == b"\x89PNG\r\n\x1a\nfakedata"
+        assert (
+            open(os.path.join(log_dir, rel), "rb").read()
+            == b"\x89PNG\r\n\x1a\nfakedata"
+        )
 
     def test_copy_jpg(self, tmp_path):
         src = tmp_path / "photo.jpg"
@@ -382,13 +385,16 @@ class TestWriterMedia:
         art_file.write_bytes(b"model")
 
         with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
-            w.log({
-                "loss": 0.5,
-                "sample": Image(str(img_file)),
-                "audio": Audio(str(aud_file), sample_rate=16000),
-                "video": Video(str(vid_file)),
-                "model": Artifact(str(art_file)),
-            }, step=0)
+            w.log(
+                {
+                    "loss": 0.5,
+                    "sample": Image(str(img_file)),
+                    "audio": Audio(str(aud_file), sample_rate=16000),
+                    "video": Video(str(vid_file)),
+                    "model": Artifact(str(art_file)),
+                },
+                step=0,
+            )
 
         db = Database(_project_db_path(log_dir))
         exp = db.get_experiment_by_name("logmedia")

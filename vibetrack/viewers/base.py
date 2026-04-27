@@ -7,10 +7,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from ..reader import ExperimentReader, RunReader
+from .event import LogEvent
 
 
 class BaseOutput(ABC):
-    """Every output backend implements this interface."""
+    """Every output backend implements this interface.
+
+    Two roles are supported and need not both be implemented:
+
+    * ``show(**kwargs)`` — pull-based dashboard/summary (required).
+    * ``send(events)``  — push-based per-event dispatch (optional, default no-op).
+    """
 
     def __init__(
         self,
@@ -38,6 +45,15 @@ class BaseOutput(ABC):
     def show(self, **kwargs: Any) -> Any:
         """Render the output. What 'show' means depends on the backend."""
         ...
+
+    def send(self, events: List[LogEvent]) -> None:
+        """Receive a batch of log events for push-based dispatch.
+
+        Default: no-op.  Override in adapters that forward per-event data
+        (telegram, slack, console, gradio).  Pure dashboards (web, mcp) leave
+        the default so they are silently ignored by ``SummaryWriter.to(...)``.
+        """
+        return None
 
     def close(self) -> None:
         self._reader.close()

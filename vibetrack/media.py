@@ -15,9 +15,9 @@ import os
 import shutil
 import struct
 import wave
+from math import ceil, sqrt
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # ── helpers ────────────────────────────────────────────────────────
 
@@ -58,6 +58,134 @@ def _is_torch_tensor(obj: Any) -> bool:
     return type(obj).__module__ == "torch" and type(obj).__name__ == "Tensor"
 
 
+def _to_numpy_array(data: Any) -> Optional[Any]:
+    """Return a numpy array for tensor/ndarray inputs without importing eagerly."""
+    if _is_torch_tensor(data):
+        return data.detach().cpu().numpy()
+    if _is_numpy_array(data):
+        return data
+    return None
+
+
+def _normalize_single_image_array(data: Any, dataformats: str) -> Any:
+    """Move image arrays to HWC/HW layout accepted by Pillow."""
+    import numpy as np  # type: ignore[import-untyped]
+
+    arr = np.asarray(data)
+    fmt = (dataformats or "").upper()
+
+    if arr.ndim == 2:
+        return arr
+
+    if arr.ndim == 3 and len(fmt) == 3 and "H" in fmt and "W" in fmt:
+        axes: List[int] = [fmt.index("H"), fmt.index("W")]
+        if "C" in fmt:
+            axes.append(fmt.index("C"))
+        arr = np.transpose(arr, axes)
+    elif arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
+        arr = np.transpose(arr, (1, 2, 0))
+
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        arr = arr.squeeze(2)
+    return arr
+
+
+def _make_image_grid(images: List[Any]) -> Any:
+    """Pack a batch of HWC/HW images into a near-square grid."""
+    import numpy as np  # type: ignore[import-untyped]
+
+    if not images:
+        raise ValueError("image batch is empty")
+
+    prepared = []
+    max_h = 0
+    max_w = 0
+    max_c = 1
+    for img in images:
+        arr = np.asarray(img)
+        if arr.ndim == 2:
+            arr = arr[:, :, None]
+        if arr.ndim != 3:
+            raise ValueError(f"expected image array with 2 or 3 dims, got {arr.shape}")
+        prepared.append(arr)
+        max_h = max(max_h, arr.shape[0])
+        max_w = max(max_w, arr.shape[1])
+        max_c = max(max_c, arr.shape[2])
+
+    cols = int(ceil(sqrt(len(prepared))))
+    rows = int(ceil(len(prepared) / cols))
+    grid = np.zeros((rows * max_h, cols * max_w, max_c), dtype=prepared[0].dtype)
+    for i, img in enumerate(prepared):
+        r = i // cols
+        c = i % cols
+        if img.shape[2] == 1 and max_c > 1:
+            img = np.repeat(img, max_c, axis=2)
+        grid[
+            r * max_h : r * max_h + img.shape[0],
+            c * max_w : c * max_w + img.shape[1],
+            : img.shape[2],
+        ] = img
+
+    if max_c == 1:
+        return grid.squeeze(2)
+    return grid
+
+
+def _normalize_image_array(data: Any, dataformats: str) -> Any:
+    """Normalize single or batched image arrays according to TensorBoard dataformats."""
+    import numpy as np  # type: ignore[import-untyped]
+
+    arr = np.asarray(data)
+    fmt = (dataformats or "").upper()
+    if "N" in fmt and arr.ndim == len(fmt):
+        n_axis = fmt.index("N")
+        arr = np.moveaxis(arr, n_axis, 0)
+        child_fmt = fmt.replace("N", "", 1)
+        return _make_image_grid(
+            [_normalize_single_image_array(frame, child_fmt) for frame in arr]
+        )
+    return _normalize_single_image_array(arr, fmt)
+
+
+def _as_uint8_image(data: Any) -> Any:
+    """Convert numeric image arrays to uint8 with TensorBoard-like [0, 1] floats."""
+    import numpy as np  # type: ignore[import-untyped]
+
+    arr = np.asarray(data)
+    if arr.dtype.kind == "b":
+        arr = arr.astype(np.uint8) * 255
+    elif arr.dtype.kind == "f":
+        arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
+    elif arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
+def _normalize_video_frames(data: Any) -> List[Any]:
+    """Convert video tensor/array inputs to a list of HWC uint8 frames."""
+    import numpy as np  # type: ignore[import-untyped]
+
+    arr = np.asarray(data)
+    if arr.ndim == 5:
+        # TensorBoard documents N,T,C,H,W. Also accept N,T,H,W,C.
+        if arr.shape[2] in (1, 3, 4):
+            arr = np.moveaxis(arr, 2, -1)
+        frames = []
+        for t in range(arr.shape[1]):
+            frames.append(
+                _as_uint8_image(
+                    _make_image_grid([arr[n, t] for n in range(arr.shape[0])])
+                )
+            )
+        return frames
+    if arr.ndim == 4:
+        # Accept T,C,H,W or T,H,W,C.
+        if arr.shape[1] in (1, 3, 4):
+            arr = np.moveaxis(arr, 1, -1)
+        return [_as_uint8_image(frame) for frame in arr]
+    raise TypeError(f"Unsupported video array shape: {arr.shape}")
+
+
 # ── public API ─────────────────────────────────────────────────────
 
 
@@ -66,6 +194,7 @@ def save_image(
     log_dir: str,
     tag: str,
     step: int,
+    dataformats: str = "",
 ) -> str:
     """Save an image and return the path relative to *log_dir*.
 
@@ -84,29 +213,15 @@ def save_image(
     elif _is_pil_image(data):
         dest = dest_dir / f"{step}.png"
         data.save(str(dest))
-    elif _is_torch_tensor(data):
-        # Convert torch tensor to numpy and recurse
-        arr = data.detach().cpu().numpy()
-        # CHW → HWC for 3-channel images
-        if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
-            arr = arr.transpose(1, 2, 0)
-        if arr.ndim == 3 and arr.shape[2] == 1:
-            arr = arr.squeeze(2)
-        return save_image(arr, log_dir, tag, step)
-    elif _is_numpy_array(data):
-        import numpy as np  # type: ignore[import-untyped]
-
+    elif _to_numpy_array(data) is not None:
         try:
             from PIL import Image as PILImage  # type: ignore[import-untyped]
         except ImportError:
             raise ImportError(
                 "Saving numpy arrays as images requires Pillow: pip install Pillow"
             )
-        if data.ndim == 4 and data.shape[0] == 1:
-            data = data[0]
-        if data.dtype.kind == "f":
-            data = (np.clip(data, 0, 1) * 255).astype(np.uint8)
-        img = PILImage.fromarray(data)
+        arr = _normalize_image_array(_to_numpy_array(data), dataformats)
+        img = PILImage.fromarray(_as_uint8_image(arr))
         dest = dest_dir / f"{step}.png"
         img.save(str(dest))
     else:
@@ -138,12 +253,12 @@ def save_audio(
         ext = Path(data).suffix or ".wav"
         dest = dest_dir / f"{step}{ext}"
         shutil.copy2(str(data), str(dest))
-    elif _is_numpy_array(data):
+    elif _to_numpy_array(data) is not None:
         import numpy as np  # type: ignore[import-untyped]
 
         dest = dest_dir / f"{step}.wav"
         # Normalize float → int16
-        arr = data.flatten()
+        arr = _to_numpy_array(data).flatten()
         if arr.dtype.kind == "f":
             arr = (arr * 32767).clip(-32768, 32767).astype(np.int16)
         elif arr.dtype != np.int16:
@@ -167,6 +282,7 @@ def save_video(
     log_dir: str,
     tag: str,
     step: int,
+    fps: Union[int, float] = 4,
 ) -> str:
     """Save video and return the path relative to *log_dir*.
 
@@ -184,6 +300,20 @@ def save_video(
     elif isinstance(data, (bytes, bytearray)):
         dest = dest_dir / f"{step}.mp4"
         dest.write_bytes(data)
+    elif _to_numpy_array(data) is not None:
+        try:
+            try:
+                from moviepy import ImageSequenceClip  # type: ignore[import-untyped]
+            except ImportError:
+                from moviepy.editor import ImageSequenceClip  # type: ignore[import-untyped]
+        except ImportError:
+            raise ImportError(
+                "Saving tensor/array videos requires moviepy: pip install moviepy"
+            )
+        frames = _normalize_video_frames(_to_numpy_array(data))
+        dest = dest_dir / f"{step}.mp4"
+        clip = ImageSequenceClip(frames, fps=fps)
+        clip.write_videofile(str(dest), codec="libx264", audio=False, logger=None)
     else:
         raise TypeError(f"Unsupported video type: {type(data)}")
 

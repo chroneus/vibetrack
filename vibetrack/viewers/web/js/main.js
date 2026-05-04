@@ -4,24 +4,46 @@
 function buildAll() {
   buildCharts();
   buildImages(); buildAudio(); buildVideo(); buildArtifacts();
-  buildText(); buildHistograms(); buildSystem();
+  buildGraphs(); buildText(); buildHistograms(); buildHParams(); buildSystem();
+  if (typeof buildMeshes === 'function') buildMeshes();
+  if (typeof buildEmbeddings === 'function') buildEmbeddings();
 }
 
 // ── Project switcher ─────────────────────────────────────────
-function _setupProjectSwitcher() {
-  if (window.VT_PROJECT) localStorage.setItem('vt_last_project', window.VT_PROJECT);
-  if (!(window.VT_PROJECTS && window.VT_PROJECTS.length > 0)) return;
-
+function _renderProjectMenu(projects) {
+  window.VT_PROJECTS = Array.isArray(projects) ? projects : [];
   const projName = document.getElementById('project-name');
+  const menu = document.getElementById('project-menu');
+  menu.innerHTML = '';
+  if (!(window.VT_PROJECTS && window.VT_PROJECTS.length > 0)) {
+    projName.classList.remove('has-menu');
+    return;
+  }
   projName.textContent = window.VT_PROJECT;
   projName.classList.add('has-menu');
-  const menu = document.getElementById('project-menu');
   window.VT_PROJECTS.forEach(p => {
     const a = document.createElement('a');
     a.href = '/' + p; a.textContent = p;
     if (p === window.VT_PROJECT) a.classList.add('active');
     menu.appendChild(a);
   });
+}
+
+function refreshProjectMenu() {
+  if (!window.VT_PROJECT) return Promise.resolve();
+  return fetch('/api/projects')
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
+    .then(projects => _renderProjectMenu(projects))
+    .catch(() => {});
+}
+
+function _setupProjectSwitcher() {
+  if (window.VT_PROJECT) localStorage.setItem('vt_last_project', window.VT_PROJECT);
+  if (!(window.VT_PROJECTS && window.VT_PROJECTS.length > 0)) return;
+
+  _renderProjectMenu(window.VT_PROJECTS);
+  const projName = document.getElementById('project-name');
+  const menu = document.getElementById('project-menu');
   projName.addEventListener('click', e => { e.stopPropagation(); menu.classList.toggle('open'); });
   document.addEventListener('click', () => menu.classList.remove('open'));
   menu.addEventListener('click', e => e.stopPropagation());

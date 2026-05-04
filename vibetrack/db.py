@@ -549,7 +549,8 @@ class Database:
                             if p not in latest or ts > latest[p]:
                                 latest[p] = ts
                         return [
-                            p for p, _ in sorted(
+                            p
+                            for p, _ in sorted(
                                 latest.items(), key=lambda kv: kv[1], reverse=True
                             )
                         ]
@@ -713,6 +714,66 @@ class Database:
                 (experiment_id,),
             )
             return log_dir
+
+    def purge_experiment_from_step(self, experiment_id: int, step: int) -> None:
+        """Delete step-indexed data for an experiment at ``step`` and beyond."""
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if self._check_and_maybe_materialize():
+                        pass
+                    else:
+                        self._cache_scalars = [
+                            r
+                            for r in self._cache_scalars
+                            if not (r[0] == experiment_id and r[2] >= step)
+                        ]
+                        self._cache_texts = [
+                            r
+                            for r in self._cache_texts
+                            if not (r[0] == experiment_id and r[2] >= step)
+                        ]
+                        self._cache_images = [
+                            r
+                            for r in self._cache_images
+                            if not (r[0] == experiment_id and r[2] >= step)
+                        ]
+                        self._cache_audio = [
+                            r
+                            for r in self._cache_audio
+                            if not (r[0] == experiment_id and r[2] >= step)
+                        ]
+                        self._cache_video = [
+                            r
+                            for r in self._cache_video
+                            if not (r[0] == experiment_id and r[2] >= step)
+                        ]
+                        self._cache_artifacts = [
+                            r
+                            for r in self._cache_artifacts
+                            if not (r[0] == experiment_id and r[2] >= step)
+                        ]
+                        self._cache_histograms = [
+                            r
+                            for r in self._cache_histograms
+                            if not (r[0] == experiment_id and r[2] >= step)
+                        ]
+                        return
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for table in (
+                "scalars",
+                "texts",
+                "images",
+                "audio",
+                "video",
+                "artifacts",
+                "histograms",
+            ):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE experiment_id=? AND step>=?",
+                    (experiment_id, step),
+                )
 
     def rename_experiment(self, experiment_id: int, new_name: str) -> bool:
         """Rename an experiment. Returns True if successful."""

@@ -10,8 +10,9 @@ const _delIconLg = `<svg width="15" height="17" viewBox="0 0 11 13" fill="none" 
 // Prefix project-scoped API endpoints. `/api/data`, `/api/config`, `/api/rename`
 // are scoped per-project when window.VT_PROJECT is set. Endpoints that encode the
 // project directly (`/api/project/${p}`, `/api/experiment`, `/api/move-logdir`,
-// `/media`) stay unscoped.
+// `/api/projects`, `/media`) stay unscoped.
 function apiUrl(base) {
+  if (base === '/api/projects') return base;
   return window.VT_PROJECT ? `${base}/${window.VT_PROJECT}` : base;
 }
 
@@ -272,13 +273,17 @@ function buildTabs() {
   const prev = _activeTab || (el.querySelector('button.active') || {}).dataset?.tab;
   el.innerHTML = '';
   const defs = [
-    { id: 'scalars', label: 'Scalars', has: DATA.some(d => (d.tags || []).length > 0) },
+    { id: 'scalars', label: 'Scalars', has: DATA.some(d => (d.tags || []).length > 0 || (d.figure_tags || []).length > 0 || (d.pr_curve_tags || []).length > 0) },
     { id: 'images', label: 'Images', has: DATA.some(d => (d.image_tags || []).length > 0) },
     { id: 'audio', label: 'Audio', has: DATA.some(d => (d.audio_tags || []).length > 0) },
     { id: 'video', label: 'Video', has: DATA.some(d => (d.video_tags || []).length > 0) },
     { id: 'artifacts', label: 'Artifacts', has: DATA.some(d => (d.artifact_tags || []).length > 0) },
+    { id: 'models', label: 'Models', has: DATA.some(d => (d.model_tags || d.graph_tags || []).length > 0) },
+    { id: 'meshes', label: 'Meshes', has: DATA.some(d => (d.mesh_tags || []).length > 0) },
+    { id: 'embeddings', label: 'Embeddings', has: DATA.some(d => (d.embedding_tags || []).length > 0) },
     { id: 'text', label: 'Text', has: DATA.some(d => (d.text_tags || []).length > 0) },
     { id: 'histograms', label: 'Histograms', has: DATA.some(d => (d.histogram_tags || []).length > 0) },
+    { id: 'hparams', label: 'HParams', has: DATA.some(d => d.hparams && Object.keys(d.hparams).length > 0) },
     { id: 'system', label: 'System', has: DATA.some(d => (d.system_tags || []).length > 0) },
     { id: 'settings', label: 'Settings', has: true },
   ];

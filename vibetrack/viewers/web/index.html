@@ -6,9 +6,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>vibetrack</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/viz.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/full.render.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/img-comparison-slider@8/dist/index.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/img-comparison-slider@8/dist/styles.css">
   <link rel="stylesheet" href="/static/css/style.css">
+  <!-- 3D mesh viewer (vendored locally, works offline) -->
+  <script defer src="/static/vendor/three.min.js"></script>
+  <script defer src="/static/vendor/OrbitControls.js"></script>
   <script>
     window.VT_DATA = __DATA_JSON__;
     window.VT_PROJECT = __PROJECT_JSON__;
@@ -18,6 +23,9 @@
   <script defer src="/static/js/charts.js"></script>
   <script defer src="/static/js/pills.js"></script>
   <script defer src="/static/js/media.js"></script>
+  <script defer src="/static/js/hparams.js"></script>
+  <script defer src="/static/js/meshes.js"></script>
+  <script defer src="/static/js/embeddings.js"></script>
   <script defer src="/static/js/settings.js"></script>
   <script defer src="/static/js/main.js"></script>
 </head>
@@ -83,6 +91,21 @@
     </table>
   </div>
 
+  <!-- Models (formerly Graphs) -->
+  <div class="tab-content" id="tab-models">
+    <div id="models-list"></div>
+  </div>
+
+  <!-- Meshes (3D viewer) -->
+  <div class="tab-content" id="tab-meshes">
+    <div id="meshes-list"></div>
+  </div>
+
+  <!-- Embeddings (3D point cloud projector with thumbnail mode) -->
+  <div class="tab-content" id="tab-embeddings">
+    <div id="embeddings-list"></div>
+  </div>
+
   <!-- Text -->
   <div class="tab-content" id="tab-text">
     <div id="text-list"></div>
@@ -91,6 +114,17 @@
   <!-- Histograms -->
   <div class="tab-content" id="tab-histograms">
     <div class="grid" id="histogram-charts"></div>
+  </div>
+
+  <!-- HParams -->
+  <div class="tab-content" id="tab-hparams">
+    <div class="hparams-controls" id="hparams-controls"></div>
+    <div class="hparams-summary" id="hparams-summary"></div>
+    <div class="hparams-table-wrap" id="hparams-table-wrap"></div>
+    <div class="hparams-section-title">HParam result plots</div>
+    <div class="hparams-viz-grid" id="hparams-viz"></div>
+    <div class="hparams-section-title">Nested hparams</div>
+    <div class="hparams-tree-grid" id="hparams-trees"></div>
   </div>
 
   <!-- System -->

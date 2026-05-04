@@ -14,43 +14,16 @@ from __future__ import annotations
 import io
 import logging
 import os
+import sys
 from typing import Any, List, Optional, Sequence
 
 from ..compare import compare_scalars, find_all_tags, summary_table
 from ..config import load_config
-from ..smoother import smooth
+from ._summary import format_metric as _format_metric
+from ._summary import render_scalar_chart_png as _render_chart_png
 from .base import BaseOutput
 
 _log = logging.getLogger(__name__)
-
-
-def _render_chart_png(
-    comparison_data: list,
-    tag: str,
-) -> bytes:
-    """Render a chart to PNG bytes using matplotlib (stdlib fallback: skip)."""
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        return b""
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-    for entry in comparison_data:
-        values = entry.get("smoothed", entry["values"])
-        ax.plot(entry["steps"], values, label=entry["name"])
-    ax.set_title(tag)
-    ax.set_xlabel("step")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=100)
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
 
 
 class TelegramOutput(BaseOutput):
@@ -195,16 +168,29 @@ class TelegramOutput(BaseOutput):
         if tags is None:
             tags = find_all_tags(exps)
 
-        # Build text summary
+        # Build text summary — split user metrics from auto-collected
+        # system/gpu metrics so the message stays scannable. System metrics
+        # use unit-aware formatting (24 Gb, 4.0 %, 58 °C, …).
         table = summary_table(exps)
         lines = ["*vibetrack summary*\n"]
         for row in table:
             parts = [f"`{row['name']}`"]
+            user_items: list[tuple[str, str]] = []
+            sys_items: list[tuple[str, str]] = []
             for k, v in row.items():
-                if k in ("name", "experiment_id"):
+                if k in ("name", "experiment_id") or v is None:
                     continue
-                if v is not None:
-                    parts.append(f"  {k}: {v:.4f}")
+                disp_tag, disp_val = _format_metric(k, v)
+                if k.startswith("system/") or k.startswith("gpu/"):
+                    sys_items.append((disp_tag, disp_val))
+                else:
+                    user_items.append((disp_tag, disp_val))
+            for tag, val in user_items:
+                parts.append(f"  `{tag}`: {val}")
+            if sys_items:
+                parts.append("  _system_:")
+                for tag, val in sys_items:
+                    parts.append(f"    `{tag}`: {val}")
             lines.append("\n".join(parts))
         text = "\n\n".join(lines)
 
@@ -274,6 +260,20 @@ class TelegramOutput(BaseOutput):
                             kind,
                             f"{exp.name} / {media_tag} — step {latest['step']}",
                         )
+                # Models: upload the rendered PNG diagram (when present)
+                # alongside chart media so it appears in the digest.
+                for model_tag in exp.model_tags():
+                    entries = exp.models(model_tag)
+                    if not entries:
+                        continue
+                    latest = max(entries, key=lambda e: e["step"])
+                    png_path = latest.get("rendered_png_abs")
+                    if png_path:
+                        await _send_file(
+                            png_path,
+                            "photo",
+                            f"{exp.name} / model {model_tag} — step {latest['step']}",
+                        )
                 for txt_tag in exp.text_tags():
                     entries = exp.texts(txt_tag)
                     if not entries:
@@ -302,3 +302,36 @@ class TelegramOutput(BaseOutput):
             _log.warning("Telegram delivery failed: %s", exc)
             return None
         return text
+
+    def send_summary(self, run_name: str, project: Optional[str] = None) -> None:
+        """Send a single-run digest scoped to *run_name*.
+
+        Reuses :meth:`show` (text + scalar charts + latest media + text
+        entries) but limits the experiment set to one run and filters out
+        auto-collected ``system/*`` and ``gpu/*`` scalars from the chart set.
+        """
+        if not self.token or not self.chat_id:
+            print(
+                "vibetrack telegram: NO post sent — set "
+                "VIBETRACK_TELEGRAM_TOKEN and VIBETRACK_TELEGRAM_CHAT_ID.",
+                file=sys.stderr,
+            )
+            return
+        exp = next((e for e in self._reader.experiments() if e.name == run_name), None)
+        if exp is None:
+            print(
+                f"vibetrack telegram: run {run_name!r} not found in DB.",
+                file=sys.stderr,
+            )
+            return
+        user_tags = [
+            t
+            for t in exp.scalar_tags()
+            if not (t.startswith("system/") or t.startswith("gpu/"))
+        ]
+        self.show(experiments=[run_name], tags=user_tags)
+        print(
+            f"vibetrack telegram: posted summary for {run_name!r} "
+            f"({len(user_tags)} chart(s)).",
+            file=sys.stderr,
+        )

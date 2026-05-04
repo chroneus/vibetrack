@@ -45,7 +45,7 @@ function saveSettings() {
   delete c.check_resources_before_run;
   currentConfig = c;
   fetch(apiUrl('/api/config'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(c) });
-  applyConfig(c); buildCharts(); buildSystem();
+  applyConfig(c); buildCharts(); buildHParams(); buildSystem();
 }
 
 let refreshTimer = null;
@@ -68,6 +68,7 @@ function setAutoRefresh(s) {
   if (refreshTimer) clearInterval(refreshTimer);
   if (s <= 0) return;
   refreshTimer = setInterval(() => {
+    refreshProjectMenu();
     fetch(apiUrl('/api/data')).then(r => r.text()).then(txt => {
       if (txt === _lastDataText) return;
       if (_userIsBusy()) return;
@@ -76,7 +77,8 @@ function setAutoRefresh(s) {
       const sx = window.scrollX, sy = window.scrollY;
       DATA.length = 0; DATA.push(...d);
       buildTabs(); buildPills(); buildCharts(); buildSystem();
-      buildImages(); buildAudio(); buildVideo(); buildArtifacts(); buildText(); buildHistograms();
+      buildImages(); buildAudio(); buildVideo(); buildArtifacts(); buildGraphs(); buildText(); buildHistograms();
+      buildHParams();
       window.scrollTo(sx, sy);
     });
   }, s * 1000);

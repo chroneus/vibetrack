@@ -66,6 +66,30 @@ def _normalize_project_folder(project_folder: Optional[str]) -> Optional[str]:
     return str(path)
 
 
+def _looks_like_project_folder(value: str) -> bool:
+    path = Path(value).expanduser()
+    if path.exists():
+        return True
+    if path.name == "vibetrack.db":
+        return True
+    if value.startswith((".", "~")):
+        return True
+    return any(sep and sep in value for sep in {os.sep, os.altsep})
+
+
+def _resolve_gradio_target(
+    args: argparse.Namespace,
+) -> Tuple[Optional[str], Optional[str]]:
+    target = args.project_folder_pos
+    if args.project_folder is not None:
+        return args.project_folder, None
+    if target is None:
+        return None, None
+    if _looks_like_project_folder(target):
+        return target, None
+    return None, target
+
+
 def _create_listen_app(project_folder: Optional[str], token: Optional[str] = None):
     """Build FastAPI app for the HTTP ingest server."""
     from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -379,7 +403,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PROJECT_FOLDER",
-        help="Project folder, or the literal command 'migrate'.",
+        help="Project folder, or a subcommand: 'migrate', 'gradio'.",
     )
     parser.add_argument(
         "project_folder_pos",
@@ -428,6 +452,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Viewer port (default: 6006)",
     )
     parser.add_argument(
+        "--share",
+        "-share",
+        dest="share",
+        action="store_true",
+        default=None,
+        help="Create a public Gradio share link. Only used with --viewer=gradio.",
+    )
+    parser.add_argument(
+        "--no-share",
+        dest="share",
+        action="store_false",
+        help="Disable Gradio public sharing. Only used with --viewer=gradio.",
+    )
+    parser.add_argument(
         "--mcp-transport",
         default="streamable-http",
         choices=["streamable-http", "sse"],
@@ -446,6 +484,13 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.target_pos == "migrate":
         project_folder = args.project_folder_pos or args.project_folder or "."
         sys.exit(migrate_project(project_folder))
+
+    if args.target_pos == "gradio":
+        args.viewer = "gradio"
+        args.project_folder, args.project = _resolve_gradio_target(args)
+        args.target_pos = None
+    else:
+        args.project = None
 
     if args.target_pos is not None:
         args.project_folder = args.target_pos
@@ -473,14 +518,17 @@ def main(argv: Optional[List[str]] = None) -> None:
     from .viewers import load_viewer
 
     viewer_cls = load_viewer(args.viewer)
-    viewer = viewer_cls(project_folder)
+    viewer = viewer_cls(project_folder, project=args.project)
+    show_kwargs = {
+        "host": args.host,
+        "port": args.port,
+        "token": args.token,
+        "mcp_transport": args.mcp_transport,
+    }
+    if args.share is not None:
+        show_kwargs["share"] = args.share
     try:
-        viewer.show(
-            host=args.host,
-            port=args.port,
-            token=args.token,
-            mcp_transport=args.mcp_transport,
-        )
+        viewer.show(**show_kwargs)
     except ImportError:
         if args.viewer == "mcp":
             print(

@@ -1,5 +1,7 @@
 """Tests for SummaryWriter — TensorBoard & W&B API compatibility."""
 
+import inspect
+import json
 import os
 import time
 import threading
@@ -31,6 +33,10 @@ def _open_project_db(log_dir: str) -> Database:
     return Database(_project_db_path(log_dir))
 
 
+def _artifact_json(log_dir: str, row) -> dict:
+    return json.loads(Path(log_dir, row["path"]).read_text(encoding="utf-8"))
+
+
 def _cleanup_active_writer(vibetrack_module) -> None:
     writer = getattr(vibetrack_module, "_active_writer", None)
     if writer is not None:
@@ -39,6 +45,184 @@ def _cleanup_active_writer(vibetrack_module) -> None:
 
 
 class TestSummaryWriter:
+    def test_tensorboard_documented_signature_surface(self):
+        expected = {
+            "__init__": [
+                ("log_dir", None),
+                ("comment", ""),
+                ("purge_step", None),
+                ("max_queue", 10),
+                ("flush_secs", 120),
+                ("filename_suffix", ""),
+            ],
+            "add_scalar": [
+                ("tag", inspect._empty),
+                ("scalar_value", inspect._empty),
+                ("global_step", None),
+                ("walltime", None),
+                ("new_style", False),
+                ("double_precision", False),
+            ],
+            "add_scalars": [
+                ("main_tag", inspect._empty),
+                ("tag_scalar_dict", inspect._empty),
+                ("global_step", None),
+                ("walltime", None),
+            ],
+            "add_histogram": [
+                ("tag", inspect._empty),
+                ("values", inspect._empty),
+                ("global_step", None),
+                ("bins", "tensorflow"),
+                ("walltime", None),
+                ("max_bins", None),
+            ],
+            "add_histogram_raw": [
+                ("tag", inspect._empty),
+                ("min", inspect._empty),
+                ("max", inspect._empty),
+                ("num", inspect._empty),
+                ("sum", inspect._empty),
+                ("sum_squares", inspect._empty),
+                ("bucket_limits", inspect._empty),
+                ("bucket_counts", inspect._empty),
+                ("global_step", None),
+                ("walltime", None),
+            ],
+            "add_image": [
+                ("tag", inspect._empty),
+                ("img_tensor", inspect._empty),
+                ("global_step", None),
+                ("walltime", None),
+                ("dataformats", "CHW"),
+            ],
+            "add_images": [
+                ("tag", inspect._empty),
+                ("img_tensor", inspect._empty),
+                ("global_step", None),
+                ("walltime", None),
+                ("dataformats", "NCHW"),
+            ],
+            "add_image_with_boxes": [
+                ("tag", inspect._empty),
+                ("img_tensor", inspect._empty),
+                ("box_tensor", inspect._empty),
+                ("global_step", None),
+                ("walltime", None),
+                ("rescale", 1),
+                ("dataformats", "CHW"),
+                ("labels", None),
+            ],
+            "add_figure": [
+                ("tag", inspect._empty),
+                ("figure", inspect._empty),
+                ("global_step", None),
+                ("close", True),
+                ("walltime", None),
+            ],
+            "add_video": [
+                ("tag", inspect._empty),
+                ("vid_tensor", inspect._empty),
+                ("global_step", None),
+                ("fps", 4),
+                ("walltime", None),
+            ],
+            "add_audio": [
+                ("tag", inspect._empty),
+                ("snd_tensor", inspect._empty),
+                ("global_step", None),
+                ("sample_rate", 44100),
+                ("walltime", None),
+            ],
+            "add_text": [
+                ("tag", inspect._empty),
+                ("text_string", inspect._empty),
+                ("global_step", None),
+                ("walltime", None),
+            ],
+            "add_graph": [
+                ("model", inspect._empty),
+                ("input_to_model", None),
+                ("verbose", False),
+                ("use_strict_trace", True),
+            ],
+            "add_onnx_graph": [("prototxt", inspect._empty)],
+            "add_embedding": [
+                ("mat", inspect._empty),
+                ("metadata", None),
+                ("label_img", None),
+                ("global_step", None),
+                ("tag", "default"),
+                ("metadata_header", None),
+            ],
+            "add_pr_curve": [
+                ("tag", inspect._empty),
+                ("labels", inspect._empty),
+                ("predictions", inspect._empty),
+                ("global_step", None),
+                ("num_thresholds", 127),
+                ("weights", None),
+                ("walltime", None),
+            ],
+            "add_pr_curve_raw": [
+                ("tag", inspect._empty),
+                ("true_positive_counts", inspect._empty),
+                ("false_positive_counts", inspect._empty),
+                ("true_negative_counts", inspect._empty),
+                ("false_negative_counts", inspect._empty),
+                ("precision", inspect._empty),
+                ("recall", inspect._empty),
+                ("global_step", None),
+                ("num_thresholds", 127),
+                ("weights", None),
+                ("walltime", None),
+            ],
+            "add_custom_scalars": [("layout", inspect._empty)],
+            "add_custom_scalars_marginchart": [
+                ("tags", inspect._empty),
+                ("category", "default"),
+                ("title", "untitled"),
+            ],
+            "add_custom_scalars_multilinechart": [
+                ("tags", inspect._empty),
+                ("category", "default"),
+                ("title", "untitled"),
+            ],
+            "add_mesh": [
+                ("tag", inspect._empty),
+                ("vertices", inspect._empty),
+                ("colors", None),
+                ("faces", None),
+                ("config_dict", None),
+                ("global_step", None),
+                ("walltime", None),
+            ],
+            "add_tensor": [
+                ("tag", inspect._empty),
+                ("tensor", inspect._empty),
+                ("global_step", None),
+                ("walltime", None),
+            ],
+            "add_hparams": [
+                ("hparam_dict", inspect._empty),
+                ("metric_dict", inspect._empty),
+                ("hparam_domain_discrete", None),
+                ("run_name", None),
+                ("global_step", None),
+            ],
+            "flush": [],
+            "close": [],
+        }
+
+        for name, params in expected.items():
+            method = (
+                SummaryWriter.__init__
+                if name == "__init__"
+                else getattr(SummaryWriter, name)
+            )
+            actual = list(inspect.signature(method).parameters.values())[1:]
+            assert [(p.name, p.default) for p in actual[: len(params)]] == params
+
     def test_add_scalar(self, log_dir):
         with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
             w.add_scalar("loss", 0.9, 0)
@@ -84,6 +268,30 @@ class TestSummaryWriter:
         rows = db.get_histograms(exp["id"], "weights")
         assert len(rows) == 1
         assert len(rows[0]["bins"]) > 0
+        db.close()
+
+    def test_add_histogram_raw_accepts_tensorboard_signature(self, tmp_path):
+        log_dir = str(tmp_path / "runs" / "hist_raw_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_histogram_raw(
+                "weights/raw",
+                min=0.0,
+                max=3.0,
+                num=6,
+                sum=9.0,
+                sum_squares=19.0,
+                bucket_limits=[1.0, 2.0, 3.0],
+                bucket_counts=[2, 3, 1],
+                global_step=7,
+            )
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("hist_raw_run")
+        rows = db.get_histograms(exp["id"], "weights/raw")
+        assert len(rows) == 1
+        assert rows[0]["step"] == 7
+        assert rows[0]["bins"] == [0.0, 1.0, 2.0, 3.0]
+        assert rows[0]["counts"] == [2.0, 3.0, 1.0]
         db.close()
 
     def test_add_hparams(self, log_dir):
@@ -159,8 +367,8 @@ class TestSummaryWriter:
         assert loss[1]["value"] == 0.3
         db.close()
 
-    def test_flush_is_compatibility_noop(self, log_dir):
-        """flush() should not force buffered scalars into the DB."""
+    def test_flush_persists_buffered_scalars(self, log_dir):
+        """flush() matches TensorBoard by making pending events durable."""
         w = SummaryWriter(
             log_dir, max_queue=1000, project_folder=str(Path(log_dir).parent)
         )
@@ -170,10 +378,325 @@ class TestSummaryWriter:
 
         db = _open_project_db(log_dir)
         exp = db.get_experiment_by_name("test_run")
-        assert len(db.get_scalars(exp["id"], "loss")) == 0
+        assert len(db.get_scalars(exp["id"], "loss")) == 5
         w.close()
         rows = db.get_scalars(exp["id"], "loss")
         assert len(rows) == 5
+        db.close()
+
+    def test_add_images_accepts_tensorboard_batch_format(self, tmp_path):
+        np = pytest.importorskip("numpy")
+        pytest.importorskip("PIL")
+
+        log_dir = str(tmp_path / "runs" / "image_batch")
+        batch = np.zeros((4, 3, 8, 8), dtype=np.float32)
+        batch[:, 0, :, :] = 1.0
+
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_images("batch", batch, global_step=3)
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("image_batch")
+        rows = db.get_images(exp["id"], "batch")
+        assert len(rows) == 1
+        assert rows[0]["step"] == 3
+        assert Path(log_dir, rows[0]["path"]).is_file()
+        db.close()
+
+    def test_add_image_with_boxes_accepts_tensorboard_box_format(self, tmp_path):
+        np = pytest.importorskip("numpy")
+        pytest.importorskip("PIL")
+        from PIL import Image
+
+        log_dir = str(tmp_path / "runs" / "image_boxes_run")
+        image = np.zeros((3, 10, 10), dtype=np.float32)
+        boxes = np.array([[1, 1, 8, 8]], dtype=np.float32)
+
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_image_with_boxes(
+                "detections",
+                image,
+                boxes,
+                global_step=4,
+                labels=["object"],
+            )
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("image_boxes_run")
+        rows = db.get_images(exp["id"], "detections")
+        assert len(rows) == 1
+        assert rows[0]["step"] == 4
+        path = Path(log_dir, rows[0]["path"])
+        assert path.is_file()
+        drawn = Image.open(path).convert("RGB")
+        assert drawn.getpixel((1, 1))[0] > 200
+        db.close()
+
+    def test_add_figure_accepts_matplotlib_figure(self, tmp_path):
+        pytest.importorskip("numpy")
+        pytest.importorskip("PIL")
+        plt = pytest.importorskip("matplotlib.pyplot")
+
+        log_dir = str(tmp_path / "runs" / "figure_run")
+        fig, ax = plt.subplots()
+        ax.plot([0, 1], [1, 0])
+
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_figure("plot", fig, global_step=2)
+
+        # Figures are charts, not media — they live in the artifacts table
+        # under kind="figure" so the web UI can route them to the Scalars tab
+        # rather than the Images gallery.
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("figure_run")
+        assert db.get_images(exp["id"], "plot") == []
+        rows = db.get_artifacts(exp["id"], "plot")
+        assert len(rows) == 1
+        assert rows[0]["step"] == 2
+        assert Path(log_dir, rows[0]["path"]).is_file()
+        assert Path(log_dir, rows[0]["path"]).suffix == ".png"
+        metadata = json.loads(rows[0]["metadata"])
+        assert metadata["kind"] == "figure"
+        assert metadata["format"] == "png"
+        db.close()
+
+    def test_add_graph_writes_graph_artifact_payload(self, tmp_path):
+        np = pytest.importorskip("numpy")
+
+        log_dir = str(tmp_path / "runs" / "graph_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_graph("linear-model", input_to_model=np.zeros((1, 3)))
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("graph_run")
+        rows = db.get_artifacts(exp["id"], "graph")
+        assert len(rows) == 1
+        dot = Path(log_dir, rows[0]["path"]).read_text(encoding="utf-8")
+        metadata = json.loads(rows[0]["metadata"])
+        assert "linear-model" in dot
+        assert metadata["kind"] == "graph"
+        assert metadata["format"] == "dot"
+        # Raw string / DOT input doesn't have a meaningful class name —
+        # writer stores model=None to avoid leaking source into the UI.
+        assert metadata["model"] is None
+        assert metadata["input_shape"] == [1, 3]
+        db.close()
+
+    def test_add_onnx_graph_accepts_tensorboard_signature(self, tmp_path):
+        log_dir = str(tmp_path / "runs" / "onnx_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_onnx_graph("ir_version: 8\nproducer_name: 'demo'\n")
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("onnx_run")
+        rows = db.get_artifacts(exp["id"], "onnx_graph")
+        assert len(rows) == 1
+        payload = Path(log_dir, rows[0]["path"]).read_text(encoding="utf-8")
+        metadata = json.loads(rows[0]["metadata"])
+        assert "ir_version" in payload
+        assert metadata["kind"] == "onnx_graph"
+        assert metadata["format"] == "onnx"
+        db.close()
+
+    def test_add_embedding_writes_embedding_artifact_payload(self, tmp_path):
+        np = pytest.importorskip("numpy")
+
+        log_dir = str(tmp_path / "runs" / "embedding_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_embedding(np.zeros((2, 3)), metadata=["a", "b"], tag="emb")
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("embedding_run")
+        rows = db.get_artifacts(exp["id"], "emb")
+        assert len(rows) == 1
+        payload = _artifact_json(log_dir, rows[0])
+        assert payload["mat"]["shape"] == [2, 3]
+        assert payload["metadata"] == ["a", "b"]
+        # No label_img means no sprite sidecar — the metadata.kind is the
+        # only thing that classifies it for the Embeddings tab.
+        meta = json.loads(rows[0]["metadata"])
+        assert meta["kind"] == "embedding"
+        assert "sprite_path" not in meta
+        db.close()
+
+    def test_add_embedding_with_label_img_writes_sprite_atlas(self, tmp_path):
+        """label_img → sprite-atlas PNG sidecar + sprite metadata in DB row."""
+        np = pytest.importorskip("numpy")
+        pytest.importorskip("PIL")
+
+        log_dir = str(tmp_path / "runs" / "embedding_thumb_run")
+        # 4 thumbnails of 8×8 RGB. NCHW (torch) layout — writer must coerce.
+        rng = np.random.default_rng(0)
+        label_img = (rng.random((4, 3, 8, 8), dtype=np.float32) * 255).astype(np.uint8)
+        # NCHW → ensure the writer accepts both layouts. Pass NCHW directly.
+        label_img_nchw = label_img
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_embedding(
+                np.zeros((4, 6), dtype=np.float32),
+                metadata=[
+                    ["cat", "train"],
+                    ["dog", "train"],
+                    ["cat", "val"],
+                    ["dog", "val"],
+                ],
+                metadata_header=["label", "split"],
+                label_img=label_img_nchw,
+                tag="emb",
+            )
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("embedding_thumb_run")
+        rows = db.get_artifacts(exp["id"], "emb")
+        assert len(rows) == 1
+        meta = json.loads(rows[0]["metadata"])
+        assert meta["kind"] == "embedding"
+        assert meta["sprite_path"], "sprite_path missing from artifact metadata"
+        sprite_meta = meta["sprite"]
+        assert sprite_meta["count"] == 4
+        # 4 tiles → 2×2 grid; tiles are 8×8 (writer NCHW → NHWC coercion).
+        assert sprite_meta["cols"] == 2
+        assert sprite_meta["rows"] == 2
+        assert sprite_meta["tile_w"] == 8
+        assert sprite_meta["tile_h"] == 8
+
+        sprite_abs = Path(log_dir) / meta["sprite_path"]
+        assert sprite_abs.exists(), f"sprite PNG missing at {sprite_abs}"
+        # Sanity-check the rendered atlas dimensions.
+        from PIL import Image
+
+        img = Image.open(sprite_abs)
+        assert img.size == (sprite_meta["cols"] * 8, sprite_meta["rows"] * 8)
+        db.close()
+
+    def test_add_pr_curve_writes_curve_artifact_payload(self, tmp_path):
+        log_dir = str(tmp_path / "runs" / "pr_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_pr_curve("pr", [0, 1, 1], [0.1, 0.7, 0.9], global_step=4)
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("pr_run")
+        rows = db.get_artifacts(exp["id"], "pr")
+        assert len(rows) == 1
+        assert rows[0]["step"] == 4
+        payload = _artifact_json(log_dir, rows[0])
+        assert payload["num_examples"] == 3
+        assert len(payload["points"]) == 127
+        assert {"threshold", "precision", "recall"} <= set(payload["points"][0])
+        db.close()
+
+    def test_add_pr_curve_raw_accepts_tensorboard_signature(self, tmp_path):
+        log_dir = str(tmp_path / "runs" / "pr_raw_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_pr_curve_raw(
+                "pr/raw",
+                true_positive_counts=[0, 1, 2],
+                false_positive_counts=[2, 1, 0],
+                true_negative_counts=[3, 2, 1],
+                false_negative_counts=[1, 0, 0],
+                precision=[0.0, 0.5, 1.0],
+                recall=[0.0, 0.75, 1.0],
+                global_step=5,
+            )
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("pr_raw_run")
+        rows = db.get_artifacts(exp["id"], "pr/raw")
+        assert len(rows) == 1
+        assert rows[0]["step"] == 5
+        payload = _artifact_json(log_dir, rows[0])
+        assert payload["num_thresholds"] == 127
+        assert payload["points"][2]["precision"] == 1.0
+        assert payload["points"][2]["recall"] == 1.0
+        assert payload["points"][2]["tp"] == 2.0
+        db.close()
+
+    def test_add_custom_scalars_writes_layout_artifact_payload(self, tmp_path):
+        layout = {"cat": {"chart": ["Multiline", ["loss", "acc"]]}}
+        log_dir = str(tmp_path / "runs" / "custom_scalars_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_custom_scalars(layout)
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("custom_scalars_run")
+        rows = db.get_artifacts(exp["id"], "custom_scalars")
+        assert len(rows) == 1
+        payload = _artifact_json(log_dir, rows[0])
+        assert payload == {"layout": layout}
+        db.close()
+
+    def test_add_custom_scalar_chart_helpers_accept_tensorboard_signatures(
+        self, tmp_path
+    ):
+        log_dir = str(tmp_path / "runs" / "custom_margin_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_custom_scalars_marginchart(["low", "mid", "high"], title="spread")
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("custom_margin_run")
+        rows = db.get_artifacts(exp["id"], "custom_scalars")
+        payload = _artifact_json(log_dir, rows[0])
+        assert payload == {
+            "layout": {"default": {"spread": ["Margin", ["low", "mid", "high"]]}}
+        }
+        db.close()
+
+        log_dir = str(tmp_path / "runs" / "custom_multiline_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_custom_scalars_multilinechart(
+                ["loss", "acc"],
+                category="metrics",
+                title="train",
+            )
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("custom_multiline_run")
+        rows = db.get_artifacts(exp["id"], "custom_scalars")
+        payload = _artifact_json(log_dir, rows[0])
+        assert payload == {
+            "layout": {"metrics": {"train": ["Multiline", ["loss", "acc"]]}}
+        }
+        db.close()
+
+    def test_add_mesh_writes_mesh_artifact_payload(self, tmp_path):
+        np = pytest.importorskip("numpy")
+
+        log_dir = str(tmp_path / "runs" / "mesh_run")
+        vertices = np.zeros((1, 3, 3))
+        colors = np.ones((1, 3, 3))
+        faces = np.array([[[0, 1, 2]]])
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_mesh(
+                "mesh", vertices=vertices, colors=colors, faces=faces, global_step=5
+            )
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("mesh_run")
+        rows = db.get_artifacts(exp["id"], "mesh")
+        assert len(rows) == 1
+        assert rows[0]["step"] == 5
+        payload = _artifact_json(log_dir, rows[0])
+        assert payload["vertices"]["shape"] == [1, 3, 3]
+        assert payload["colors"]["shape"] == [1, 3, 3]
+        assert payload["faces"]["values"] == [[[0, 1, 2]]]
+        db.close()
+
+    def test_add_tensor_accepts_tensorboard_signature(self, tmp_path):
+        np = pytest.importorskip("numpy")
+
+        log_dir = str(tmp_path / "runs" / "tensor_run")
+        with SummaryWriter(log_dir, project_folder=str(Path(log_dir).parent)) as w:
+            w.add_tensor("weights/tensor", np.array([[1, 2], [3, 4]]), global_step=6)
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("tensor_run")
+        rows = db.get_artifacts(exp["id"], "weights/tensor")
+        assert len(rows) == 1
+        assert rows[0]["step"] == 6
+        payload = _artifact_json(log_dir, rows[0])
+        metadata = json.loads(rows[0]["metadata"])
+        assert payload["tensor"]["shape"] == [2, 2]
+        assert payload["tensor"]["values"] == [[1, 2], [3, 4]]
+        assert metadata["kind"] == "tensor"
         db.close()
 
     def test_flush_timer_writes_buffered_scalars(self, log_dir):
@@ -210,6 +733,33 @@ class TestSummaryWriter:
         acc_steps = [r["step"] for r in db.get_scalars(exp["id"], "acc")]
         assert loss_steps == [0, 1]
         assert acc_steps == [0, 1]
+        db.close()
+
+    def test_purge_step_reuses_run_and_drops_later_events(self, tmp_path):
+        log_dir = str(tmp_path / "runs" / "purge_run")
+        project_folder = str(Path(log_dir).parent)
+
+        with SummaryWriter(log_dir, project_folder=project_folder) as w:
+            for step in range(5):
+                w.add_scalar("loss", float(step), step)
+
+        with SummaryWriter(
+            log_dir,
+            purge_step=3,
+            project_folder=project_folder,
+            system_metrics_interval=0,
+        ) as w:
+            w.add_scalar("loss", 30.0, 3)
+
+        db = _open_project_db(log_dir)
+        exp = db.get_experiment_by_name("purge_run")
+        rows = db.get_scalars(exp["id"], "loss")
+        assert [(r["step"], r["value"]) for r in rows] == [
+            (0, 0.0),
+            (1, 1.0),
+            (2, 2.0),
+            (3, 30.0),
+        ]
         db.close()
 
     def test_runtime_errors_do_not_raise_into_caller(self, log_dir):
@@ -289,7 +839,7 @@ class TestPrecacheWriter:
         db.close()
 
     def test_precache_writer_reads_during_precache(self, project_folder):
-        """flush() should not populate precache reads before close()."""
+        """flush() should move pending scalars into the in-memory precache."""
         run_dir = str(project_folder / "read_run")
         db_file = project_folder / "vibetrack.db"
         w = SummaryWriter(
@@ -303,8 +853,8 @@ class TestPrecacheWriter:
         w.flush()
 
         tags = w._db.get_scalar_tags(w.experiment_id)
-        assert "loss" not in tags
-        assert "acc" not in tags
+        assert "loss" in tags
+        assert "acc" in tags
 
         w.close()
         db = Database(db_file)

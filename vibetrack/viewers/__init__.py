@@ -29,7 +29,7 @@ _EXCLUDED = {"__init__.py", "base.py", "event.py"}
 
 def _viewer_name(filename: str) -> str:
     """Derive viewer name from filename: strip ``.py`` and ``_ui`` suffix."""
-    name = filename.removesuffix(".py")
+    name = filename[:-3] if filename.endswith(".py") else filename
     if name.endswith("_ui"):
         name = name[:-3]
     return name

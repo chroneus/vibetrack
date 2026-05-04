@@ -19,7 +19,9 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -40,6 +42,12 @@ def _load_template() -> str:
     return _INDEX_PATH.read_text(encoding="utf-8")
 
 
+# Per-process cache-busting stamp. Static asset URLs in index.html get
+# rewritten to include `?v=<stamp>` so a server restart forces browsers to
+# refetch JS/CSS even if their HTTP cache holds the previous version.
+_STATIC_VERSION = str(int(time.time()))
+
+
 def _json_for_html(obj: Any) -> str:
     """Serialize *obj* to JSON safe for embedding inside ``<script>``."""
     return json.dumps(obj).replace("</", r"\u003c/")
@@ -51,12 +59,19 @@ def _render(
     projects: Sequence[str],
 ) -> str:
     """Render the index template with JSON-safe replacements."""
-    return (
+    html = (
         _load_template()
         .replace("__DATA_JSON__", _json_for_html(data))
         .replace("__PROJECT_JSON__", _json_for_html(project))
         .replace("__PROJECTS_JSON__", _json_for_html(list(projects)))
     )
+    # Cache-bust local static URLs: src="/static/foo.js" → src="/static/foo.js?v=…"
+    html = re.sub(
+        r'(src|href)="(/static/[^"?#]+)"',
+        rf'\1="\2?v={_STATIC_VERSION}"',
+        html,
+    )
+    return html
 
 
 def _resolve_host(host: str) -> str:
@@ -77,11 +92,23 @@ def _resolve_media_path(log_dir: str, rel_path: str) -> str:
     """Resolve a relative media path to absolute using the experiment's log_dir."""
     if not rel_path:
         return rel_path
+    if not log_dir:
+        # No log_dir to anchor containment against — preserve legacy behaviour.
+        return rel_path
+    log_dir_resolved = str(Path(log_dir).resolve())
     if os.path.isabs(rel_path):
-        return rel_path  # already absolute (legacy data)
-    if log_dir:
-        return str(Path(log_dir).resolve() / rel_path)
-    return rel_path
+        candidate = str(Path(rel_path).resolve())
+    else:
+        candidate = str((Path(log_dir) / rel_path).resolve())
+    # Defense in depth: even with a poisoned absolute path, refuse to return
+    # anything outside the experiment's log_dir. The /media endpoint enforces
+    # this again, but catching it here keeps poisoned paths off the wire.
+    if (
+        not candidate.startswith(log_dir_resolved + os.sep)
+        and candidate != log_dir_resolved
+    ):
+        return ""
+    return candidate
 
 
 def _scalar_series(exp: ExperimentReader, tag: str) -> Dict[str, list]:
@@ -91,6 +118,111 @@ def _scalar_series(exp: ExperimentReader, tag: str) -> Dict[str, list]:
         "values": [r["value"] for r in rows],
         "wall_times": [r["wall_time"] for r in rows],
     }
+
+
+# Cap how many points we PCA-reduce + push to the browser per (tag, step).
+# 5k points renders smoothly under a custom THREE.Points shader and keeps the
+# embedded JSON payload reasonable. Larger tags are random-sampled with a
+# tag-derived seed so the projection is stable across reloads.
+_EMBEDDING_MAX_POINTS = 5000
+
+
+def _project_3d(vectors: Any) -> Any:
+    """Project an (N, D) matrix to (N, 3) via mean-centered SVD (PCA)."""
+    import numpy as np  # type: ignore[import-untyped]
+
+    arr = np.asarray(vectors, dtype=np.float32)
+    if arr.ndim != 2:
+        arr = arr.reshape(arr.shape[0], -1) if arr.size else arr
+    if arr.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    n, d = arr.shape
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    centered = arr - arr.mean(axis=0, keepdims=True)
+    if d == 0:
+        return np.zeros((n, 3), dtype=np.float32)
+    if d < 3:
+        # Pad to 3-D so the viewer always gets a renderable cloud.
+        out = np.zeros((n, 3), dtype=np.float32)
+        out[:, :d] = centered
+        return out
+    # Truncated SVD via numpy — fast for the sizes we cap to (N ≤ 5000).
+    try:
+        u, s, _ = np.linalg.svd(centered, full_matrices=False)
+        comps = (u[:, :3] * s[:3]).astype(np.float32)
+        if comps.shape[1] < 3:
+            padded = np.zeros((n, 3), dtype=np.float32)
+            padded[:, : comps.shape[1]] = comps
+            comps = padded
+        return comps
+    except np.linalg.LinAlgError:
+        return np.zeros((n, 3), dtype=np.float32)
+
+
+def _embedding_payload(
+    log_dir: str,
+    entry: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Build the per-step JSON the embeddings tab consumes, or ``None``.
+
+    Drops empty payloads (no vectors) so the server doesn't ship dead cards.
+    """
+    import numpy as np  # type: ignore[import-untyped]
+
+    vectors = entry.get("vectors")
+    if not vectors:
+        return None
+    try:
+        mat = np.asarray(vectors, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+    if mat.ndim != 2 or mat.shape[0] == 0:
+        return None
+
+    rows = entry.get("metadata_rows")
+    indices = None
+    if mat.shape[0] > _EMBEDDING_MAX_POINTS:
+        # Deterministic sub-sample so reloads don't reshuffle the cloud.
+        seed = abs(hash((entry.get("step"), mat.shape[0], mat.shape[1]))) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed)
+        indices = np.sort(
+            rng.choice(mat.shape[0], size=_EMBEDDING_MAX_POINTS, replace=False)
+        )
+        mat = mat[indices]
+        if isinstance(rows, list):
+            rows = [rows[i] for i in indices.tolist()]
+
+    points3d = _project_3d(mat)
+
+    sprite_abs = entry.get("sprite_abs")
+    sprite_url: Optional[str] = None
+    if sprite_abs and os.path.exists(sprite_abs):
+        sprite_url = "/media?path=" + sprite_abs
+
+    out: Dict[str, Any] = {
+        "step": entry.get("step"),
+        "path": _resolve_media_path(log_dir, entry.get("path", "")),
+        "shape": list(map(int, entry.get("shape") or []))
+        or [int(mat.shape[0]), int(mat.shape[1])],
+        "n_points": int(points3d.shape[0]),
+        "n_total": (
+            int(entry.get("shape", [mat.shape[0]])[0])
+            if entry.get("shape")
+            else int(mat.shape[0])
+        ),
+        "points3d": points3d.tolist(),
+        "metadata_rows": rows if isinstance(rows, list) else None,
+        "metadata_header": (
+            entry.get("metadata_header")
+            if isinstance(entry.get("metadata_header"), list)
+            else None
+        ),
+        "sprite_url": sprite_url,
+        "sprite": entry.get("sprite"),
+        "sampled_indices": indices.tolist() if indices is not None else None,
+    }
+    return out
 
 
 def _serialize_experiment(exp: ExperimentReader) -> Dict[str, Any]:
@@ -124,7 +256,7 @@ def _serialize_experiment(exp: ExperimentReader) -> Dict[str, Any]:
         ]
         for tag in exp.video_tags()
     }
-    artifacts = {
+    raw_artifacts = {
         tag: [
             {
                 "step": r["step"],
@@ -135,6 +267,82 @@ def _serialize_experiment(exp: ExperimentReader) -> Dict[str, Any]:
         ]
         for tag in exp.artifact_tags()
     }
+
+    def _is_kind(item: Dict[str, Any], *kinds: str) -> bool:
+        meta = item.get("metadata") or {}
+        return meta.get("kind") in kinds
+
+    # Pull each special "kind" (graphs/pr_curves/figures/meshes) into its
+    # own bucket and *remove* them from the generic artifacts feed so they
+    # don't double up in the Artifacts tab. Each gets its own UI surface.
+    models: Dict[str, list] = {}
+    pr_curves: Dict[str, list] = {}
+    figures: Dict[str, list] = {}
+    meshes: Dict[str, list] = {}
+    embeddings: Dict[str, list] = {}
+    artifacts: Dict[str, list] = {}
+    for tag, rows in raw_artifacts.items():
+        model_rows = [
+            r
+            for r in rows
+            if _is_kind(r, "graph") or (r.get("metadata") or {}).get("format") == "dot"
+        ]
+        pr_rows = [r for r in rows if _is_kind(r, "pr_curve")]
+        figure_rows = [r for r in rows if _is_kind(r, "figure")]
+        mesh_rows = [r for r in rows if _is_kind(r, "mesh")]
+        embedding_rows = [r for r in rows if _is_kind(r, "embedding")]
+        leftover = [
+            r
+            for r in rows
+            if r not in model_rows
+            and r not in pr_rows
+            and r not in figure_rows
+            and r not in mesh_rows
+            and r not in embedding_rows
+        ]
+        if model_rows:
+            for r in model_rows:
+                # Resolve embedded rendered PNG path to absolute so the JS
+                # can serve it via /media without further work.
+                meta = r.get("metadata") or {}
+                rel = meta.get("rendered_png_path")
+                if rel:
+                    meta["rendered_png_abs"] = _resolve_media_path(log_dir, rel)
+            models[tag] = model_rows
+        if pr_rows:
+            pr_curves[tag] = pr_rows
+        if figure_rows:
+            figures[tag] = figure_rows
+        if mesh_rows:
+            # Inline the mesh JSON payload (vertices/colors/faces) so the
+            # client renders without a follow-up fetch. Strip the .shape
+            # wrapper — the JS only needs flat .values arrays.
+            mesh_entries = exp.meshes(tag)
+            by_step = {e["step"]: e for e in mesh_entries}
+            for r in mesh_rows:
+                entry = by_step.get(r["step"], {})
+                r["vertices"] = (entry.get("vertices") or {}).get("values")
+                r["colors"] = (entry.get("colors") or {}).get("values")
+                r["faces"] = (entry.get("faces") or {}).get("values")
+            meshes[tag] = mesh_rows
+        if embedding_rows:
+            # Server-side PCA-reduce + sample so the client gets a render-
+            # ready 3-D point cloud + sprite URL without parsing megabytes
+            # of high-D vectors. Drop entries whose JSON is empty/corrupt.
+            embed_entries = exp.embeddings(tag)
+            by_step = {e["step"]: e for e in embed_entries}
+            collected: List[Dict[str, Any]] = []
+            for r in embedding_rows:
+                entry = by_step.get(r["step"])
+                if entry is None:
+                    continue
+                payload = _embedding_payload(log_dir, entry)
+                if payload is not None:
+                    collected.append(payload)
+            if collected:
+                embeddings[tag] = collected
+        if leftover:
+            artifacts[tag] = leftover
     text_data = {
         tag: [{"step": r["step"], "value": r["value"]} for r in exp.texts(tag)]
         for tag in exp.text_tags()
@@ -163,6 +371,20 @@ def _serialize_experiment(exp: ExperimentReader) -> Dict[str, Any]:
         "video_data": video_data,
         "artifact_tags": list(artifacts),
         "artifacts": artifacts,
+        "model_tags": list(models),
+        "models": models,
+        # Back-compat aliases for older clients/tests that may still query
+        # the "graphs" key. New code should use "models".
+        "graph_tags": list(models),
+        "graphs": models,
+        "pr_curve_tags": list(pr_curves),
+        "pr_curves": pr_curves,
+        "figure_tags": list(figures),
+        "figures": figures,
+        "mesh_tags": list(meshes),
+        "meshes": meshes,
+        "embedding_tags": list(embeddings),
+        "embeddings": embeddings,
         "text_tags": list(text_data),
         "text_data": text_data,
         "histogram_tags": list(histogram_data),
@@ -452,6 +674,10 @@ class WebOutput(BaseOutput):
             if db is None or not db.list_experiments(project=project):
                 return JSONResponse({"error": "not found"}, status_code=404)
             return _build_data(_experiments_for_project(db, project))
+
+        @app.get("/api/projects")
+        def api_projects() -> List[str]:
+            return _all_projects()
 
         # ── Config ────────────────────────────────────────────
 

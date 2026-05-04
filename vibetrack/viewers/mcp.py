@@ -10,6 +10,7 @@ from typing import Any, List, Optional, Sequence
 
 from ..compare import compare_hparams, summary_table
 from .base import BaseOutput
+from .console import ConsoleOutput
 
 _STREAMABLE_HTTP_LOGGER = "mcp.server.streamable_http_manager"
 
@@ -50,6 +51,7 @@ class MCPOutput(BaseOutput):
         reader = self._reader
         resolve = self._resolve_experiments
         mcp = self._mcp
+        project_folder = self.project_folder
 
         @mcp.tool()
         def list_experiments() -> str:
@@ -74,7 +76,9 @@ class MCPOutput(BaseOutput):
                     "images": exp.image_tags(),
                     "audio": exp.audio_tags(),
                     "video": exp.video_tags(),
-                    "artifacts": exp.artifact_tags(),
+                    "artifacts": exp.user_artifact_tags(),
+                    "models": exp.model_tags(),
+                    "pr_curves": exp.pr_curve_tags(),
                     "histograms": exp.histogram_tags(),
                 }
             )
@@ -148,6 +152,20 @@ class MCPOutput(BaseOutput):
                 return json.dumps({"error": "No experiments found"})
             return json.dumps(compare_hparams(exps))
 
+        @mcp.tool()
+        def run_report(experiment: str) -> str:
+            """Get a human-readable end-of-run digest for one experiment.
+
+            Includes hparams, scalar stats (last/min/max/mean + sparkline),
+            text entries, and media counts. Mirrors what
+            ``writer.to("console", summary=True)`` prints at close time.
+            """
+            exps = resolve([experiment])
+            if not exps:
+                return f"Experiment {experiment!r} not found"
+            console = ConsoleOutput(project_folder)
+            return console._build_run_report(exps[0])
+
     # ── Resources ────────────────────────────────────────────
 
     def _register_resources(self) -> None:
@@ -179,7 +197,9 @@ class MCPOutput(BaseOutput):
                     "images": exp.image_tags(),
                     "audio": exp.audio_tags(),
                     "video": exp.video_tags(),
-                    "artifacts": exp.artifact_tags(),
+                    "artifacts": exp.user_artifact_tags(),
+                    "models": exp.model_tags(),
+                    "pr_curves": exp.pr_curve_tags(),
                     "histograms": exp.histogram_tags(),
                     "hparams": exp.hparams(),
                     "config": exp.config(),

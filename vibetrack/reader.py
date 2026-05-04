@@ -44,14 +44,17 @@ class ExperimentReader:
         if not rel_path:
             return rel_path
         path = Path(rel_path)
-        if path.is_absolute():
-            return str(path)
         log_dir = self.log_dir
         if not log_dir:
+            # No log dir to anchor against — preserve legacy behaviour.
             return str(path)
-        resolved = (Path(log_dir) / path).resolve()
-        # Reject path traversal attempts
         log_dir_resolved = str(Path(log_dir).resolve())
+        if path.is_absolute():
+            resolved = path.resolve()
+        else:
+            resolved = (Path(log_dir) / path).resolve()
+        # Reject path traversal — even for stored absolute paths, since a
+        # poisoned row could otherwise leak files outside the experiment dir.
         if (
             not str(resolved).startswith(log_dir_resolved + os.sep)
             and str(resolved) != log_dir_resolved
@@ -139,7 +142,200 @@ class ExperimentReader:
         ]
 
     def artifact_tags(self) -> List[str]:
+        """All tags in the artifacts table — including graphs and PR curves.
+
+        For a "user artifacts only" view (excluding graphs and PR curves,
+        which now live under their own kinds), use :meth:`user_artifact_tags`.
+        """
         return self._db.get_artifact_tags(self.experiment_id)
+
+    def _filter_artifact_tags(self, *kinds: str) -> List[str]:
+        """Tags whose first-row metadata.kind matches any of *kinds*."""
+        out: List[str] = []
+        for tag in self._db.get_artifact_tags(self.experiment_id):
+            rows = self._db.get_artifacts(self.experiment_id, tag)
+            if not rows:
+                continue
+            meta_raw = rows[0]["metadata"]
+            meta = json.loads(meta_raw) if meta_raw else {}
+            if meta.get("kind") in kinds or (
+                "dot" in kinds and meta.get("format") == "dot"
+            ):
+                out.append(tag)
+        return out
+
+    def user_artifact_tags(self) -> List[str]:
+        """Artifact tags excluding kinds that have their own UI bucket.
+
+        Models (``add_graph``), PR curves (``add_pr_curve``), figures
+        (``add_figure``), meshes (``add_mesh``) and embeddings
+        (``add_embedding``) live under their own readers and are surfaced
+        in dedicated tabs — they should not appear in the generic
+        Artifacts feed.
+        """
+        special = (
+            set(self.model_tags())
+            | set(self.pr_curve_tags())
+            | set(self.figure_tags())
+            | set(self.mesh_tags())
+            | set(self.embedding_tags())
+        )
+        return [t for t in self.artifact_tags() if t not in special]
+
+    def model_tags(self) -> List[str]:
+        """Tags stored under the ``add_graph`` (model diagram) channel."""
+        return self._filter_artifact_tags("graph", "dot")
+
+    def models(self, tag: str) -> List[Dict[str, Any]]:
+        """Per-step model entries: DOT path, rendered PNG path, metadata."""
+        rows = self.artifacts(tag)
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            meta = r.get("metadata") or {}
+            png_rel = meta.get("rendered_png_path")
+            out.append(
+                {
+                    "step": r["step"],
+                    "path": r["path"],
+                    "abs_path": r["abs_path"],
+                    "rendered_png_path": png_rel,
+                    "rendered_png_abs": (
+                        self.resolve_media_path(png_rel) if png_rel else None
+                    ),
+                    "metadata": meta,
+                    "wall_time": r["wall_time"],
+                }
+            )
+        return out
+
+    def pr_curve_tags(self) -> List[str]:
+        """Tags stored under the ``add_pr_curve`` channel."""
+        return self._filter_artifact_tags("pr_curve")
+
+    def pr_curves(self, tag: str) -> List[Dict[str, Any]]:
+        """Per-step PR-curve payloads with parsed precision/recall points."""
+        out: List[Dict[str, Any]] = []
+        for r in self.artifacts(tag):
+            payload: Dict[str, Any] = {}
+            try:
+                if r["abs_path"]:
+                    with open(r["abs_path"], "rb") as fh:
+                        payload = json.loads(fh.read())
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            out.append(
+                {
+                    "step": r["step"],
+                    "path": r["path"],
+                    "abs_path": r["abs_path"],
+                    "num_examples": payload.get("num_examples"),
+                    "points": payload.get("points", []),
+                    "metadata": r["metadata"],
+                    "wall_time": r["wall_time"],
+                }
+            )
+        return out
+
+    def figure_tags(self) -> List[str]:
+        """Tags stored under the ``add_figure`` (matplotlib chart) channel."""
+        return self._filter_artifact_tags("figure")
+
+    def figures(self, tag: str) -> List[Dict[str, Any]]:
+        """Per-step figure entries: PNG path + metadata.
+
+        The artifact file *is* the rendered PNG (no JSON sidecar).
+        """
+        out: List[Dict[str, Any]] = []
+        for r in self.artifacts(tag):
+            meta = r.get("metadata") or {}
+            out.append(
+                {
+                    "step": r["step"],
+                    "path": r["path"],
+                    "abs_path": r["abs_path"],
+                    "shape": meta.get("shape"),
+                    "format": meta.get("format", "png"),
+                    "metadata": meta,
+                    "wall_time": r["wall_time"],
+                }
+            )
+        return out
+
+    def mesh_tags(self) -> List[str]:
+        """Tags stored under the ``add_mesh`` channel."""
+        return self._filter_artifact_tags("mesh")
+
+    def meshes(self, tag: str) -> List[Dict[str, Any]]:
+        """Per-step mesh payloads with parsed vertices / colors / faces."""
+        out: List[Dict[str, Any]] = []
+        for r in self.artifacts(tag):
+            payload: Dict[str, Any] = {}
+            try:
+                if r["abs_path"]:
+                    with open(r["abs_path"], "rb") as fh:
+                        payload = json.loads(fh.read())
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            out.append(
+                {
+                    "step": r["step"],
+                    "path": r["path"],
+                    "abs_path": r["abs_path"],
+                    "vertices": payload.get("vertices"),
+                    "colors": payload.get("colors"),
+                    "faces": payload.get("faces"),
+                    "config": payload.get("config"),
+                    "metadata": r["metadata"],
+                    "wall_time": r["wall_time"],
+                }
+            )
+        return out
+
+    def embedding_tags(self) -> List[str]:
+        """Tags stored under the ``add_embedding`` channel."""
+        return self._filter_artifact_tags("embedding")
+
+    def embeddings(self, tag: str) -> List[Dict[str, Any]]:
+        """Per-step embedding payloads with parsed ``mat`` / ``metadata``.
+
+        Each entry exposes the high-D vectors (``vectors`` / ``shape``),
+        per-row metadata, and — when the writer rendered a sprite atlas
+        from ``label_img`` — the absolute path to the companion PNG so the
+        web viewer can fetch it as a Three.js texture without re-parsing
+        the JSON.
+        """
+        out: List[Dict[str, Any]] = []
+        for r in self.artifacts(tag):
+            payload: Dict[str, Any] = {}
+            try:
+                if r["abs_path"]:
+                    with open(r["abs_path"], "rb") as fh:
+                        payload = json.loads(fh.read())
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            meta = r.get("metadata") or {}
+            sprite_rel = meta.get("sprite_path")
+            sprite_abs = self.resolve_media_path(sprite_rel) if sprite_rel else None
+            mat = payload.get("mat") or {}
+            label_img_meta = payload.get("label_img") or {}
+            out.append(
+                {
+                    "step": r["step"],
+                    "path": r["path"],
+                    "abs_path": r["abs_path"],
+                    "vectors": mat.get("values"),
+                    "shape": mat.get("shape"),
+                    "metadata_rows": payload.get("metadata"),
+                    "metadata_header": payload.get("metadata_header"),
+                    "label_img_shape": label_img_meta.get("shape"),
+                    "sprite": payload.get("sprite") or meta.get("sprite"),
+                    "sprite_path": sprite_rel,
+                    "sprite_abs": sprite_abs,
+                    "metadata": meta,
+                    "wall_time": r["wall_time"],
+                }
+            )
+        return out
 
     def histograms(self, tag: str) -> List[Dict[str, Any]]:
         return self._db.get_histograms(self.experiment_id, tag)
@@ -199,7 +395,10 @@ class RunReader:
         if project is not None:
             return project
         if project_folder is None:
-            return Path.cwd().resolve().name
+            # Path("/").resolve().name is "" — treat as "no project" rather
+            # than a literal empty-string filter that matches legacy rows.
+            name = Path.cwd().resolve().name
+            return name or None
         return None
 
     def _discover(self) -> None:
@@ -212,12 +411,21 @@ class RunReader:
             self._db.close()
             self._db = None
 
-    def experiments(self) -> List[ExperimentReader]:
-        """List all experiments stored in the project database."""
+    _UNSET_PROJECT: Any = object()
+
+    def experiments(self, project: Any = _UNSET_PROJECT) -> List[ExperimentReader]:
+        """List experiments stored in the project database.
+
+        ``project`` overrides the reader's default filter for this call only.
+        Pass ``None`` to list all projects, or omit the argument to use
+        ``self.project``. Lets callers (e.g. the Gradio dashboard) ask for a
+        specific project without mutating shared reader state.
+        """
         self._discover()
         if self._db is None:
             return []
-        rows = self._db.list_experiments(project=self.project)
+        effective = self.project if project is RunReader._UNSET_PROJECT else project
+        rows = self._db.list_experiments(project=effective)
         return [
             ExperimentReader(self._db, row["id"], row["name"], row=row) for row in rows
         ]

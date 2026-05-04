@@ -329,23 +329,35 @@ function _imgBuildAnimate(container, entries, tag) {
 
   const wrap = document.createElement('div'); wrap.className = 'img-animate';
 
-  // Controls
+  // Controls — hide play/slider entirely for single-step tags (would render
+  // as "Step 0 / 0" with a stuck slider). The cell label still gets the
+  // step number through the cell-level UI; nothing here to interact with.
   const ctrl = document.createElement('div'); ctrl.className = 'img-animate-controls';
   const playBtn = document.createElement('button'); playBtn.innerHTML = '&#9654;'; playBtn.title = 'Play';
   const stepLabel = document.createElement('span'); stepLabel.className = 'step-label';
   const slider = document.createElement('input'); slider.type = 'range';
-  slider.min = 0; slider.max = steps.length - 1; slider.value = 0;
-  ctrl.append(playBtn, slider, stepLabel);
-  wrap.appendChild(ctrl);
+  slider.min = 0; slider.max = Math.max(0, steps.length - 1); slider.value = 0;
+  if (steps.length > 1) {
+    ctrl.append(playBtn, slider, stepLabel);
+    wrap.appendChild(ctrl);
+  }
 
   // Viewport
   const viewport = document.createElement('div'); viewport.className = 'img-animate-viewport';
-  // Create one cell per experiment
+  // Create one cell per experiment. Each cell holds an <img> AND a same-sized
+  // placeholder div; renderFrame toggles between them so the grid row stays
+  // vertically aligned even when an experiment is missing a frame at the
+  // current step.
   const cells = {};
   const cellEls = {};
+  const placeholders = {};
   expNames.forEach(exp => {
     const cell = document.createElement('div'); cell.className = 'animate-cell';
     const img = document.createElement('img'); img.alt = exp;
+    const placeholder = document.createElement('div'); placeholder.className = 'img-placeholder';
+    placeholder.style.display = 'none';  // renderFrame switches this on first paint
+    const phMsg = document.createElement('span'); phMsg.className = 'img-placeholder-msg';
+    placeholder.appendChild(phMsg);
     const cb = document.createElement('input'); cb.type = 'checkbox'; cb.className = 'img-select-cb';
     cb.addEventListener('click', e => e.stopPropagation());
     cb.addEventListener('change', () => {
@@ -356,10 +368,11 @@ function _imgBuildAnimate(container, entries, tag) {
     });
     const lbl = document.createElement('div'); lbl.className = 'cell-label';
     lbl.innerHTML = `<span class="exp" style="color:${expColors[exp] || 'var(--muted)'}">${escapeHtml(exp)}</span>`;
-    cell.append(cb, img, lbl);
+    cell.append(cb, img, placeholder, lbl);
     viewport.appendChild(cell);
     cells[exp] = img;
     cellEls[exp] = cell;
+    placeholders[exp] = placeholder;
     img.style.cursor = 'pointer';
     img.addEventListener('click', () => {
       const step = steps[parseInt(slider.value)];
@@ -382,8 +395,15 @@ function _imgBuildAnimate(container, entries, tag) {
       if (path) {
         cells[exp].src = mediaUrl(path);
         cells[exp].style.display = '';
+        placeholders[exp].style.display = 'none';
       } else {
+        // Drop the previous src so the browser doesn't keep a frame buffered
+        // (and avoids a broken-img icon flash on the next paint).
+        cells[exp].removeAttribute('src');
         cells[exp].style.display = 'none';
+        placeholders[exp].style.display = '';
+        const msg = placeholders[exp].querySelector('.img-placeholder-msg');
+        if (msg) msg.textContent = 'no frame @ step ' + step;
       }
       // Update selection metadata to current step
       const si = _imgCompareSelection.findIndex(s => s.cellEl === cellEls[exp]);
@@ -708,13 +728,125 @@ function _vidOpenCompare() {
 function buildArtifacts() {
   const tb = document.getElementById('artifacts-body'); tb.innerHTML = ''; let n = 0;
   DATA.forEach(exp => (exp.artifact_tags || []).forEach(tag => (exp.artifacts[tag] || []).forEach(a => {
-    n++; const m = a.metadata || {}; const tr = document.createElement('tr');
+    const m = a.metadata || {};
+    // graphs and pr_curves have their own tabs; never list them here
+    if (m.kind === 'graph' || m.kind === 'pr_curve' || m.format === 'dot') return;
+    n++; const tr = document.createElement('tr');
     tr.dataset.dragId = exp.name + '/' + tag + '/' + a.step;
     tr.innerHTML = `<td style="color:${expColors[exp.name] || 'inherit'}">${escapeHtml(exp.name)}</td><td>${escapeHtml(tag)}</td><td>${a.step}</td><td>${escapeHtml(m.original_filename || '')}</td><td>${humanSize(m.file_size)}</td><td>${escapeHtml(m.mime_type || '')}</td><td><a href="${mediaUrl(a.path)}" download>Download</a></td>`;
     tb.appendChild(tr);
   })));
   if (!n) { const tr = document.createElement('tr'); tr.innerHTML = '<td colspan="7" class="empty-msg">No artifacts logged.</td>'; tb.appendChild(tr); }
   else enableDragSort(tb, 'artifacts');
+}
+
+// ── Graphs ───────────────────────────────────────────────────
+let _graphViz = null;
+function _graphRenderer() {
+  if (typeof Viz === 'undefined') return null;
+  if (!_graphViz) _graphViz = new Viz();
+  return _graphViz;
+}
+
+function _graphFallback(container, _dot, message) {
+  // We deliberately do NOT render the raw DOT source — the rendered PNG is
+  // the canonical view. When neither a PNG nor an SVG renderer is available
+  // we just show a short status message; the DOT itself is still
+  // downloadable from the card header link.
+  container.innerHTML = '';
+  if (message) {
+    const msg = document.createElement('div');
+    msg.className = 'graph-render-msg';
+    msg.textContent = message;
+    container.appendChild(msg);
+  }
+}
+
+function _renderGraphDot(container, dot) {
+  const viz = _graphRenderer();
+  if (!viz) {
+    _graphFallback(container, dot, 'DOT renderer unavailable; showing source.');
+    return;
+  }
+  container.innerHTML = '<div class="empty-msg">Rendering graph...</div>';
+  viz.renderSVGElement(dot)
+    .then(svg => {
+      container.innerHTML = '';
+      svg.classList.add('graph-svg');
+      container.appendChild(svg);
+    })
+    .catch(err => {
+      _graphViz = null;
+      _graphFallback(container, dot, 'DOT render failed: ' + (err && err.message ? err.message : err));
+    });
+}
+
+function _fetchAndRenderGraph(container, item) {
+  fetch(mediaUrl(item.path))
+    .then(r => r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status)))
+    .then(dot => _renderGraphDot(container, dot))
+    .catch(err => _graphFallback(container, '', 'Unable to load graph: ' + err.message));
+}
+
+function buildGraphs() {
+  // Renders the "Models" tab. Each entry now ships a server-rendered PNG
+  // alongside the DOT source — prefer the PNG (instant, sharp, accurate
+  // shape annotations) and fall back to client-side viz.js DOT rendering
+  // only when no PNG is available.
+  const c = document.getElementById('models-list') || document.getElementById('graphs-list');
+  if (!c) return;
+  c.innerHTML = '';
+  const byTag = {};
+  DATA.forEach(exp => {
+    const tags = exp.model_tags || exp.graph_tags || [];
+    const items = exp.models || exp.graphs || {};
+    tags.forEach(tag => {
+      if (!byTag[tag]) byTag[tag] = [];
+      (items[tag] || []).forEach(g => byTag[tag].push({ exp: exp.name, tag, ...g }));
+    });
+  });
+  const tags = Object.keys(byTag).sort();
+  if (!tags.length) { c.innerHTML = '<div class="empty-msg">No models logged.</div>'; return; }
+  tags.forEach(tag => {
+    const entries = byTag[tag].sort((a, b) => a.step - b.step);
+    const section = document.createElement('div'); section.className = 'graph-section';
+    const header = document.createElement('div'); header.className = 'img-tag-header';
+    const h3 = document.createElement('h3'); h3.textContent = tag;
+    header.appendChild(h3); section.appendChild(header);
+    const grid = document.createElement('div'); grid.className = 'graph-grid';
+    entries.forEach(item => {
+      const card = document.createElement('div'); card.className = 'graph-card';
+      const title = document.createElement('div'); title.className = 'graph-card-title';
+      const meta = item.metadata || {};
+      // Defensive: older runs stored repr(model) here, which for raw DOT
+      // input is the entire source ("'digraph foo {...}'"). Drop anything
+      // that looks like DOT or a multi-line blob — only keep a short class
+      // name like "ResNet" or "Sequential".
+      let modelName = '';
+      if (meta.model) {
+        const raw = String(meta.model).split('(')[0].trim();
+        const looksLikeDot = /\bdigraph\b|\bgraph\b\s*\{|\{|\n/.test(raw);
+        if (!looksLikeDot && raw.length > 0 && raw.length < 80) modelName = raw;
+      }
+      title.innerHTML = `<span style="color:${expColors[item.exp] || 'var(--muted)'}">${escapeHtml(item.exp)}</span>` +
+        (modelName ? `<span class="model-class">${escapeHtml(modelName)}</span>` : '') +
+        `<span>step ${item.step}</span>` +
+        `<a href="${mediaUrl(item.path)}" download>DOT</a>`;
+      const body = document.createElement('div'); body.className = 'graph-body';
+      card.append(title, body); grid.appendChild(card);
+      const pngAbs = meta.rendered_png_abs;
+      if (pngAbs) {
+        const img = document.createElement('img');
+        img.className = 'model-png';
+        img.alt = `${item.tag} step ${item.step}`;
+        img.src = mediaUrl(pngAbs);
+        body.appendChild(img);
+      } else {
+        _fetchAndRenderGraph(body, item);
+      }
+    });
+    section.appendChild(grid); c.appendChild(section);
+  });
 }
 
 // ── Text ─────────────────────────────────────────────────────

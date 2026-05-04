@@ -55,6 +55,15 @@ class BaseOutput(ABC):
         """
         return None
 
+    def send_summary(self, run_name: str, project: Optional[str] = None) -> None:
+        """Push a final end-of-run summary (charts + media + text body).
+
+        Called once from :meth:`SummaryWriter.close` for adapters registered
+        with ``summary=True``.  Default: no-op.  Override in adapters that
+        support rich digests (slack, telegram).
+        """
+        return None
+
     def close(self) -> None:
         self._reader.close()
 

@@ -290,6 +290,128 @@
       height: 280px !important;
     }
 
+    /* System metrics */
+    #system-charts.system-grid {
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      align-items: stretch;
+    }
+
+    .system-alert {
+      grid-column: 1 / -1;
+      background: #3d1114;
+      border: 1px solid #f85149;
+      border-radius: 8px;
+      color: #ff7b72;
+      font-weight: 600;
+      padding: 10px 16px;
+    }
+
+    .system-card {
+      min-width: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .system-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .system-card-head h2 {
+      margin: 0;
+      color: var(--text);
+      font-size: 1em;
+      letter-spacing: 0;
+    }
+
+    .system-chip {
+      flex: 0 1 auto;
+      min-width: 0;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 0.78em;
+      font-weight: 700;
+      line-height: 1.2;
+      max-width: 58%;
+      overflow: hidden;
+      padding: 4px 9px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .system-metrics {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .system-metric {
+      min-width: 0;
+    }
+
+    .system-metric-head,
+    .system-kv {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .system-metric-head span,
+    .system-kv span {
+      color: var(--muted);
+      font-size: 0.78em;
+      font-weight: 600;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .system-metric-head strong,
+    .system-kv strong {
+      color: var(--text);
+      font-size: 0.95em;
+      font-weight: 700;
+      line-height: 1.25;
+      min-width: 0;
+      overflow-wrap: anywhere;
+      text-align: right;
+    }
+
+    .system-meter {
+      background: var(--border);
+      border-radius: 999px;
+      height: 8px;
+      margin-top: 7px;
+      overflow: hidden;
+    }
+
+    .system-meter span {
+      background: var(--meter-color);
+      border-radius: inherit;
+      display: block;
+      height: 100%;
+      width: var(--meter-value);
+    }
+
+    .system-chart-wrap {
+      min-width: 0;
+      position: relative;
+    }
+
+    #system-charts .system-chart-wrap canvas {
+      display: block;
+      width: 100% !important;
+    }
+
     /* Media */
     .media-grid {
       display: grid;
@@ -449,6 +571,34 @@
 
     .img-animate-viewport .animate-cell .cell-label .exp {
       /* color set dynamically via expColors */
+    }
+
+    /* Placeholder shown when an experiment has no frame at the current
+       step. Reserves the same square footprint as the image so the carousel
+       row stays vertically aligned across the slider sweep. Uses
+       color-mix(var(--muted)) for the stripe pattern so it stays visible
+       under the dark, light, and orange themes. */
+    .img-animate-viewport .animate-cell .img-placeholder {
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      border: 1px dashed var(--border);
+      border-radius: 4px;
+      background:
+        repeating-linear-gradient(
+          45deg,
+          color-mix(in srgb, var(--muted) 6%, transparent) 0,
+          color-mix(in srgb, var(--muted) 6%, transparent) 8px,
+          color-mix(in srgb, var(--muted) 12%, transparent) 8px,
+          color-mix(in srgb, var(--muted) 12%, transparent) 16px
+        );
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      font-size: 0.78em;
+      font-style: italic;
+      user-select: none;
+      box-sizing: border-box;
     }
 
     /* Image selection & compare */
@@ -1079,6 +1229,409 @@
 
     .artifacts-table a:hover {
       text-decoration: underline;
+    }
+
+    /* HParams */
+    .hparams-controls {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+
+    .hparams-controls label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.85em;
+      color: var(--muted);
+    }
+
+    .hparams-controls select {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 5px 8px;
+      min-width: 180px;
+    }
+
+    .hparam-objective {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+
+    .hparam-objective button {
+      background: var(--card);
+      color: var(--muted);
+      border: 0;
+      border-right: 1px solid var(--border);
+      padding: 6px 12px;
+      cursor: pointer;
+    }
+
+    .hparam-objective button:last-child { border-right: 0; }
+
+    .hparam-objective button.active {
+      background: var(--accent);
+      color: var(--bg);
+    }
+
+    .hparams-summary {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+
+    .hparams-summary span {
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      color: var(--muted);
+      padding: 3px 9px;
+      font-size: 0.8em;
+    }
+
+    .hparams-table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin-bottom: 20px;
+    }
+
+    .hparams-table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 720px;
+    }
+
+    .hparams-table th,
+    .hparams-table td {
+      padding: 7px 10px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      font-size: 0.82em;
+      white-space: nowrap;
+    }
+
+    .hparams-table th {
+      color: var(--accent);
+      background: var(--card);
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+
+    .hparams-table tr.best td {
+      background: color-mix(in srgb, var(--accent) 10%, transparent);
+    }
+
+    .hparams-table td.diff {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .hparams-table td.missing {
+      color: var(--muted);
+    }
+
+    .hparam-run,
+    .hparam-result {
+      font-weight: 600;
+    }
+
+    .hparams-section-title {
+      margin: 18px 0 10px;
+      color: var(--muted);
+      font-size: 0.86em;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .hparams-viz-grid,
+    .hparams-tree-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 12px;
+    }
+
+    .hparam-viz-card {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--card);
+      padding: 10px;
+      min-height: 270px;
+    }
+
+    .hparam-viz-card h3 {
+      font-size: 0.9em;
+      color: var(--text);
+      margin-bottom: 8px;
+      overflow-wrap: anywhere;
+    }
+
+    .hparam-chart-wrap {
+      height: 220px;
+    }
+
+    .hparam-chart-wrap canvas {
+      width: 100%;
+      height: 100%;
+    }
+
+    .hparams-tree {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--card);
+      padding: 8px 10px;
+      min-width: 0;
+    }
+
+    .hparams-tree summary {
+      cursor: pointer;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+
+    .hparams-tree ul {
+      list-style: none;
+      margin-left: 12px;
+      border-left: 1px solid var(--border);
+      padding-left: 10px;
+    }
+
+    .hparams-tree li {
+      margin: 4px 0;
+      font-size: 0.82em;
+      overflow-wrap: anywhere;
+    }
+
+    .hparam-tree-key {
+      color: var(--accent);
+      margin-right: 6px;
+    }
+
+    .hparam-tree-value {
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    /* Graphs */
+    .graph-section {
+      margin-bottom: 28px;
+    }
+
+    .graph-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 16px;
+      margin-top: 12px;
+    }
+
+    .graph-card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--card);
+      overflow: hidden;
+    }
+
+    .graph-card-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.85em;
+      color: var(--muted);
+    }
+
+    .graph-card-title a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    .graph-body {
+      min-height: 260px;
+      max-height: 620px;
+      overflow: auto;
+      padding: 12px;
+      background: var(--bg);
+    }
+
+    .graph-svg {
+      display: block;
+      min-width: 100%;
+      height: auto;
+    }
+
+    .graph-render-msg {
+      color: var(--muted);
+      margin-bottom: 10px;
+      font-size: 0.9em;
+    }
+
+    /* Meshes */
+    #meshes-list .graph-grid {
+      /* Allow narrower mesh cards so they don't overflow on small screens. */
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+
+    .mesh-body {
+      padding: 0;
+      min-height: 360px;
+      max-height: 360px;
+      overflow: hidden;
+      background: #111418;
+    }
+
+    .mesh-body canvas {
+      display: block;
+      width: 100% !important;
+      height: 360px !important;
+    }
+
+    .mesh-stats {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.85em;
+      color: var(--muted);
+    }
+
+    .mesh-render-msg {
+      color: var(--muted);
+      padding: 12px;
+      font-size: 0.9em;
+    }
+
+    /* Embeddings (3-D point-cloud projector) */
+    #embeddings-list .graph-grid {
+      /* Wider than meshes — point clouds need real estate to read. */
+      grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    }
+
+    .embedding-body {
+      padding: 0;
+      position: relative;
+      min-height: 400px;
+      max-height: 400px;
+      overflow: hidden;
+      background: #0c1016;
+    }
+
+    .embedding-body canvas {
+      display: block;
+      width: 100% !important;
+      height: 400px !important;
+      cursor: grab;
+    }
+
+    .embedding-body canvas:active {
+      cursor: grabbing;
+    }
+
+    .embedding-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      background: var(--bg2);
+      font-size: 0.8em;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+
+    .embedding-controls select,
+    .embedding-controls input[type=range] {
+      font-size: 0.95em;
+    }
+
+    .embedding-controls input[type=range] {
+      flex: 1;
+      min-width: 80px;
+      accent-color: var(--accent);
+    }
+
+    .embedding-tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(20, 24, 32, 0.96);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-size: 0.78em;
+      color: var(--text);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+      max-width: 220px;
+      z-index: 10;
+      display: none;
+    }
+
+    .embedding-tooltip canvas {
+      display: block;
+      width: 64px;
+      height: 64px;
+      image-rendering: pixelated;
+      margin-bottom: 4px;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+    }
+
+    .embedding-tooltip .row {
+      display: flex;
+      gap: 6px;
+      line-height: 1.3;
+      overflow: hidden;
+    }
+
+    .embedding-tooltip .row > span:last-child {
+      /* Wrap long values (e.g. text-embedding source strings) and cap height
+         so a single 500-char sentence doesn't take over the whole card. */
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      max-height: 6.5em;
+      overflow: hidden;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+
+    .embedding-tooltip .key {
+      color: var(--muted);
+      flex: 0 0 auto;
+    }
+
+    .embedding-render-msg {
+      color: var(--muted);
+      padding: 12px;
+      font-size: 0.9em;
+    }
+
+    /* Figures (matplotlib charts on the Scalars tab) */
+    .figure-card {
+      grid-column: span 2;
+    }
+
+    .figure-card .figure-img {
+      max-width: 100%;
+      height: auto;
+      display: block;
+      margin: 0 auto;
+      background: var(--card);
+      border-radius: 4px;
+    }
+
+    .figure-card .figure-controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-top: 6px;
+      font-size: 0.85em;
+      color: var(--muted);
     }
 
     /* Settings */

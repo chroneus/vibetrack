@@ -38,6 +38,8 @@ function makeLineChart(ctx, datasets, opts) {
   const o = opts || {};
   const tc = themeColors();
   const isTime = _xAxisMode() === 'wall_time';
+  const compact = !!o.compact;
+  const tickFont = compact ? { size: 10 } : undefined;
   const xTickCb = isTime
     ? v => fmtDuration(v)
     : v => Number.isInteger(v) ? v : null;
@@ -46,13 +48,28 @@ function makeLineChart(ctx, datasets, opts) {
     type: 'line', data: { datasets },
     options: {
       responsive: true, maintainAspectRatio: false, animation: false,
+      layout: compact ? { padding: { top: 2, right: 4, bottom: 0, left: 0 } } : undefined,
       interaction: { mode: 'nearest', axis: 'x', intersect: false },
       scales: {
-        x: { type: 'linear', title: { display: true, text: isTime ? 'time' : 'step', color: tc.muted }, ticks: { color: tc.muted, maxTicksLimit: o.xTicks || 8, autoSkip: true, stepSize: xStepSize, callback: xTickCb }, grid: { color: tc.grid } },
-        y: { beginAtZero: false, ticks: { color: tc.muted, maxTicksLimit: o.yTicks || 7, autoSkip: true, callback: yTickCallback }, grid: { color: tc.grid } },
+        x: {
+          type: 'linear',
+          title: { display: o.xTitle !== false && !compact, text: isTime ? 'time' : 'step', color: tc.muted },
+          ticks: { color: tc.muted, maxTicksLimit: o.xTicks || (compact ? 4 : 8), autoSkip: true, stepSize: xStepSize, callback: xTickCb, font: tickFont },
+          grid: { color: tc.grid },
+        },
+        y: {
+          beginAtZero: o.yBeginAtZero ?? false,
+          min: o.yMin,
+          max: o.yMax,
+          suggestedMin: o.ySuggestedMin,
+          suggestedMax: o.ySuggestedMax,
+          ticks: { color: tc.muted, maxTicksLimit: o.yTicks || (compact ? 4 : 7), autoSkip: true, callback: yTickCallback, font: tickFont },
+          grid: { color: tc.grid },
+        },
       },
       plugins: {
         legend: {
+          display: o.legend !== false,
           labels: { color: tc.text, font: { size: 11 }, filter: i => !i.text.startsWith('_') },
           onClick: (e, i, l) => {
             Chart.defaults.plugins.legend.onClick.call(l, e, i, l);
@@ -141,21 +158,37 @@ function buildScalarDatasets(tag, sw) {
     const raw = xVals.map((st, j) => ({ x: st, y: s.values[j] }));
     const pr = raw.length <= 3 ? 4 : 0;
 
-    // Compute global min/max for extrema markers
+    // Compute global min/max for extrema markers. When several points share
+    // the extremum value (plateau), highlight the one closest to either
+    // edge of the series so the marker hugs the border rather than stamping
+    // every point on the plateau.
     const validYs = s.values.filter(v => v !== null && v !== undefined && !isNaN(v));
     const minY = validYs.length >= 3 ? Math.min(...validYs) : null;
     const maxY = validYs.length >= 3 ? Math.max(...validYs) : null;
     const hasExt = minY !== null && maxY !== null && minY !== maxY;
-    const extRadius = v => hasExt && (v === minY || v === maxY) ? 5 : pr;
-    const extBorder = v => hasExt && (v === minY || v === maxY) ? '#fff8' : 'transparent';
-    const extBorderW = v => hasExt && (v === minY || v === maxY) ? 1.5 : 0;
+    const _borderIdx = target => {
+      const last = s.values.length - 1;
+      let best = -1; let bestDist = Infinity;
+      for (let i = 0; i <= last; i++) {
+        if (s.values[i] !== target) continue;
+        const d = Math.min(i, last - i);
+        if (d < bestDist) { best = i; bestDist = d; }
+      }
+      return best;
+    };
+    const minIdx = hasExt ? _borderIdx(minY) : -1;
+    const maxIdx = hasExt ? _borderIdx(maxY) : -1;
+    const isExt = j => j === minIdx || j === maxIdx;
+    const extRadius = (v, j) => isExt(j) ? 5 : pr;
+    const extBorder = (v, j) => isExt(j) ? '#fff8' : 'transparent';
+    const extBorderW = (v, j) => isExt(j) ? 1.5 : 0;
 
     const hiddenFlag = _hiddenScalars.has(exp.name);
     if (sw > 0) {
       ds.push({
         label: '_raw_' + exp.name, data: raw, borderColor: withOpacity(col, rawOpacity), spanGaps: false,
-        pointRadius: s.values.map(v => extRadius(v)), pointBackgroundColor: col,
-        pointBorderColor: s.values.map(v => extBorder(v)), pointBorderWidth: s.values.map(v => extBorderW(v)),
+        pointRadius: s.values.map((v, j) => extRadius(v, j)), pointBackgroundColor: col,
+        pointBorderColor: s.values.map((v, j) => extBorder(v, j)), pointBorderWidth: s.values.map((v, j) => extBorderW(v, j)),
         borderWidth: 1, tension: 0, hidden: hiddenFlag
       });
       const sm = emaSmoothXY(xVals, s.values, sw);
@@ -163,8 +196,8 @@ function buildScalarDatasets(tag, sw) {
     } else {
       ds.push({
         label: exp.name, data: raw, borderColor: col, spanGaps: false,
-        pointRadius: s.values.map(v => extRadius(v)), pointBackgroundColor: col,
-        pointBorderColor: s.values.map(v => extBorder(v)), pointBorderWidth: s.values.map(v => extBorderW(v)),
+        pointRadius: s.values.map((v, j) => extRadius(v, j)), pointBackgroundColor: col,
+        pointBorderColor: s.values.map((v, j) => extBorder(v, j)), pointBorderWidth: s.values.map((v, j) => extBorderW(v, j)),
         backgroundColor: col, borderWidth: 2, tension: 0, hidden: hiddenFlag
       });
     }
@@ -173,19 +206,33 @@ function buildScalarDatasets(tag, sw) {
 }
 
 function buildSystemDatasets(tag, sw) {
+  const o = arguments[2] || {};
   const ds = [];
   const baseTime = _computeBaseTime(tag, DATA, (e, t) => (e.system_scalars || {})[t]);
   DATA.forEach(exp => {
     const s = (exp.system_scalars || {})[tag]; if (!s) return;
-    const col = expColors[exp.name];
-    const fillCol = col + '33';
+    const col = o.color || expColors[exp.name];
+    const fillCol = withOpacity(col, o.fillOpacity ?? 0.08);
     const xVals = _getXVals(s, baseTime);
-    const pr = xVals.length <= 3 ? 4 : 0;
+    const pr = o.pointRadius ?? (xVals.length <= 3 ? 3 : 0);
+    const labelBase = o.label || tag;
+    const label = DATA.length > 1 ? `${exp.name} · ${labelBase}` : labelBase;
+    const common = {
+      label,
+      borderColor: col,
+      spanGaps: false,
+      pointRadius: pr,
+      backgroundColor: fillCol,
+      borderWidth: o.borderWidth || 2,
+      tension: 0,
+      fill: o.fill ?? false,
+      borderDash: o.borderDash,
+    };
     if (sw > 0) {
       const sm = emaSmoothXY(xVals, s.values, sw);
-      ds.push({ label: exp.name, data: sm, borderColor: col, spanGaps: false, pointRadius: 0, backgroundColor: fillCol, borderWidth: 2, tension: 0, fill: true });
+      ds.push({ ...common, data: sm, pointRadius: 0 });
     } else {
-      ds.push({ label: exp.name, data: xVals.map((st, j) => ({ x: st, y: s.values[j] })), borderColor: col, spanGaps: false, pointRadius: pr, backgroundColor: fillCol, borderWidth: 2, tension: 0, fill: true });
+      ds.push({ ...common, data: xVals.map((st, j) => ({ x: st, y: s.values[j] })) });
     }
   });
   return ds;
@@ -263,9 +310,204 @@ function buildCharts() {
     });
     window._charts.push(makeLineChart(card.querySelector('canvas').getContext('2d'), buildScalarDatasets(tag, sw)));
   });
-  if (!allTags.length) c.innerHTML = '<div class="empty-msg">No scalars logged.</div>';
-  else if (tags.length) enableDragSort(c, 'scalars');
+  const hasPR = DATA.some(d => (d.pr_curve_tags || []).length > 0);
+  const hasFigures = DATA.some(d => (d.figure_tags || []).length > 0);
+  if (!allTags.length && !hasPR && !hasFigures) {
+    c.innerHTML = '<div class="empty-msg">No scalars logged.</div>';
+  } else if (tags.length) {
+    enableDragSort(c, 'scalars');
+  }
   buildHiddenChartsTray(hiddenTags);
+  // PR curves and matplotlib figures share the #charts grid with the line
+  // plots — they're all "scalars-tab content" conceptually.
+  buildPRCurves();
+  buildFigures();
+}
+
+// ── PR curves (rendered inside the Scalars tab) ──────────────
+function _makePRChart(ctx, datasets) {
+  const tc = themeColors();
+  return new Chart(ctx, {
+    type: 'line',
+    data: { datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'nearest', intersect: false },
+      scales: {
+        x: {
+          type: 'linear', min: 0, max: 1,
+          title: { display: true, text: 'recall', color: tc.muted },
+          ticks: { color: tc.muted, callback: v => Number(v).toFixed(2) },
+          grid: { color: tc.grid },
+        },
+        y: {
+          min: 0, max: 1,
+          title: { display: true, text: 'precision', color: tc.muted },
+          ticks: { color: tc.muted, callback: v => Number(v).toFixed(2) },
+          grid: { color: tc.grid },
+        },
+      },
+      plugins: {
+        legend: { labels: { color: tc.text, font: { size: 11 } } },
+        tooltip: {
+          mode: 'nearest', intersect: false,
+          callbacks: {
+            label: item => `${item.dataset.label}: P=${item.parsed.y.toFixed(3)} R=${item.parsed.x.toFixed(3)}`,
+          },
+        },
+      },
+    },
+  });
+}
+
+function _prCardForTag(tag) {
+  // Collect every (experiment, step) curve under this PR tag.
+  const series = [];
+  DATA.forEach(exp => {
+    ((exp.pr_curves || {})[tag] || []).forEach(item => {
+      const expName = exp.name;
+      series.push({ exp: expName, step: item.step, path: item.path });
+    });
+  });
+  if (!series.length) return null;
+  const card = document.createElement('div');
+  card.className = 'card pr-card';
+  card.dataset.dragId = 'pr:' + tag;
+  card.innerHTML = `<h2>${escapeHtml(tag)} <span class="pr-badge">PR</span></h2><canvas></canvas>`;
+  // Fetch artifact JSONs in parallel, then render once.
+  Promise.all(series.map(s => fetch(mediaUrl(s.path))
+    .then(r => r.ok ? r.json() : null)
+    .then(payload => ({ ...s, payload }))
+    .catch(() => ({ ...s, payload: null }))
+  )).then(rows => {
+    const datasets = rows
+      .filter(r => r.payload && Array.isArray(r.payload.points))
+      .map(r => {
+        const col = expColors[r.exp] || pickDistinctColor(Object.values(expColors));
+        // Sort by recall ascending so the line draws cleanly.
+        const pts = [...r.payload.points]
+          .map(p => ({ x: Number(p.recall), y: Number(p.precision) }))
+          .sort((a, b) => a.x - b.x);
+        return {
+          label: `${r.exp} · step ${r.step}`,
+          data: pts,
+          borderColor: col,
+          backgroundColor: withOpacity(col, 0.15),
+          tension: 0.1,
+          pointRadius: 2.5,
+          borderWidth: 2,
+          showLine: true,
+          fill: false,
+        };
+      });
+    if (!datasets.length) {
+      card.innerHTML += '<div class="empty-msg">PR data unavailable</div>';
+      return;
+    }
+    const ctx = card.querySelector('canvas').getContext('2d');
+    if (!window._prCharts) window._prCharts = [];
+    window._prCharts.push(_makePRChart(ctx, datasets));
+  });
+  return card;
+}
+
+function buildPRCurves() {
+  if (window._prCharts) { window._prCharts.forEach(x => x.destroy()); window._prCharts = []; }
+  const grid = document.getElementById('charts');
+  const tags = [...new Set(DATA.flatMap(d => d.pr_curve_tags || []))].sort();
+  tags.forEach(tag => {
+    const card = _prCardForTag(tag);
+    if (card) grid.appendChild(card);
+  });
+}
+
+// ── Figures (matplotlib charts rendered server-side; live on Scalars) ──
+function _figureCardForTag(tag) {
+  // One card per tag with a step slider when there's more than one entry.
+  // Figures from multiple experiments stack vertically inside the card.
+  const expEntries = [];
+  DATA.forEach(exp => {
+    const entries = (exp.figures || {})[tag] || [];
+    if (!entries.length) return;
+    expEntries.push({
+      exp: exp.name,
+      entries: [...entries].sort((a, b) => a.step - b.step),
+    });
+  });
+  if (!expEntries.length) return null;
+
+  const card = document.createElement('div');
+  card.className = 'card figure-card';
+  card.dataset.dragId = 'fig:' + tag;
+  const heading = document.createElement('h2');
+  heading.innerHTML = `${escapeHtml(tag)} <span class="pr-badge">fig</span>`;
+  card.appendChild(heading);
+
+  // Compute a shared step axis so the slider lines up across experiments.
+  const allSteps = [...new Set(expEntries.flatMap(g => g.entries.map(e => e.step)))]
+    .sort((a, b) => a - b);
+
+  const stack = document.createElement('div');
+  card.appendChild(stack);
+
+  function _imageFor(group, stepIdx) {
+    // Pick the entry at-or-before the requested step so missing steps fall
+    // back to the most recent figure for that experiment.
+    const targetStep = allSteps[stepIdx];
+    let chosen = group.entries[0];
+    for (const e of group.entries) {
+      if (e.step <= targetStep) chosen = e;
+    }
+    return chosen;
+  }
+
+  function render(stepIdx) {
+    stack.innerHTML = '';
+    expEntries.forEach(group => {
+      const e = _imageFor(group, stepIdx);
+      const wrap = document.createElement('div');
+      wrap.style.marginBottom = '8px';
+      const lbl = document.createElement('div');
+      lbl.className = 'figure-controls';
+      lbl.innerHTML = `<span style="color:${expColors[group.exp] || 'var(--muted)'}">${escapeHtml(group.exp)}</span>` +
+        `<span>step ${e.step}</span>` +
+        `<a href="${mediaUrl(e.path)}" download>PNG</a>`;
+      const img = document.createElement('img');
+      img.className = 'figure-img';
+      img.alt = `${tag} · ${group.exp} step ${e.step}`;
+      img.src = mediaUrl(e.path);
+      wrap.append(lbl, img);
+      stack.appendChild(wrap);
+    });
+  }
+
+  if (allSteps.length > 1) {
+    const ctrl = document.createElement('div'); ctrl.className = 'figure-controls';
+    const slider = document.createElement('input'); slider.type = 'range';
+    slider.min = 0; slider.max = allSteps.length - 1; slider.value = allSteps.length - 1;
+    const stepLbl = document.createElement('span');
+    stepLbl.textContent = `step ${allSteps[allSteps.length - 1]}`;
+    ctrl.append(slider, stepLbl);
+    card.appendChild(ctrl);
+    slider.addEventListener('input', () => {
+      const i = parseInt(slider.value, 10);
+      stepLbl.textContent = `step ${allSteps[i]}`;
+      render(i);
+    });
+    render(allSteps.length - 1);
+  } else {
+    render(0);
+  }
+  return card;
+}
+
+function buildFigures() {
+  const grid = document.getElementById('charts');
+  const tags = [...new Set(DATA.flatMap(d => d.figure_tags || []))].sort();
+  tags.forEach(tag => {
+    const card = _figureCardForTag(tag);
+    if (card) grid.appendChild(card);
+  });
 }
 
 // ── Histograms ───────────────────────────────────────────────
@@ -301,6 +543,7 @@ function lastVal(tag) {
 
 function buildSystem() {
   const c = document.getElementById('system-charts'); c.innerHTML = '';
+  c.classList.add('system-grid');
   if (window._sc) window._sc.forEach(x => x.destroy()); window._sc = [];
 
   const hasSys = DATA.some(d => (d.system_tags || []).length > 0);
@@ -312,20 +555,49 @@ function buildSystem() {
       e.value.split('\n').forEach(line => {
         if (!line.trim()) return;
         const d = document.createElement('div');
-        d.style.cssText = 'background:#3d1114;border:1px solid #f85149;border-radius:8px;padding:10px 16px;margin-bottom:8px;color:#ff7b72;font-weight:600;';
+        d.className = 'system-alert';
         d.textContent = line; c.appendChild(d);
       });
     });
   });
 
-  const grid = document.createElement('div'); grid.className = 'grid'; c.appendChild(grid);
+  function pctColor(pct, warn, danger, calm) {
+    if (pct > danger) return '#f85149';
+    if (pct > warn) return '#e3b341';
+    return calm || '#3fb950';
+  }
 
-  function maybeChart(card, ...tags) {
-    const datasets = tags.flatMap(tag => buildSystemDatasets(tag, 0));
+  function clampPct(v) {
+    if (!Number.isFinite(v)) return 0;
+    return Math.max(0, Math.min(100, v));
+  }
+
+  function metricRow(label, value, pct, color) {
+    const safePct = clampPct(pct);
+    return `
+      <div class="system-metric" style="--meter-color:${color};--meter-value:${safePct}%;">
+        <div class="system-metric-head">
+          <span>${label}</span>
+          <strong>${value}</strong>
+        </div>
+        <div class="system-meter"><span></span></div>
+      </div>`;
+  }
+
+  function maybeChart(card, specs, opts) {
+    const chartSpecs = Array.isArray(specs) ? specs : [specs];
+    const datasets = chartSpecs.flatMap(spec => buildSystemDatasets(spec.tag, 0, spec));
     if (!datasets.some(d => d.data.length > 1)) return;
-    const wrap = document.createElement('div'); wrap.style.cssText = 'height:120px;margin-top:12px;';
+    const wrap = document.createElement('div'); wrap.className = 'system-chart-wrap';
     const cv = document.createElement('canvas'); wrap.appendChild(cv); card.appendChild(wrap);
-    window._sc.push(makeLineChart(cv.getContext('2d'), datasets));
+    window._sc.push(makeLineChart(cv.getContext('2d'), datasets, {
+      compact: true,
+      legend: false,
+      xTicks: 4,
+      yTicks: 4,
+      yMin: opts?.percent ? 0 : undefined,
+      yMax: opts?.percent ? 100 : undefined,
+    }));
   }
 
   // CPU
@@ -335,14 +607,20 @@ function buildSystem() {
   const load5 = lastVal('system/cpu_load_5m');
   const load15 = lastVal('system/cpu_load_15m');
   if (cpuPct !== null || load1 !== null) {
-    const card = document.createElement('div'); card.className = 'card';
-    let html = '<h2>CPU</h2>';
-    if (cpuCount) html += `<div style="font-size:1.6em;font-weight:700;margin:8px 0;">${cpuCount} cores</div>`;
-    if (cpuPct !== null) html += `<div style="color:var(--muted);font-size:0.9em;">Usage: ${cpuPct.toFixed(0)}%</div>`;
-    if (load1 !== null) html += `<div style="color:var(--muted);font-size:0.9em;">Load: ${load1.toFixed(2)} ${(load5||0).toFixed(2)} ${(load15||0).toFixed(2)} (1m 5m 15m)</div>`;
-    card.innerHTML = html;
-    maybeChart(card, 'system/cpu_percent');
-    grid.appendChild(card);
+    const usageColor = pctColor(cpuPct || 0, 70, 90);
+    const card = document.createElement('div'); card.className = 'card system-card';
+    card.innerHTML = `
+      <div class="system-card-head">
+        <h2>CPU</h2>
+        ${cpuCount ? `<span class="system-chip">${cpuCount} cores</span>` : ''}
+      </div>
+      <div class="system-metrics">
+        ${cpuPct !== null ? metricRow('Usage', `${cpuPct.toFixed(0)}%`, cpuPct, usageColor) : ''}
+        ${load1 !== null ? `<div class="system-kv"><span>Load</span><strong>${load1.toFixed(2)} ${(load5 || 0).toFixed(2)} ${(load15 || 0).toFixed(2)}</strong></div>` : ''}
+      </div>`;
+    if (cpuPct !== null) maybeChart(card, [{ tag: 'system/cpu_percent', label: 'CPU', color: usageColor, pointRadius: 0 }], { percent: true });
+    else maybeChart(card, [{ tag: 'system/cpu_load_normalized', label: 'load/core', color: '#58a6ff', pointRadius: 0 }]);
+    c.appendChild(card);
   }
 
   // Memory
@@ -351,14 +629,18 @@ function buildSystem() {
   const memPct = lastVal('system/memory_used_percent');
   const memUsed = lastVal('system/memory_used_gb');
   if (memTotal) {
-    const barColor = memPct > 90 ? '#f85149' : memPct > 70 ? '#e3b341' : '#3fb950';
-    const card = document.createElement('div'); card.className = 'card';
-    card.innerHTML = `<h2>Memory</h2>
-      <div style="font-size:1.6em;font-weight:700;margin:8px 0;">${memAvail.toFixed(1)}G free <span style="color:var(--muted);font-size:0.5em;">/ ${memTotal.toFixed(1)}G</span></div>
-      <div style="background:var(--border);border-radius:4px;height:8px;margin:8px 0;"><div style="background:${barColor};height:100%;border-radius:4px;width:${memPct.toFixed(0)}%;"></div></div>
-      <div style="color:var(--muted);font-size:0.85em;">${memPct.toFixed(0)}% used (${memUsed.toFixed(1)}G)</div>`;
-    maybeChart(card, 'system/memory_used_percent');
-    grid.appendChild(card);
+    const barColor = pctColor(memPct, 70, 90);
+    const card = document.createElement('div'); card.className = 'card system-card';
+    card.innerHTML = `
+      <div class="system-card-head">
+        <h2>Memory</h2>
+        <span class="system-chip">${memAvail.toFixed(1)}G free</span>
+      </div>
+      <div class="system-metrics">
+        ${metricRow('Used', `${memPct.toFixed(0)}% (${memUsed.toFixed(1)}G / ${memTotal.toFixed(1)}G)`, memPct, barColor)}
+      </div>`;
+    maybeChart(card, [{ tag: 'system/memory_used_percent', label: 'Memory', color: barColor, pointRadius: 0 }], { percent: true });
+    c.appendChild(card);
   }
 
   // Disk
@@ -367,14 +649,18 @@ function buildSystem() {
   const diskPct = lastVal('system/disk_used_percent');
   const diskUsed = lastVal('system/disk_used_gb');
   if (diskTotal) {
-    const barColor = diskPct > 95 ? '#f85149' : diskPct > 85 ? '#e3b341' : '#3fb950';
-    const card = document.createElement('div'); card.className = 'card';
-    card.innerHTML = `<h2>Disk</h2>
-      <div style="font-size:1.6em;font-weight:700;margin:8px 0;">${diskFree.toFixed(1)}G free <span style="color:var(--muted);font-size:0.5em;">/ ${diskTotal.toFixed(0)}G</span></div>
-      <div style="background:var(--border);border-radius:4px;height:8px;margin:8px 0;"><div style="background:${barColor};height:100%;border-radius:4px;width:${diskPct.toFixed(0)}%;"></div></div>
-      <div style="color:var(--muted);font-size:0.85em;">${diskPct.toFixed(0)}% used (${diskUsed.toFixed(1)}G)</div>`;
-    maybeChart(card, 'system/disk_used_percent');
-    grid.appendChild(card);
+    const barColor = pctColor(diskPct, 85, 95);
+    const card = document.createElement('div'); card.className = 'card system-card';
+    card.innerHTML = `
+      <div class="system-card-head">
+        <h2>Disk</h2>
+        <span class="system-chip">${diskFree.toFixed(1)}G free</span>
+      </div>
+      <div class="system-metrics">
+        ${metricRow('Used', `${diskPct.toFixed(0)}% (${diskUsed.toFixed(1)}G / ${diskTotal.toFixed(0)}G)`, diskPct, barColor)}
+      </div>`;
+    maybeChart(card, [{ tag: 'system/disk_used_percent', label: 'Disk', color: barColor, pointRadius: 0 }], { percent: true });
+    c.appendChild(card);
   }
 
   // GPUs
@@ -384,43 +670,24 @@ function buildSystem() {
     const memUsedGpu = lastVal(`gpu/${gi}/memory_used_gb`) || 0;
     const memTotalGpu = lastVal(`gpu/${gi}/memory_total_gb`) || 1;
     const temp = lastVal(`gpu/${gi}/temperature_c`) || 0;
-    const barColor = util > 90 ? '#f85149' : util > 70 ? '#e3b341' : '#3fb950';
-    const gMemPct = (memUsedGpu / memTotalGpu * 100).toFixed(0);
-    const memColor = gMemPct > 90 ? '#f85149' : gMemPct > 70 ? '#e3b341' : '#58a6ff';
-    const card = document.createElement('div'); card.className = 'card';
+    const barColor = pctColor(util, 70, 90);
+    const gMemPct = lastVal(`gpu/${gi}/memory_used_percent`) ?? (memUsedGpu / memTotalGpu * 100);
+    const memColor = pctColor(gMemPct, 70, 90, '#58a6ff');
+    const card = document.createElement('div'); card.className = 'card system-card';
     card.innerHTML = `
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h2 style="margin:0; font-size:1.15em; display:flex; align-items:center; gap:8px; color:var(--text); letter-spacing:-0.2px;">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.8"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>
-          GPU ${gi}
-        </h2>
-        <div style="background:var(--border); padding:4px 10px; border-radius:16px; font-size:0.75em; font-weight:700; color:var(--text); display:flex; align-items:center; gap:4px; box-shadow:inset 0 1px 2px rgba(0,0,0,0.1);">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"></path></svg>
-          ${temp.toFixed(0)}°C
-        </div>
+      <div class="system-card-head">
+        <h2>GPU ${gi}</h2>
+        <span class="system-chip">${temp.toFixed(0)}°C</span>
       </div>
-      <div style="margin-top:20px; display:flex; flex-direction:column; gap:16px;">
-        <div>
-          <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
-            <span style="color:var(--muted); font-size:0.75em; text-transform:uppercase; letter-spacing:0.8px; font-weight:600;">Core Utilization</span>
-            <span style="font-size:1.4em; font-weight:800; line-height:1; letter-spacing:-0.5px;">${util.toFixed(0)}<span style="font-size:0.6em; color:var(--muted); margin-left:2px;">%</span></span>
-          </div>
-          <div style="background:var(--border); border-radius:8px; height:8px; overflow:hidden; box-shadow:inset 0 1px 3px rgba(0,0,0,0.05);">
-            <div style="background:${barColor}; height:100%; width:${util}%; border-radius:8px; box-shadow:0 0 10px ${barColor}80; transition:width 0.4s ease-out;"></div>
-          </div>
-        </div>
-        <div>
-          <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px;">
-            <span style="color:var(--muted); font-size:0.75em; text-transform:uppercase; letter-spacing:0.8px; font-weight:600;">Memory Usage</span>
-            <span style="font-size:1.1em; font-weight:700; line-height:1; letter-spacing:-0.2px;">${(memUsedGpu*1024).toFixed(0)} <span style="font-size:0.8em; color:var(--muted); font-weight:500;">/ ${(memTotalGpu*1024).toFixed(0)} MiB</span></span>
-          </div>
-          <div style="background:var(--border); border-radius:8px; height:8px; overflow:hidden; box-shadow:inset 0 1px 3px rgba(0,0,0,0.05);">
-            <div style="background:${memColor}; height:100%; width:${gMemPct}%; border-radius:8px; box-shadow:0 0 10px ${memColor}80; transition:width 0.4s ease-out;"></div>
-          </div>
-        </div>
+      <div class="system-metrics">
+        ${metricRow('Core', `${util.toFixed(0)}%`, util, barColor)}
+        ${metricRow('VRAM', `${gMemPct.toFixed(0)}% (${(memUsedGpu * 1024).toFixed(0)} / ${(memTotalGpu * 1024).toFixed(0)} MiB)`, gMemPct, memColor)}
       </div>`;
-    maybeChart(card, `gpu/${gi}/utilization_percent`, `gpu/${gi}/memory_used_gb`);
-    grid.appendChild(card);
+    maybeChart(card, [
+      { tag: `gpu/${gi}/utilization_percent`, label: 'Core', color: barColor, pointRadius: 0 },
+      { tag: `gpu/${gi}/memory_used_percent`, label: 'VRAM', color: memColor, pointRadius: 0 },
+    ], { percent: true });
+    c.appendChild(card);
     gi++;
   }
 }

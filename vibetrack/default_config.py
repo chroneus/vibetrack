@@ -34,7 +34,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "x_axis_mode": "step",
     },
     "gradio": {
-        "share": False,
+        "share": True,
+        "refresh_interval": 2,
+        "image_max_px": 1024,
     },
     "console": {},
     "telegram": {},

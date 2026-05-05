@@ -135,6 +135,41 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
                 writer.add_scalar(tag, value, step)
             for tag, value in data.get("texts", {}).items():
                 writer.add_text(tag, value, step)
+            for tag, hist in data.get("histograms", {}).items():
+                if not isinstance(hist, dict):
+                    continue
+                bin_edges = hist.get("bin_edges")
+                counts = hist.get("counts")
+                if not bin_edges or not counts:
+                    continue
+                writer.add_histogram_raw(
+                    tag,
+                    min=float(bin_edges[0]),
+                    max=float(bin_edges[-1]),
+                    num=float(sum(counts)),
+                    sum=0.0,
+                    sum_squares=0.0,
+                    bucket_limits=bin_edges,
+                    bucket_counts=counts,
+                    global_step=step,
+                )
+        finally:
+            writer.close()
+        return {"status": "ok"}
+
+    @app.post("/hparams")
+    async def log_hparams(request: Request, _=Depends(check_auth)) -> dict:
+        data = await request.json()
+        experiment = data.get("experiment", "default")
+        if "/" in experiment or "\\" in experiment or ".." in experiment:
+            raise HTTPException(status_code=400, detail="Invalid experiment name")
+        hparams = data.get("hparams") or {}
+        metrics = data.get("metrics") or {}
+        if not isinstance(hparams, dict) or not isinstance(metrics, dict):
+            raise HTTPException(status_code=400, detail="hparams/metrics must be objects")
+        writer = _new_writer(experiment)
+        try:
+            writer.add_hparams(hparams, metrics)
         finally:
             writer.close()
         return {"status": "ok"}

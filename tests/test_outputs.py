@@ -4,6 +4,7 @@ import asyncio
 import io
 import inspect
 import importlib.util
+import json
 import logging
 from pathlib import Path
 from unittest import mock
@@ -379,6 +380,181 @@ class TestListenServer:
             },
         )
         assert resp.status_code == 200
+
+    def test_log_histogram(self, listen_app):
+        client, project_folder = listen_app
+        resp = client.post(
+            "/log",
+            json={
+                "experiment": "hist_run",
+                "step": 0,
+                "histograms": {
+                    "weights": {
+                        "bin_edges": [-1.0, 0.0, 1.0],
+                        "counts": [3.0, 7.0],
+                    }
+                },
+            },
+        )
+        assert resp.status_code == 200
+
+        reader = RunReader(str(project_folder))
+        exp = next(e for e in reader.experiments() if e.name == "hist_run")
+        assert "weights" in exp.histogram_tags()
+        rows = exp.histograms("weights")
+        assert rows and rows[0]["counts"] == [3.0, 7.0]
+        reader.close()
+
+    def test_hparams_endpoint(self, listen_app):
+        client, project_folder = listen_app
+        resp = client.post(
+            "/hparams",
+            json={
+                "experiment": "hp_run",
+                "hparams": {"lr": 1e-3, "batch_size": 32},
+                "metrics": {"final_acc": 0.92},
+            },
+        )
+        assert resp.status_code == 200
+
+        reader = RunReader(str(project_folder))
+        exp = next(e for e in reader.experiments() if e.name == "hp_run")
+        assert exp.hparams() == {"lr": 1e-3, "batch_size": 32}
+        assert "final_acc" in exp.scalar_tags()
+        reader.close()
+
+    def test_hparams_rejects_non_object(self, listen_app):
+        client, _ = listen_app
+        resp = client.post(
+            "/hparams",
+            json={"experiment": "bad", "hparams": "not-a-dict", "metrics": {}},
+        )
+        assert resp.status_code == 400
+
+
+class TestRemoteOutput:
+    """RemoteOutput adapter sends events to a stub server via .to('remote', ...)."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_central_db(self, tmp_path, monkeypatch):
+        central_db = tmp_path / "_central" / "vibetrack.db"
+        central_db.parent.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr("vibetrack.writer.central_db_path", lambda: central_db)
+        monkeypatch.setattr("vibetrack.reader.central_db_path", lambda: central_db)
+
+    @pytest.fixture
+    def stub_server(self):
+        """A minimal threaded HTTPServer that records every request."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        recorded: list = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802 - http.server API
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                recorded.append(
+                    {
+                        "path": self.path,
+                        "headers": dict(self.headers),
+                        "body": body,
+                    }
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"ok"}')
+
+            def log_message(self, *_a, **_kw):  # silence stderr noise
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address
+        try:
+            yield f"http://{host}:{port}", recorded
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_to_remote_dispatches_scalar(self, stub_server, tmp_path):
+        url, recorded = stub_server
+        with SummaryWriter(str(tmp_path / "run"), name="run") as w:
+            w.to("remote", url=url, token="t1")
+            w.add_scalar("loss", 0.25, 0)
+        # Drain dispatch executor — close() already does this, just assert.
+        log_posts = [r for r in recorded if r["path"] == "/log"]
+        assert log_posts, f"expected at least one /log POST, got {recorded}"
+        body = json.loads(log_posts[0]["body"])
+        assert body["experiment"] == "run"
+        assert body["scalars"] == {"loss": 0.25}
+        assert log_posts[0]["headers"].get("Authorization") == "Bearer t1"
+
+    def test_to_remote_dispatches_text_and_histogram(self, stub_server, tmp_path):
+        import numpy as np
+
+        url, recorded = stub_server
+        with SummaryWriter(str(tmp_path / "r"), name="r") as w:
+            w.to("remote", url=url)
+            w.add_text("note", "hello", 0)
+            w.add_histogram("weights", np.array([0.0, 0.5, 1.0, 1.0]), 0)
+
+        log_posts = [r for r in recorded if r["path"] == "/log"]
+        bodies = [json.loads(p["body"]) for p in log_posts]
+        # Find one body that carries the text and one that carries the histogram.
+        assert any(b.get("texts") == {"note": "hello"} for b in bodies)
+        hist_body = next(b for b in bodies if b.get("histograms"))
+        hist = hist_body["histograms"]["weights"]
+        assert "bin_edges" in hist and "counts" in hist
+        assert sum(hist["counts"]) == 4.0
+
+    def test_to_remote_dispatches_media(self, stub_server, tmp_path):
+        url, recorded = stub_server
+        img = tmp_path / "frame.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+        with SummaryWriter(str(tmp_path / "r2"), name="r2") as w:
+            w.to("remote", url=url)
+            w.add_image("samples", str(img), 0)
+
+        media_posts = [r for r in recorded if r["path"] == "/media"]
+        assert media_posts, f"expected /media POST, got paths={[r['path'] for r in recorded]}"
+        assert media_posts[0]["headers"].get("Content-Type", "").startswith(
+            "multipart/form-data"
+        )
+        assert b'name="experiment"' in media_posts[0]["body"]
+        assert b"r2" in media_posts[0]["body"]
+        assert b'name="type"' in media_posts[0]["body"]
+        assert b"image" in media_posts[0]["body"]
+
+    def test_to_remote_dispatches_hparams(self, stub_server, tmp_path):
+        url, recorded = stub_server
+        with SummaryWriter(str(tmp_path / "r3"), name="r3") as w:
+            w.to("remote", url=url)
+            w.add_hparams({"lr": 0.01}, {"final_loss": 0.1})
+
+        hp_posts = [r for r in recorded if r["path"] == "/hparams"]
+        assert hp_posts, f"expected /hparams POST, got paths={[r['path'] for r in recorded]}"
+        body = json.loads(hp_posts[0]["body"])
+        assert body["experiment"] == "r3"
+        assert body["hparams"] == {"lr": 0.01}
+        assert body["metrics"] == {"final_loss": 0.1}
+
+    def test_to_remote_failure_does_not_raise(self, tmp_path):
+        # Point at an unreachable port; .add_scalar must not raise.
+        with SummaryWriter(str(tmp_path / "rf"), name="rf") as w:
+            w.to("remote", url="http://127.0.0.1:1", timeout=0.5)
+            w.add_scalar("loss", 0.5, 0)
+        # No assertion on logs — just that the run finished cleanly.
+
+    def test_remote_in_discovered_viewers(self):
+        from vibetrack.viewers import discover_viewers, load_viewer
+        from vibetrack.viewers.remote import RemoteOutput
+
+        assert "remote" in discover_viewers()
+        assert load_viewer("remote") is RemoteOutput
 
 
 class TestUploadSecurity:

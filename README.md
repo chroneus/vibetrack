@@ -82,9 +82,47 @@ string (`"5s"`, `"15m"`, `"1h"`, `"2d"`).
 - `"slack"` — needs `SLACK_WEBHOOK_URL` (or `webhook=`)
 - `"console"` — prints one line per event to stdout
 - `"gradio"` — buffers events for a running Gradio dashboard
+- `"remote"` — forwards events to another vibetrack server (see *Track to a remote server* below)
 - The built-in web dashboard / SQLite store is always active; `.to(...)` adds *additional* destinations.
 
 W&B-style equivalent: `vibetrack.init(..., to=["console", "telegram"])`.
+
+### Track to a remote server
+
+Run `vibetrack --listen HOST:PORT` on a peer machine to expose `/log`, `/media`,
+and `/hparams` ingest endpoints. Then point any training run at it with
+`writer.to("remote", url=..., token=...)`:
+
+```bash
+# Server side
+vibetrack --listen 0.0.0.0:8080 --token devtoken --project-folder /srv/runs
+```
+
+```python
+# Client side
+import vibetrack
+
+writer = vibetrack.init(project="cifar10", name="resnet18")
+writer.to("remote",
+          url="http://server:8080",
+          token="devtoken",
+          every="10m")          # batch dispatches every 10 minutes
+
+vibetrack.log({"loss": 0.5})
+```
+
+W&B-style at init time:
+
+```python
+vibetrack.init(
+    project="cifar10", name="resnet18",
+    to=[{"name": "remote", "url": "http://server:8080", "token": "devtoken", "every": "10m"}],
+)
+```
+
+All event kinds round-trip — scalars, texts, histograms, images, audio, video,
+artifacts, and hparams. Local SQLite stays the source of truth; if the remote
+server is unreachable the adapter logs one warning and keeps training going.
 
 ### Launch the dashboard
 

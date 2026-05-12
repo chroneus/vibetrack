@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Minimal real YOLO training with vibetrack logging (TensorBoard-style API).
+"""Minimal real YOLO training with TensorBoard logging.
 
-Trains YOLOv8n on COCO8 (tiny 8-image dataset bundled with ultralytics).
-Hooks into ultralytics callbacks to log per-epoch losses, val metrics,
-learning rates, and prediction images with bounding boxes.
+Same training as train_yolo.py but logs to TensorBoard instead of vibetrack.
+Useful for side-by-side comparison of the two dashboards.
 
-Install:  pip install ultralytics
-Run:      python examples/train_yolo.py
-View:     vibetrack
+Install:  pip install ultralytics torch tensorboard
+Run:      python examples/train_yolo_tb.py
+View:     tensorboard --logdir runs/yolo_tb
 """
 
 import os
@@ -16,9 +15,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from ultralytics import YOLO
-
-from vibetrack import SummaryWriter
 
 # ── Config ───────────────────────────────────────────────────────
 SEED = 42
@@ -32,7 +30,7 @@ torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-writer = SummaryWriter("runs/yolo")
+writer = SummaryWriter("runs/yolo_tb")
 
 # ── Callbacks ────────────────────────────────────────────────────
 
@@ -89,7 +87,17 @@ def on_train_end(trainer):
         for i, fname in enumerate(sorted(os.listdir(save_dir))):
             fpath = os.path.join(save_dir, fname)
             if fname.lower().endswith((".jpg", ".jpeg", ".png")):
-                writer.add_image(f"predictions/{fname}", fpath, global_step=0)
+                from PIL import Image
+
+                img = Image.open(fpath)
+                img_array = np.array(img)
+                # TensorBoard expects (C, H, W) for add_image
+                writer.add_image(
+                    f"predictions/{fname}",
+                    img_array,
+                    global_step=0,
+                    dataformats="HWC",
+                )
 
 
 # ── Train ────────────────────────────────────────────────────────
@@ -102,5 +110,4 @@ model.train(data=DATA, epochs=EPOCHS, imgsz=640, batch=16, seed=SEED, verbose=Fa
 writer.close()
 
 print("\nDone! View results:")
-print("  vibetrack")
-print("  vibetrack --viewer=console")
+print("  tensorboard --logdir runs/yolo_tb")

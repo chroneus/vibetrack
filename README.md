@@ -3,12 +3,12 @@
 Lightweight experiment tracking.
 
 Key features:
+    Send experiment results to elsewhere: Telegram/Slack/Jupyter/Gradio/MCP
     Run locally but could receive experiment data over network via REST API. 
     Open formats: store experiment data in sqlite and local files. 
     Image2image comparison. 
     Rich UI.
-    Send experiment results to Gradio/Telegram/Slack
-    TensorBoard or W&B drop-in API replacement 
+    TensorBoard-compatible logging APIs
     MCP server with results
 
 
@@ -34,7 +34,7 @@ for step in range(100):
 writer.close()
 ```
 
-### W&B-style API
+### Module-level API
 
 ```python
 import vibetrack
@@ -45,92 +45,98 @@ for step in range(100):
 vibetrack.finish()
 ```
 
-### Send events to Telegram, Slack, console, gradio
+### Launch the dashboard
 
-Every `add_*` and `log()` call returns a handle with `.to(name, **creds)` for
-ad-hoc dispatch, and `writer.to(name, every=...)` registers a persistent
-destination. Fire-and-forget: adapter exceptions never bubble up to the
-training loop.
+```bash
+vibetrack
+# -> Web UI on http://0.0.0.0:6116
+# -> MCP is also mounted when installed with vibetrack[all] on Python 3.10+
+```
+
+### Viewers and destinations
 
 ```python
 from vibetrack import SummaryWriter
 
 writer = SummaryWriter("runs/exp1", project_folder="my_project")
-
-# Register destinations; chainable, one per call.
-writer = (
-    writer
-    .to("console")                          # every event -> stdout
-    .to("telegram", every=100)              # every 100 events
-    .to("slack", every="15m")               # time-based digest
-)
-
-for step in range(1000):
-    writer.add_scalar("loss", 1.0 / (step + 1), step)
-
-# Per-event one-shot: send just this event, independent of registration.
-writer.add_image("samples", "out.png", step=999).to("telegram")
-
-writer.close()
+writer.to("console").to("slack", every="15m")
+writer.add_scalar("loss", 0.5, step=0).to("telegram")
 ```
 
-`every=` accepts `None` (every event), an `int` (N events), or a duration
-string (`"5s"`, `"15m"`, `"1h"`, `"2d"`).
+See [VIEWERS.md](VIEWERS.md) for web, console, Slack, Telegram, Gradio,
+Jupyter, custom viewers, remote forwarding, credentials, and HTTP ingest.
 
-**Adapters** (under `vibetrack/viewers/`):
-- `"telegram"` — needs `VIBETRACK_TELEGRAM_TOKEN` + `VIBETRACK_TELEGRAM_CHAT_ID` (or `token=` / `chat_id=`)
-- `"slack"` — needs `SLACK_WEBHOOK_URL` (or `webhook=`)
-- `"console"` — prints one line per event to stdout
-- `"gradio"` — buffers events for a running Gradio dashboard
-- `"remote"` — forwards events to another vibetrack server (see *Track to a remote server* below)
-- The built-in web dashboard / SQLite store is always active; `.to(...)` adds *additional* destinations.
+# vibetrack Architecture
 
-W&B-style equivalent: `vibetrack.init(..., to=["console", "telegram"])`.
+```mermaid
+flowchart TB
+  subgraph LOGGING["Experiment logging"]
+    direction TB
+    SW["SummaryWriter"]
+    ADD["add_(scalar|image|*)"]
+    SW --> ADD
+  end
+  subgraph REMOTE["remote HTTP logging"]
+    direction TB
+    TO_REMOTE[".to(#quot;remote#quot;)"]
+  end
+  VIBETRACK["vibetrack<br/>scalars • media • text"]
+  subgraph PERSIST["Persist"]
+    direction TB
+    DB_ROWS["scalars + text + metadata"]
+    DEFAULT_DB[("default DB<br/>~/.vibetrack/vibetrack.db")]
+    PROJECT_DB[("per project DB<br/>project_log_dir/vibetrack.db")]
+    MEDIA["media files<br/>project_log_dir/media"]
+    DB_ROWS --> DEFAULT_DB
+    DB_ROWS -.-> PROJECT_DB
+  end
+  DISPATCH[".to(viewer)"]
+  FANOUT["best-effort fanout"]
+  subgraph VIEWERS["live / summary viewers"]
+    direction TB
+    WEB["web<br/>(default)"]
+    CONSOLE["console"]
+    SLACK["slack"]
+    GRADIO["gradio"]
+    TELEGRAM["telegram"]
+    JUPYTER["jupyter"]
+    MCP["MCP"]
+    CUSTOM[".to(#quot;custom#quot;)"]
+  end
 
-### Track to a remote server
+  ADD --> VIBETRACK
+  TO_REMOTE -.-> VIBETRACK
+  VIBETRACK --> DB_ROWS
+  VIBETRACK --> MEDIA
+  ADD --> DISPATCH
+  DISPATCH --> FANOUT
+  FANOUT --> VIEWERS
+  DEFAULT_DB --> VIEWERS
+  PROJECT_DB -.-> VIEWERS
+  MEDIA --> VIEWERS
 
-Run `vibetrack --listen HOST:PORT` on a peer machine to expose `/log`, `/media`,
-and `/hparams` ingest endpoints. Then point any training run at it with
-`writer.to("remote", url=..., token=...)`:
+  classDef logging fill:#fff4e6,stroke:#f59e0b,stroke-width:2px,color:#172033;
+  classDef code fill:#fff7ed,stroke:#f59e0b,stroke-width:1.5px,color:#172033,font-family:monospace;
+  classDef liveCode fill:#eef2ff,stroke:#6366f1,stroke-width:1.5px,color:#172033,font-family:monospace;
+  classDef event fill:#ffe4ec,stroke:#e11d48,stroke-width:2px,color:#172033;
+  classDef live fill:#eef2ff,stroke:#6366f1,stroke-width:2px,color:#172033;
+  classDef storage fill:#e7f8ef,stroke:#10b981,stroke-width:2px,color:#172033;
+  classDef optional fill:#f8fafc,stroke:#94a3b8,stroke-width:1.5px,stroke-dasharray:5 5,color:#64748b;
+  classDef optionalCode fill:#f8fafc,stroke:#94a3b8,stroke-width:1.5px,stroke-dasharray:5 5,color:#64748b,font-family:monospace;
+  classDef viewer fill:#f5e8ff,stroke:#a855f7,stroke-width:2px,color:#172033;
 
-```bash
-# Server side
-vibetrack --listen 0.0.0.0:8080 --token devtoken --project-folder /srv/runs
+  class SW,ADD code;
+  class TO_REMOTE optionalCode;
+  class VIBETRACK event;
+  class DISPATCH liveCode;
+  class FANOUT live;
+  class DB_ROWS,DEFAULT_DB,MEDIA storage;
+  class PROJECT_DB optional;
+  class WEB,CONSOLE viewer;
+  class SLACK,GRADIO,TELEGRAM,JUPYTER,MCP optional;
+  class CUSTOM optionalCode;
 ```
 
-```python
-# Client side
-import vibetrack
-
-writer = vibetrack.init(project="cifar10", name="resnet18")
-writer.to("remote",
-          url="http://server:8080",
-          token="devtoken",
-          every="10m")          # batch dispatches every 10 minutes
-
-vibetrack.log({"loss": 0.5})
-```
-
-W&B-style at init time:
-
-```python
-vibetrack.init(
-    project="cifar10", name="resnet18",
-    to=[{"name": "remote", "url": "http://server:8080", "token": "devtoken", "every": "10m"}],
-)
-```
-
-All event kinds round-trip — scalars, texts, histograms, images, audio, video,
-artifacts, and hparams. Local SQLite stays the source of truth; if the remote
-server is unreachable the adapter logs one warning and keeps training going.
-
-### Launch the dashboard
-
-```bash
-vibetrack 
-# -> Web UI + ingest endpoint on http://0.0.0.0:6006
-# -> MCP is also mounted when installed with vibetrack[all] on Python 3.10+
-```
 
 ## API reference
 
@@ -169,7 +175,7 @@ writer.add_hparams({"lr": 0.01, "batch_size": 32}, {"best_acc": 0.95})
 writer.close()
 ```
 
-### W&B-compatible module API
+### Module-level logging API
 
 ```python
 import vibetrack
@@ -190,25 +196,6 @@ vibetrack.log({"model": Artifact("best_model.pt", metadata={"epoch": 10})})
 vibetrack.config["lr"]  # 3e-5
 
 vibetrack.finish()
-```
-
-### Comparison and analysis
-
-```python
-from vibetrack import RunReader
-from vibetrack.compare import compare_scalars, compare_hparams, summary_table
-
-reader = RunReader("my_project/")
-experiments = reader.experiments()
-
-# Summary table — last value of each tag per experiment
-summary_table(experiments, tags=["loss", "acc"])
-
-# Compare scalars with smoothing
-compare_scalars(experiments, "loss", smoothing="ema", weight=0.6)
-
-# Side-by-side hyperparameter comparison
-compare_hparams(experiments)
 ```
 
 ## Distributed training (torchrun)
@@ -235,38 +222,6 @@ Force all ranks to log:
 writer = SummaryWriter("runs/distributed", rank="all")
 ```
 
-## Remote logging over HTTP
-
-vibetrack's built-in ingest endpoints accept metrics from remote machines:
-
-```bash
-# Server (included in default web server)
-vibetrack my_project/ --token mysecret
-# -> Ingest at http://host:6006/{project}/listen/log
-```
-
-```python
-# Remote client
-import requests
-
-requests.post("http://server:6006/my_project/listen/log", json={
-    "experiment": "remote_run",
-    "step": 42,
-    "scalars": {"loss": 0.3, "acc": 0.91},
-    "texts": {"note": "checkpoint saved"},
-}, headers={"Authorization": "Bearer mysecret"})
-```
-
-Upload media:
-
-```python
-requests.post("http://server:6006/my_project/listen/media",
-    data={"experiment": "remote_run", "tag": "sample", "step": "0", "type": "image"},
-    files={"file": open("output.png", "rb")},
-    headers={"Authorization": "Bearer mysecret"},
-)
-```
-
 ## System metrics
 
 Built-in collection of CPU, GPU, memory, and disk metrics. Runs in a background thread.
@@ -277,22 +232,11 @@ writer = SummaryWriter("runs/exp1", system_metrics_interval=3600)  # every hour 
 
 Collected metrics: `system/cpu_percent`, `system/mem_used_gb`, `system/disk_free_gb`, `gpu/utilization`, `gpu/memory_used_gb`, `gpu/temperature`, and automatic alerts when resources are critically low.
 
-## MCP server (AI agent integration)
+## MCP server
 
-When installed with `vibetrack[all]` on Python 3.10+, the web dashboard includes an MCP (Model Context Protocol) server at `/vibetrack_mcp`, enabling AI agents like Claude to query your experiment data directly.
-
-**Available MCP tools:** `list_experiments`, `get_experiment_tags`, `get_scalars`, `get_texts`, `get_images`, `get_audio`, `get_hparams`, `get_histograms`, `summary`, `compare_hparams_tool`
-
-**MCP resources:** `vibetrack://experiments`, `vibetrack://experiments/{name}`, `vibetrack://experiments/{name}/scalars/{tag}`, etc.
-
-Standalone MCP server:
-
-```bash
-pip install vibetrack[all]
-vibetrack --viewer mcp --project-folder my_project/
-```
-
-
+MCP lets LLM apps query experiment data and compact metric/image analysis tools.
+See [MCP.md](MCP.md) for tools, resources, standalone server usage, and the LLM
+demo.
 
 ## CLI
 
@@ -300,9 +244,8 @@ vibetrack --viewer mcp --project-folder my_project/
 vibetrack                           # default  
 vibetrack [PROJECT_FOLDER]          # Launch dashboard (web + ingest; MCP with vibetrack[all] on Python 3.10+)
 vibetrack --port 8080               # Custom port
-vibetrack --host 127.0.0.1          # Bind to localhost only (by default it is open on LAN IP)
 vibetrack --token SECRET            # Protect ingest endpoints
-vibetrack --listen 0.0.0.0:9009     # Standalone  server on separate port
+vibetrack --listen 0.0.0.0:9009     # Open server on separate port
 vibetrack migrate PROJECT_FOLDER    # Merge legacy per-run DBs into project DB
 ```
 

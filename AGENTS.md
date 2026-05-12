@@ -1,7 +1,7 @@
 # vibetrack
 
 Modern, lightweight experiment tracker for ML/AI. Drop-in replacement for
-TensorBoard and W&B with multiple output backends.
+TensorBoard-compatible and module-level logging APIs with multiple output backends.
 
 ## Project overview
 
@@ -30,11 +30,11 @@ strips a trailing `_ui` suffix.
 
 ```
 vibetrack/
-  __init__.py        — Public API; W&B-style module-level init/log/finish
+  __init__.py        — Public API; module-level init/log/finish
   config.py          — User config (~/.vibetrack/config.json; migrates legacy ~/.cache/vibetrack/config.json)
   default_config.py  — Central default values used by config/writer/viewers
   db.py              — Database class (SQLite WAL, thread-local conns, bulk insert, precache)
-  writer.py          — SummaryWriter (TB-compatible + W&B-style .log()); .to() dispatch
+  writer.py          — SummaryWriter (TB-compatible + dict-style .log()); .to() dispatch
   reader.py          — ExperimentReader + RunReader (central DB or explicit project DB)
   smoother.py        — EMA (TB-style debiased), moving average, gaussian
   compare.py         — Cross-experiment comparison (scalars, hparams, summary tables)
@@ -94,7 +94,7 @@ vibetrack/
 - **Viewer auto-discovery**: `viewers/__init__.py` scans viewer modules,
   excludes infrastructure files, and maps filename to viewer name (stripping
   `_ui` suffix).
-- **Event dispatch**: every `add_*` and W&B-style `log()` call returns an
+- **Event dispatch**: every `add_*` and dict-style `log()` call returns an
   event handle; use `writer.to("telegram" | "slack" | ...)` for registered
   dispatch or `handle.to(...)` for one-shot forwarding. `every=` accepts
   `None` (every event), `int` (N events), or duration strings (`"5s"`,
@@ -120,7 +120,7 @@ writer.add_scalar("loss", 0.5, step=0)
 writer.add_image("sample", img_array, step=0)
 writer.close()
 
-# W&B style
+# Module-level API
 import vibetrack
 vibetrack.init(project="cifar10", name="resnet18", config={"lr": 1e-3})
 vibetrack.log({"loss": 0.5, "sample": vibetrack.Image(img_array)})

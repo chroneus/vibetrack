@@ -1,4 +1,4 @@
-"""Tests for SummaryWriter — TensorBoard & W&B API compatibility."""
+"""Tests for SummaryWriter — TensorBoard-compatible and module-level APIs."""
 
 import inspect
 import json
@@ -905,8 +905,8 @@ class TestModuleAPI:
 
         writer = vibetrack.init(
             project=project_dir.name,
-            name="wandb_run",
-            log_dir=str(project_dir / "runs" / "wandb_run"),
+            name="module_run",
+            log_dir=str(project_dir / "runs" / "module_run"),
             config={"lr": 0.01},
         )
         vibetrack.log({"loss": 0.9})
@@ -914,9 +914,9 @@ class TestModuleAPI:
         vibetrack.finish()
 
         reader = RunReader()
-        exp = reader.experiment("wandb_run")
+        exp = reader.experiment("module_run")
         assert exp is not None
-        assert exp.log_dir == str(project_dir / "runs" / "wandb_run")
+        assert exp.log_dir == str(project_dir / "runs" / "module_run")
         assert [row["value"] for row in exp.scalars("loss")] == [0.9, 0.5]
         reader.close()
         writer.close()
@@ -1067,6 +1067,28 @@ class TestResumeRestart:
         exp = next(e for e in reader.experiments() if e.name == "exp")
         rows = exp.scalars("loss")
         assert len(rows) == 6  # 5 from w1 + 1 from w2
+        reader.close()
+
+    def test_forced_resume_appends_overlapping_steps(self, tmp_path):
+        """Remote ingest can append same-step tags without creating suffix runs."""
+        pf = str(tmp_path)
+        for tag, value in [("loss", 0.5), ("acc", 0.8)]:
+            w = SummaryWriter(
+                str(tmp_path / "exp"),
+                name="exp",
+                project_folder=pf,
+                system_metrics_interval=0,
+                resume=True,
+            )
+            w.add_scalar(tag, value, 0)
+            w.close()
+
+        reader = RunReader(pf)
+        exps = reader.experiments()
+        assert [e.name for e in exps] == ["exp"]
+        exp = exps[0]
+        assert [row["value"] for row in exp.scalars("loss")] == [0.5]
+        assert [row["value"] for row in exp.scalars("acc")] == [0.8]
         reader.close()
 
     def test_restart_suffix_increment(self, tmp_path):

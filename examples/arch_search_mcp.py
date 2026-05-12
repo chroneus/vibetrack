@@ -1,46 +1,83 @@
 #!/usr/bin/env python3
-"""Architecture search using vibetrack MCP + Claude Agent SDK.
+"""Architecture-search demo using vibetrack MCP plus any tool-calling LLM.
 
-Trains 5 tiny MLP variants on a sine-regression task (numpy, no GPU needed),
-logs metrics to vibetrack, starts the MCP server, then asks Claude to query
-the server and recommend the best architecture.
+The script trains a few tiny numpy MLP variants on a sine-regression task,
+logs their metrics to vibetrack, starts the vibetrack MCP server, exposes the
+MCP tools to an OpenAI-compatible chat-completions endpoint, and asks the LLM
+to inspect the experiment data before recommending a model.
 
-No API key required — uses the local Claude Code CLI (Claude Pro subscription).
-
-Runtime: ~2-3 minutes.
+Works with local or hosted OpenAI-compatible APIs that support tool calling:
+Ollama, LM Studio, vLLM, OpenAI, etc.
 
 Requirements:
-    pip install vibetrack[mcp] numpy claude-agent-sdk
+    pip install vibetrack[all] numpy httpx
 
-Usage:
+Example with Ollama:
+    ollama pull llama3.1
+    LLM_BASE_URL=http://127.0.0.1:11434/v1 \
+    LLM_API_KEY=ollama \
+    LLM_MODEL=llama3.1 \
+    python examples/arch_search_mcp.py
+
+Example with OpenAI:
+    LLM_BASE_URL=https://api.openai.com/v1 \
+    LLM_API_KEY=$OPENAI_API_KEY \
+    LLM_MODEL=gpt-4.1-mini \
     python examples/arch_search_mcp.py
 """
 
 from __future__ import annotations
 
-import anyio
+import asyncio
+import contextlib
+import json
+import os
+import shutil
+import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
 
+import httpx
 import numpy as np
 
 import vibetrack
 
-PROJECT_FOLDER = "/tmp/vibetrack_arch_search"
-MCP_PORT = 16006
+PROJECT_FOLDER = Path(os.getenv("VT_MCP_DEMO_PROJECT", "/tmp/vibetrack_mcp_llm_demo"))
+MCP_PORT = int(os.getenv("VT_MCP_DEMO_MCP_PORT", "16006"))
+MCP_URL = f"http://127.0.0.1:{MCP_PORT}/mcp"
 
-# ── Architecture candidates ───────────────────────────────────────────────────
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama3.1")
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
+LLM_MAX_TURNS = int(os.getenv("LLM_MAX_TURNS", "12"))
 
-ARCHS = [
-    {"name": "tiny", "layers": [16], "lr": 0.05},
-    {"name": "small", "layers": [32, 16], "lr": 0.01},
-    {"name": "medium", "layers": [64, 32], "lr": 0.01},
-    {"name": "deep", "layers": [32, 32, 32], "lr": 0.005},
-    {"name": "wide", "layers": [128, 64], "lr": 0.001},
+
+ARCHITECTURES = [
+    {"name": "tiny_fast", "layers": [16], "lr": 0.045},
+    {"name": "small_balanced", "layers": [32, 16], "lr": 0.012},
+    {"name": "medium_stable", "layers": [64, 32], "lr": 0.008},
+    {"name": "deep_slow", "layers": [32, 32, 32], "lr": 0.004},
+    {"name": "wide_underfit", "layers": [128, 64], "lr": 0.001},
 ]
 
-# ── Tiny numpy MLP ────────────────────────────────────────────────────────────
+
+PROMPT = """\
+You are reviewing a vibetrack architecture search.
+
+Use MCP tools before answering:
+1. list_experiments
+2. compare_scalar for loss/val with objective="min"
+3. analyze_scalar for the strongest candidates
+4. get_hparams for the winner and one close alternative
+
+Decide which run is best for production. Focus on validation loss, convergence
+speed, and parameter count. Mention the evidence you used. Keep the answer
+under 220 words.
+"""
 
 
 def relu(x: np.ndarray) -> np.ndarray:
@@ -51,164 +88,263 @@ def relu_grad(x: np.ndarray) -> np.ndarray:
     return (x > 0).astype(float)
 
 
-def train(cfg: dict, epochs: int = 300) -> list[tuple[int, float, float]]:
-    """Train a tiny MLP on y = sin(x) with SGD; return (epoch, train_loss, val_loss) tuples."""
-    np.random.seed(42)
+def train(cfg: Dict[str, Any], epochs: int = 260) -> List[tuple[int, float, float]]:
+    """Train a tiny MLP on y = sin(x); return (epoch, train_loss, val_loss)."""
+    rng = np.random.default_rng(7)
 
-    X_tr = np.linspace(0, 2 * np.pi, 120).reshape(-1, 1)
-    y_tr = np.sin(X_tr)
-    X_va = np.linspace(0.05, 2 * np.pi + 0.05, 40).reshape(-1, 1)
-    y_va = np.sin(X_va)
+    x_train = np.linspace(0, 2 * np.pi, 128).reshape(-1, 1)
+    y_train = np.sin(x_train)
+    x_val = np.linspace(0.04, 2 * np.pi + 0.04, 48).reshape(-1, 1)
+    y_val = np.sin(x_val)
 
-    layer_sizes = [1] + cfg["layers"] + [1]
-    Ws = [
-        np.random.randn(a, b) * np.sqrt(2.0 / a)
+    layer_sizes = [1] + list(cfg["layers"]) + [1]
+    weights = [
+        rng.normal(0, np.sqrt(2.0 / a), size=(a, b))
         for a, b in zip(layer_sizes, layer_sizes[1:])
     ]
-    bs = [np.zeros((1, b)) for b in layer_sizes[1:]]
+    biases = [np.zeros((1, b)) for b in layer_sizes[1:]]
 
-    lr = cfg["lr"]
-    history: list[tuple[int, float, float]] = []
-
-    def forward(X: np.ndarray):
-        acts = [X]
-        for i, (W, b) in enumerate(zip(Ws, bs)):
-            z = acts[-1] @ W + b
-            acts.append(z if i == len(Ws) - 1 else relu(z))
+    def forward(x: np.ndarray) -> List[np.ndarray]:
+        acts = [x]
+        for i, (w, b) in enumerate(zip(weights, biases)):
+            z = acts[-1] @ w + b
+            acts.append(z if i == len(weights) - 1 else relu(z))
         return acts
 
-    for epoch in range(epochs):
-        acts = forward(X_tr)
-        diff = acts[-1] - y_tr
+    history: List[tuple[int, float, float]] = []
+    for epoch in range(epochs + 1):
+        acts = forward(x_train)
+        diff = acts[-1] - y_train
         train_loss = float(np.mean(diff**2))
 
-        delta = 2 * diff / len(y_tr)
-        for i in range(len(Ws) - 1, -1, -1):
-            dW = acts[i].T @ delta
+        delta = 2 * diff / len(y_train)
+        for i in range(len(weights) - 1, -1, -1):
+            dw = acts[i].T @ delta
             db = np.sum(delta, axis=0, keepdims=True)
             if i > 0:
-                delta = (delta @ Ws[i].T) * relu_grad(acts[i])
-            Ws[i] -= lr * dW
-            bs[i] -= lr * db
+                delta = (delta @ weights[i].T) * relu_grad(acts[i])
+            weights[i] -= cfg["lr"] * dw
+            biases[i] -= cfg["lr"] * db
 
-        if epoch % 10 == 0:
-            va_acts = forward(X_va)
-            val_loss = float(np.mean((va_acts[-1] - y_va) ** 2))
+        if epoch % 20 == 0:
+            val_pred = forward(x_val)[-1]
+            val_loss = float(np.mean((val_pred - y_val) ** 2))
             history.append((epoch, train_loss, val_loss))
 
     return history
 
 
-# ── Step 1: run experiments ───────────────────────────────────────────────────
+def parameter_count(layers: Iterable[int]) -> int:
+    sizes = [1] + list(layers) + [1]
+    return sum(a * b + b for a, b in zip(sizes, sizes[1:]))
 
 
-def run_experiments() -> None:
-    print("=== Step 1: Training architectures ===")
-    for cfg in ARCHS:
-        n_params = sum(a * b for a, b in zip([1] + cfg["layers"], cfg["layers"] + [1]))
+def seed_experiments() -> None:
+    """Create a fresh project with enough signal for a meaningful LLM answer."""
+    if PROJECT_FOLDER.exists():
+        shutil.rmtree(PROJECT_FOLDER)
+    PROJECT_FOLDER.mkdir(parents=True, exist_ok=True)
+
+    print("1. Training and logging architecture candidates")
+    for cfg in ARCHITECTURES:
+        params = parameter_count(cfg["layers"])
+        history = train(cfg)
+        final_val = history[-1][2]
+        best_val = min(row[2] for row in history)
+
         print(
-            f"  {cfg['name']:8s}  layers={cfg['layers']}  lr={cfg['lr']}  params={n_params}",
-            end="",
-            flush=True,
+            f"   {cfg['name']:<15} layers={cfg['layers']} "
+            f"lr={cfg['lr']:<7} params={params:<5} final_val={final_val:.5f}"
         )
 
-        history = train(cfg)
-
-        writer = vibetrack.SummaryWriter(
-            log_dir=f"{PROJECT_FOLDER}/{cfg['name']}",
+        with vibetrack.SummaryWriter(
+            log_dir=str(PROJECT_FOLDER / cfg["name"]),
             name=cfg["name"],
-            project_folder=PROJECT_FOLDER,
+            project_folder=str(PROJECT_FOLDER),
+            system_metrics_interval=0,
             config={
                 "layers": str(cfg["layers"]),
                 "lr": cfg["lr"],
-                "n_params": n_params,
+                "params": params,
             },
-        )
-        for epoch, train_loss, val_loss in history:
-            writer.add_scalar("loss/train", train_loss, epoch)
-            writer.add_scalar("loss/val", val_loss, epoch)
-        writer.close()
+        ) as writer:
+            writer.add_text(
+                "notes",
+                (
+                    f"Candidate {cfg['name']} has layers={cfg['layers']}, "
+                    f"lr={cfg['lr']}, params={params}, best_val={best_val:.6f}."
+                ),
+                global_step=0,
+            )
+            for epoch, train_loss, val_loss in history:
+                writer.add_scalar("loss/train", train_loss, epoch)
+                writer.add_scalar("loss/val", val_loss, epoch)
 
-        final_val = history[-1][2]
-        print(f"  →  val_loss={final_val:.5f}")
-
-    print(f"\n  Logs saved to {PROJECT_FOLDER}\n")
+    print(f"   wrote project: {PROJECT_FOLDER}\n")
 
 
-# ── Step 2: start the MCP server ──────────────────────────────────────────────
+def wait_for_mcp(proc: subprocess.Popen[Any], timeout: float = 15.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                "MCP server exited before it was reachable. "
+                "Install MCP support with `pip install -e .[all]` or "
+                "`pip install vibetrack[all]`."
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", MCP_PORT), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.25)
+    raise RuntimeError(f"MCP server did not become reachable at {MCP_URL}")
 
 
-def start_mcp_server() -> subprocess.Popen:
-    print(f"=== Step 2: Starting vibetrack MCP server (port {MCP_PORT}) ===")
+def start_mcp_server() -> subprocess.Popen[Any]:
+    print("2. Starting vibetrack MCP server")
     proc = subprocess.Popen(
         [
             sys.executable,
             "-m",
             "vibetrack.viewers.mcp",
             "--project-folder",
-            PROJECT_FOLDER,
+            str(PROJECT_FOLDER),
             "--port",
             str(MCP_PORT),
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    time.sleep(2)
-    print(f"  Ready at http://127.0.0.1:{MCP_PORT}/mcp\n")
+    wait_for_mcp(proc)
+    print(f"   MCP endpoint: {MCP_URL}\n")
     return proc
 
 
-# ── Step 3: ask Claude via MCP ────────────────────────────────────────────────
-
-PROMPT = """\
-You are an ML engineer reviewing architecture search results logged to vibetrack.
-
-Use the available MCP tools to:
-1. List all experiments.
-2. Fetch the summary table (final metrics per experiment).
-3. For each experiment, get the "loss/val" scalar series.
-4. Identify which architecture converges fastest and which achieves the lowest
-   final validation loss.
-5. Give a clear recommendation (one best overall architecture) with concise reasoning.
-
-Focus on val_loss. Keep your final answer under 200 words.
-"""
+def tool_result_text(result: Any) -> str:
+    parts: List[str] = []
+    for item in getattr(result, "content", []) or []:
+        text = getattr(item, "text", None)
+        if text is not None:
+            parts.append(text)
+        elif hasattr(item, "model_dump"):
+            parts.append(json.dumps(item.model_dump(), default=str))
+        else:
+            parts.append(str(item))
+    return "\n".join(parts)
 
 
-async def ask_claude() -> None:
-    from claude_agent_sdk import query, ClaudeAgentOptions, ResultMessage
-
-    print("=== Step 3: Claude querying MCP server ===\n")
-
-    async for message in query(
-        prompt=PROMPT,
-        options=ClaudeAgentOptions(
-            mcp_servers={
-                "vibetrack": {
-                    "type": "http",
-                    "url": f"http://127.0.0.1:{MCP_PORT}/mcp",
-                }
-            },
-            permission_mode="default",
-            max_turns=20,
-        ),
-    ):
-        if isinstance(message, ResultMessage):
-            print(message.result)
+async def list_mcp_tools(session: Any) -> List[Dict[str, Any]]:
+    result = await session.list_tools()
+    tools = []
+    for tool in result.tools:
+        schema = tool.inputSchema or {"type": "object", "properties": {}}
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": schema,
+                },
+            }
+        )
+    return tools
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+async def chat_completion(
+    client: httpx.AsyncClient,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    response = await client.post(
+        f"{LLM_BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+        json={
+            "model": LLM_MODEL,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": LLM_TEMPERATURE,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]
+
+
+async def ask_llm_via_mcp() -> None:
+    """Expose vibetrack MCP tools to any OpenAI-compatible tool-calling LLM."""
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    print("3. Asking LLM to query vibetrack through MCP")
+    print(f"   LLM endpoint: {LLM_BASE_URL}")
+    print(f"   LLM model:    {LLM_MODEL}\n")
+
+    async with streamable_http_client(MCP_URL) as (read, write, _session_id):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await list_mcp_tools(session)
+            print("   MCP tools exposed to LLM:")
+            for tool in tools:
+                print(f"   - {tool['function']['name']}")
+            print()
+
+            messages: List[Dict[str, Any]] = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a careful ML experiment analyst. Use tools "
+                        "for evidence; do not invent experiment results."
+                    ),
+                },
+                {"role": "user", "content": PROMPT},
+            ]
+
+            async with httpx.AsyncClient() as client:
+                for _ in range(LLM_MAX_TURNS):
+                    message = await chat_completion(client, messages, tools)
+                    messages.append(message)
+                    tool_calls = message.get("tool_calls") or []
+
+                    if not tool_calls:
+                        print("=== LLM recommendation ===")
+                        print(message.get("content", "").strip())
+                        return
+
+                    for call in tool_calls:
+                        name = call["function"]["name"]
+                        raw_args = call["function"].get("arguments") or {}
+                        if isinstance(raw_args, str):
+                            try:
+                                args = json.loads(raw_args)
+                            except json.JSONDecodeError:
+                                args = {}
+                        else:
+                            args = raw_args
+                        print(f"   tool call: {name}({json.dumps(args)})")
+                        result = await session.call_tool(name, args)
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call["id"],
+                                "content": tool_result_text(result),
+                            }
+                        )
+
+            raise RuntimeError("LLM did not finish within LLM_MAX_TURNS")
 
 
 def main() -> None:
-    run_experiments()
-
+    seed_experiments()
     proc = start_mcp_server()
     try:
-        anyio.run(ask_claude)
+        asyncio.run(ask_llm_via_mcp())
     finally:
         proc.terminate()
-        print("\n=== Done ===")
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=5)
+        print("\nDone.")
 
 
 if __name__ == "__main__":

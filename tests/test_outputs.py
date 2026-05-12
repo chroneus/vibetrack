@@ -12,10 +12,17 @@ from unittest import mock
 import httpx
 import pytest
 
+from vibetrack.config import save_config
 from vibetrack.db import Database
 from vibetrack.reader import RunReader
 from vibetrack.viewers.console import ConsoleOutput, _sparkline
-from vibetrack.viewers.mcp import _suppress_streamable_http_startup_log
+from vibetrack.viewers import mcp as mcp_module
+from vibetrack.viewers.mcp import (
+    _analyze_scalar_payload,
+    _compare_image_lpips_payload,
+    _compare_scalar_payload,
+    _suppress_streamable_http_startup_log,
+)
 from vibetrack.writer import SummaryWriter
 
 
@@ -256,6 +263,101 @@ class TestAutoDiscovery:
 
 
 class TestMCPOutput:
+    def test_analyze_scalar_reports_extrema_trend_and_events(self):
+        rows = [
+            {"step": 0, "value": 5.0, "wall_time": 1.0},
+            {"step": 1, "value": 3.0, "wall_time": 2.0},
+            {"step": 2, "value": 2.0, "wall_time": 3.0},
+            {"step": 3, "value": 2.01, "wall_time": 4.0},
+            {"step": 4, "value": 2.0, "wall_time": 5.0},
+        ]
+
+        result = _analyze_scalar_payload("run_a", 7, "loss/val", rows)
+
+        assert result["experiment"] == "run_a"
+        assert result["count"] == 5
+        assert result["min"]["step"] == 2
+        assert result["max"]["step"] == 0
+        assert result["best"]["value"] == 2.0
+        assert "decreasing" in result["trend"]["direction"]
+        assert result["plateau"]["start_step"] == 2
+        assert {event["type"] for event in result["events"]} >= {
+            "minimum",
+            "maximum",
+            "largest_drop",
+            "largest_rise",
+            "plateau",
+        }
+
+    def test_compare_scalar_ranks_experiments_and_reports_missing(self):
+        class Exp:
+            def __init__(self, name, experiment_id, series):
+                self.name = name
+                self.experiment_id = experiment_id
+                self._series = series
+
+            def scalars(self, tag):
+                return self._series.get(tag, [])
+
+        exps = [
+            Exp("baseline", 1, {"loss": [{"step": 0, "value": 4.0}, {"step": 1, "value": 2.0}]}),
+            Exp("candidate", 2, {"loss": [{"step": 0, "value": 4.0}, {"step": 1, "value": 1.5}]}),
+            Exp("missing", 3, {}),
+        ]
+
+        result = _compare_scalar_payload(exps, "loss", objective="min")
+
+        assert result["winner"]["experiment"] == "candidate"
+        assert [row["experiment"] for row in result["ranking"]] == [
+            "candidate",
+            "baseline",
+        ]
+        assert result["missing"] == ["missing"]
+
+    def test_compare_image_lpips_payload_reports_lpips_and_pixel_metrics(
+        self, tmp_path, monkeypatch
+    ):
+        image_module = pytest.importorskip("PIL.Image")
+
+        ref_path = tmp_path / "ref.png"
+        cand_path = tmp_path / "cand.png"
+        image_module.new("RGB", (4, 4), (255, 0, 0)).save(ref_path)
+        image_module.new("RGB", (4, 4), (255, 0, 0)).save(cand_path)
+
+        class Exp:
+            def __init__(self, name, experiment_id, path):
+                self.name = name
+                self.experiment_id = experiment_id
+                self._path = path
+
+            def images(self, tag):
+                return [
+                    {
+                        "step": 3,
+                        "path": f"media/{tag}/3.png",
+                        "abs_path": str(self._path),
+                    }
+                ]
+
+        monkeypatch.setattr(
+            mcp_module,
+            "_lpips_metric",
+            lambda _reference, _candidate: (0.123, None),
+        )
+
+        result = _compare_image_lpips_payload(
+            Exp("reference", 1, ref_path),
+            Exp("candidate", 2, cand_path),
+            "samples",
+        )
+
+        assert result["selection"] == "latest_common_step"
+        assert result["compared_step"] == 3
+        assert result["lpips"]["available"] is True
+        assert result["lpips"]["distance"] == 0.123
+        assert result["pixel"]["mse"] == 0.0
+        assert result["pixel"]["mae"] == 0.0
+
     def test_streamable_http_startup_log_is_suppressed(self):
         logger = logging.getLogger("mcp.server.streamable_http_manager")
         previous_level = logger.level
@@ -285,6 +387,86 @@ class TestMCPOutput:
             logger.removeHandler(handler)
             logger.setLevel(previous_level)
             logger.propagate = previous_propagate
+
+
+class TestNotificationCredentials:
+    @pytest.fixture
+    def isolated_config(self, tmp_path, monkeypatch):
+        cfg_dir = tmp_path / "cfg"
+        monkeypatch.setattr("vibetrack.config.config_dir", lambda: cfg_dir)
+        monkeypatch.setattr("vibetrack.config.config_path", lambda: cfg_dir / "config.json")
+        return cfg_dir
+
+    def test_telegram_can_opt_into_config_credentials(
+        self, tmp_path, monkeypatch, isolated_config
+    ):
+        from vibetrack.viewers.telegram import TelegramOutput
+
+        monkeypatch.delenv("VIBETRACK_TELEGRAM_TOKEN", raising=False)
+        monkeypatch.delenv("VIBETRACK_TELEGRAM_CHAT_ID", raising=False)
+        save_config(
+            {"telegram": {"token": "cfg-token", "chat_id": "cfg-chat"}},
+        )
+
+        default = TelegramOutput(str(tmp_path / "project"))
+        configured = TelegramOutput(
+            str(tmp_path / "project"),
+            use_config_credentials=True,
+        )
+        explicit = TelegramOutput(
+            str(tmp_path / "project"),
+            token="arg-token",
+            chat_id="arg-chat",
+            use_config_credentials=True,
+        )
+
+        assert default.token == ""
+        assert default.chat_id == ""
+        assert configured.token == "cfg-token"
+        assert configured.chat_id == "cfg-chat"
+        assert explicit.token == "arg-token"
+        assert explicit.chat_id == "arg-chat"
+
+    def test_slack_can_opt_into_config_credentials(
+        self, tmp_path, monkeypatch, isolated_config
+    ):
+        from vibetrack.viewers.slack import SlackOutput
+
+        monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("SLACK_CHANNEL", raising=False)
+        save_config(
+            {
+                "slack": {
+                    "webhook": "https://hooks.slack.test/config",
+                    "bot_token": "xoxb-config",
+                    "channel": "C123",
+                }
+            },
+        )
+
+        default = SlackOutput(str(tmp_path / "project"))
+        configured = SlackOutput(
+            str(tmp_path / "project"),
+            use_config_credentials=True,
+        )
+        explicit = SlackOutput(
+            str(tmp_path / "project"),
+            webhook="https://hooks.slack.test/arg",
+            bot_token="xoxb-arg",
+            channel="C999",
+            use_config_credentials=True,
+        )
+
+        assert default.webhook == ""
+        assert default.bot_token == ""
+        assert default.channel == ""
+        assert configured.webhook == "https://hooks.slack.test/config"
+        assert configured.bot_token == "xoxb-config"
+        assert configured.channel == "C123"
+        assert explicit.webhook == "https://hooks.slack.test/arg"
+        assert explicit.bot_token == "xoxb-arg"
+        assert explicit.channel == "C999"
 
 
 class TestListenServer:
@@ -339,6 +521,18 @@ class TestListenServer:
         exp = next(e for e in exps if e.name == "text_run")
         assert "note" in exp.text_tags()
         reader.close()
+
+    def test_log_rejects_non_integer_step(self, listen_app):
+        client, _ = listen_app
+        resp = client.post(
+            "/log",
+            json={
+                "experiment": "bad_step",
+                "step": "<script>alert(1)</script>",
+                "scalars": {"loss": 0.5},
+            },
+        )
+        assert resp.status_code == 400
 
     def test_token_rejects_unauthorized(self, listen_app_with_token):
         resp = listen_app_with_token.post(
@@ -1082,3 +1276,54 @@ class TestUnifiedServer:
             },
         )
         assert resp.status_code == 200
+
+    def test_listen_log_rejects_path_traversal_experiment(self, unified_app):
+        """Project-scoped listen routes must not write outside project_folder."""
+        client, project_folder = unified_app
+        project_name = project_folder.name
+        resp = client.post(
+            f"/{project_name}/listen/log",
+            json={
+                "experiment": "../escape",
+                "step": 0,
+                "scalars": {"loss": 0.5},
+            },
+        )
+        assert resp.status_code == 400
+        assert not (project_folder.parent / "escape").exists()
+
+    def test_listen_log_rejects_non_integer_step(self, unified_app):
+        """Remote JSON steps must be numeric before entering dashboard payloads."""
+        client, project_folder = unified_app
+        project_name = project_folder.name
+        resp = client.post(
+            f"/{project_name}/listen/log",
+            json={
+                "experiment": "remote_run",
+                "step": "<img src=x onerror=alert(1)>",
+                "scalars": {"loss": 0.5},
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_listen_media_rejects_dangerous_artifact_extension(self, unified_app):
+        """Remote artifact uploads should not create executable same-origin files."""
+        client, project_folder = unified_app
+        project_name = project_folder.name
+        resp = client.post(
+            f"/{project_name}/listen/media",
+            data={
+                "experiment": "media_run",
+                "tag": "sample",
+                "step": "0",
+                "type": "artifact",
+            },
+            files={
+                "file": (
+                    "payload.html",
+                    io.BytesIO(b"<script>alert(1)</script>"),
+                    "text/html",
+                )
+            },
+        )
+        assert resp.status_code == 400

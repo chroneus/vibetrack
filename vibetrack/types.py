@@ -1,4 +1,4 @@
-"""Media wrapper types for W&B-style log() dispatch.
+"""Media wrapper types for dict-style log() dispatch.
 
 Usage::
 

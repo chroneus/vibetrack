@@ -18,6 +18,17 @@ _ALLOWED_SUFFIXES = {
     "audio": {".wav", ".mp3", ".ogg", ".flac", ".m4a"},
     "video": {".mp4", ".webm", ".avi", ".mov", ".mkv"},
 }
+_DANGEROUS_ARTIFACT_SUFFIXES = {
+    ".html",
+    ".htm",
+    ".js",
+    ".svg",
+    ".php",
+    ".sh",
+    ".exe",
+    ".cgi",
+    ".pl",
+}
 
 
 async def _write_upload_to_tempfile(
@@ -66,6 +77,24 @@ def _normalize_project_folder(project_folder: Optional[str]) -> Optional[str]:
     return str(path)
 
 
+def _validate_remote_experiment_name(experiment: object) -> str:
+    """Return a safe run directory name for remote logging endpoints."""
+    if not isinstance(experiment, str):
+        raise ValueError("Invalid experiment name")
+    name = experiment.strip()
+    if not name or "/" in name or "\\" in name or ".." in name:
+        raise ValueError("Invalid experiment name")
+    return name
+
+
+def _coerce_remote_step(step: object) -> int:
+    """Return an integer step for remote logging endpoints."""
+    try:
+        return int(step)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError("Invalid step")
+
+
 def _looks_like_project_folder(value: str) -> bool:
     path = Path(value).expanduser()
     if path.exists():
@@ -104,7 +133,7 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
         else None
     )
 
-    def _new_writer(name: str) -> SummaryWriter:
+    def _new_writer(name: str, project_name: Optional[str] = None) -> SummaryWriter:
         if project_root is not None:
             log_dir = project_root / name
             return SummaryWriter(
@@ -112,9 +141,16 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
                 name=name,
                 project_folder=str(project_root),
                 system_metrics_interval=0,
+                resume=True,
             )
         log_dir = Path.cwd() / name
-        return SummaryWriter(str(log_dir), name=name, system_metrics_interval=0)
+        return SummaryWriter(
+            str(log_dir),
+            name=name,
+            project=project_name,
+            system_metrics_interval=0,
+            resume=True,
+        )
 
     async def check_auth(request: Request):  # type: ignore[no-untyped-def]
         if token:
@@ -125,11 +161,18 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
     @app.post("/log")
     async def log_data(request: Request, _=Depends(check_auth)) -> dict:
         data = await request.json()
-        experiment = data.get("experiment", "default")
-        if "/" in experiment or "\\" in experiment or ".." in experiment:
+        try:
+            experiment = _validate_remote_experiment_name(
+                data.get("experiment", "default")
+            )
+        except ValueError:
             raise HTTPException(status_code=400, detail="Invalid experiment name")
-        step = data.get("step", 0)
-        writer = _new_writer(experiment)
+        try:
+            step = _coerce_remote_step(data.get("step", 0))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid step")
+        project_name = data.get("project")
+        writer = _new_writer(experiment, project_name)
         try:
             for tag, value in data.get("scalars", {}).items():
                 writer.add_scalar(tag, value, step)
@@ -160,14 +203,18 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
     @app.post("/hparams")
     async def log_hparams(request: Request, _=Depends(check_auth)) -> dict:
         data = await request.json()
-        experiment = data.get("experiment", "default")
-        if "/" in experiment or "\\" in experiment or ".." in experiment:
+        try:
+            experiment = _validate_remote_experiment_name(
+                data.get("experiment", "default")
+            )
+        except ValueError:
             raise HTTPException(status_code=400, detail="Invalid experiment name")
         hparams = data.get("hparams") or {}
         metrics = data.get("metrics") or {}
         if not isinstance(hparams, dict) or not isinstance(metrics, dict):
             raise HTTPException(status_code=400, detail="hparams/metrics must be objects")
-        writer = _new_writer(experiment)
+        project_name = data.get("project")
+        writer = _new_writer(experiment, project_name)
         try:
             writer.add_hparams(hparams, metrics)
         finally:
@@ -181,9 +228,12 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
         tag: str = Form("upload"),
         step: int = Form(0),
         type: str = Form("artifact"),
+        project: Optional[str] = Form(None),
         file: UploadFile = File(...),
     ) -> dict:
-        if "/" in experiment or "\\" in experiment or ".." in experiment:
+        try:
+            experiment = _validate_remote_experiment_name(experiment)
+        except ValueError:
             raise HTTPException(status_code=400, detail="Invalid experiment name")
         writer: Optional[SummaryWriter] = None
         tmp_path: Optional[str] = None
@@ -195,17 +245,7 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
                 )
 
             if type == "artifact":
-                if raw_suffix in {
-                    ".html",
-                    ".htm",
-                    ".js",
-                    ".svg",
-                    ".php",
-                    ".sh",
-                    ".exe",
-                    ".cgi",
-                    ".pl",
-                }:
+                if raw_suffix in _DANGEROUS_ARTIFACT_SUFFIXES:
                     raise HTTPException(
                         status_code=400,
                         detail="Refusing to serve potentially dangerous file extension",
@@ -222,7 +262,7 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
             except ValueError:
                 raise HTTPException(status_code=413, detail="File too large (max 1 GB)")
 
-            writer = _new_writer(experiment)
+            writer = _new_writer(experiment, project)
             if type == "image":
                 writer.add_image(tag, tmp_path, step)
             elif type == "audio":
@@ -477,14 +517,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="Viewer host (default: 0.0.0.0)",
+        default="127.0.0.1",
+        help="Viewer host (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=6006,
-        help="Viewer port (default: 6006)",
+        default=6116,
+        help="Viewer port (default: 6116)",
     )
     parser.add_argument(
         "--share",

@@ -32,7 +32,9 @@ function buildPills() {
     pill.className = 'exp-pill' + (activePills.has(name) ? ' active' : ''); pill.dataset.name = name;
     const ci = document.createElement('input'); ci.type = 'color'; ci.value = color;
     ci.style.cssText = 'position:absolute;width:0;height:0;opacity:0;pointer-events:none;';
-    ci.addEventListener('input', e => { expColors[name] = e.target.value; _saveColors(); pill.querySelector('.dot').style.background = e.target.value; buildCharts(); });
+    function _applyColor(v) { expColors[name] = v; _saveColors(); pill.querySelector('.dot').style.background = v; buildCharts(); buildHistograms(); buildSystem(); }
+    ci.addEventListener('input',  e => _applyColor(e.target.value));
+    ci.addEventListener('change', e => _applyColor(e.target.value));
     const dot = document.createElement('span'); dot.className = 'dot'; dot.style.background = color; dot.title = 'Change color';
     dot.addEventListener('click', e => { e.stopPropagation(); ci.click(); });
     const nameSpan = document.createElement('span'); nameSpan.className = 'exp-name'; nameSpan.textContent = name;

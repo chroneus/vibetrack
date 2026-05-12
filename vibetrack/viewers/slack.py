@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import parse as _urlparse
 from urllib import request as _urlreq
 
+from ..config import load_config
 from .base import BaseOutput
 
 _log = logging.getLogger(__name__)
@@ -52,11 +53,28 @@ class SlackOutput(BaseOutput):
         webhook: Optional[str] = None,
         bot_token: Optional[str] = None,
         channel: Optional[str] = None,
+        use_config_credentials: bool = False,
     ) -> None:
         super().__init__(project_folder, project=project)
-        self.webhook = webhook or os.environ.get("SLACK_WEBHOOK_URL", "")
-        self.bot_token = bot_token or os.environ.get("SLACK_BOT_TOKEN", "")
-        self.channel = channel or os.environ.get("SLACK_CHANNEL", "")
+        cfg: Dict[str, Any] = {}
+        if use_config_credentials:
+            raw = load_config(self.config_project()).get("slack", {})
+            cfg = raw if isinstance(raw, dict) else {}
+        self.webhook = (
+            webhook
+            or os.environ.get("SLACK_WEBHOOK_URL", "")
+            or str(cfg.get("webhook", "") or "")
+        )
+        self.bot_token = (
+            bot_token
+            or os.environ.get("SLACK_BOT_TOKEN", "")
+            or str(cfg.get("bot_token", "") or "")
+        )
+        self.channel = (
+            channel
+            or os.environ.get("SLACK_CHANNEL", "")
+            or str(cfg.get("channel", "") or "")
+        )
         self._channel_id: Optional[str] = None
 
     def show(self, **kwargs: Any) -> Any:

@@ -15,7 +15,7 @@ import io
 import logging
 import os
 import sys
-from typing import Any, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from ..compare import compare_scalars, find_all_tags, summary_table
 from ..config import load_config
@@ -35,10 +35,23 @@ class TelegramOutput(BaseOutput):
         project: Optional[str] = None,
         token: Optional[str] = None,
         chat_id: Optional[str] = None,
+        use_config_credentials: bool = False,
     ) -> None:
         super().__init__(project_folder, project=project)
-        self.token = token or os.environ.get("VIBETRACK_TELEGRAM_TOKEN", "")
-        self.chat_id = chat_id or os.environ.get("VIBETRACK_TELEGRAM_CHAT_ID", "")
+        cfg: Dict[str, Any] = {}
+        if use_config_credentials:
+            raw = load_config(self.config_project()).get("telegram", {})
+            cfg = raw if isinstance(raw, dict) else {}
+        self.token = (
+            token
+            or os.environ.get("VIBETRACK_TELEGRAM_TOKEN", "")
+            or str(cfg.get("token", "") or "")
+        )
+        self.chat_id = (
+            chat_id
+            or os.environ.get("VIBETRACK_TELEGRAM_CHAT_ID", "")
+            or str(cfg.get("chat_id", "") or "")
+        )
 
     # ── Push: per-event dispatch via ``writer.to("telegram")`` ──
     def send(self, events: Sequence[Any]) -> None:

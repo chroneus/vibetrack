@@ -418,9 +418,20 @@ def _get_media_roots(reader: RunReader, project: Optional[str] = None) -> List[s
     for row in db.list_experiments(project=project):
         log_dir = row["log_dir"] if hasattr(row, "__getitem__") else ""
         if log_dir:
-            media_dir = os.path.normpath(os.path.join(log_dir, "media"))
-            roots.add(media_dir + os.sep)
+            media_dir = os.path.realpath(os.path.join(log_dir, "media"))
+            roots.add(media_dir)
     return list(roots)
+
+
+def _path_is_under(candidate: str, roots: Sequence[str]) -> bool:
+    """Return True when candidate is contained by one of the allowed roots."""
+    for root in roots:
+        try:
+            if os.path.commonpath([candidate, root]) == root:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _cleanup_experiment_files(log_dir: str) -> None:
@@ -521,7 +532,7 @@ class WebOutput(BaseOutput):
     def show(self, **kwargs: Any) -> Any:
         """Launch uvicorn server."""
         host: str = kwargs.get("host", "127.0.0.1")
-        port: int = kwargs.get("port", 6006)
+        port: int = kwargs.get("port", 6116)
         token: Optional[str] = kwargs.get("token")
         experiments: Optional[Sequence[str]] = kwargs.get("experiments")
         return self._serve_uvicorn(experiments, host, port, token=token)
@@ -542,8 +553,8 @@ class WebOutput(BaseOutput):
     def start_in_thread(
         self,
         experiments: Optional[Sequence[str]] = None,
-        host: str = "0.0.0.0",
-        port: int = 6006,
+        host: str = "127.0.0.1",
+        port: int = 6116,
         token: Optional[str] = None,
     ) -> "threading.Thread":
         """Start the web UI in a daemon thread and return immediately."""
@@ -579,7 +590,13 @@ class WebOutput(BaseOutput):
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
         from fastapi.staticfiles import StaticFiles
 
-        from ..cli import _ALLOWED_SUFFIXES, _write_upload_to_tempfile
+        from ..cli import (
+            _ALLOWED_SUFFIXES,
+            _DANGEROUS_ARTIFACT_SUFFIXES,
+            _coerce_remote_step,
+            _validate_remote_experiment_name,
+            _write_upload_to_tempfile,
+        )
         from ..writer import SummaryWriter
 
         logging.getLogger("uvicorn.error").addFilter(
@@ -771,7 +788,7 @@ class WebOutput(BaseOutput):
                 return JSONResponse({"error": "not found"}, status_code=404)
             candidate = os.path.realpath(path)
             allowed_dirs = _get_media_roots(self._reader)
-            if not any(candidate.startswith(d) for d in allowed_dirs):
+            if not _path_is_under(candidate, allowed_dirs):
                 return JSONResponse({"error": "not found"}, status_code=404)
             if os.path.isfile(candidate):
                 return FileResponse(candidate)
@@ -793,12 +810,14 @@ class WebOutput(BaseOutput):
                     name=name,
                     project_folder=normalized_pf,
                     system_metrics_interval=0,
+                    resume=True,
                 )
             return SummaryWriter(
                 str(Path.cwd() / name),
                 name=name,
                 project=project_name,
                 system_metrics_interval=0,
+                resume=True,
             )
 
         async def _check_listen_auth(request: Request):
@@ -812,8 +831,16 @@ class WebOutput(BaseOutput):
             project: str, request: Request, _=Depends(_check_listen_auth)
         ) -> dict:
             data = await request.json()
-            experiment = data.get("experiment", "default")
-            step = data.get("step", 0)
+            try:
+                experiment = _validate_remote_experiment_name(
+                    data.get("experiment", "default")
+                )
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid experiment name")
+            try:
+                step = _coerce_remote_step(data.get("step", 0))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid step")
             writer = _new_writer(experiment, project)
             try:
                 for tag, value in data.get("scalars", {}).items():
@@ -837,16 +864,33 @@ class WebOutput(BaseOutput):
             writer: Optional[SummaryWriter] = None
             tmp_path: Optional[str] = None
             try:
+                try:
+                    experiment = _validate_remote_experiment_name(experiment)
+                except ValueError:
+                    raise HTTPException(
+                        status_code=400, detail="Invalid experiment name"
+                    )
                 raw_suffix = os.path.splitext(file.filename or "")[1].lower()
                 if type not in {"image", "audio", "video", "artifact"}:
                     raise HTTPException(
                         status_code=400, detail=f"Unsupported upload type {type!r}"
                     )
-                allowed = _ALLOWED_SUFFIXES.get(type)
-                if allowed is not None and raw_suffix not in allowed:
-                    raise HTTPException(
-                        status_code=400, detail=f"Unsupported file type for {type!r}"
-                    )
+                if type == "artifact":
+                    if raw_suffix in _DANGEROUS_ARTIFACT_SUFFIXES:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                "Refusing to serve potentially dangerous file "
+                                "extension"
+                            ),
+                        )
+                else:
+                    allowed = _ALLOWED_SUFFIXES.get(type)
+                    if allowed is not None and raw_suffix not in allowed:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unsupported file type for {type!r}",
+                        )
                 try:
                     tmp_path = await _write_upload_to_tempfile(file, suffix=raw_suffix)
                 except ValueError:

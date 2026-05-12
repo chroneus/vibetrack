@@ -40,5 +40,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "console": {},
     "telegram": {},
+    "slack": {},
     "mcp": {},
 }

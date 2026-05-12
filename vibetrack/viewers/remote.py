@@ -91,7 +91,12 @@ class RemoteOutput(BaseOutput):
         for (run_name, step), payload in log_groups.items():
             if not any(payload.values()):
                 continue
-            body = {"experiment": run_name, "step": step or 0, **payload}
+            body = {
+                "experiment": run_name,
+                "project": self.project,
+                "step": step or 0,
+                **payload,
+            }
             if not self._post_json("/log", body):
                 return
 
@@ -110,6 +115,7 @@ class RemoteOutput(BaseOutput):
             metrics = (ev.extra or {}).get("metrics") or {}
             body = {
                 "experiment": ev.run_name,
+                "project": ev.project,
                 "hparams": ev.value if isinstance(ev.value, dict) else {},
                 "metrics": metrics,
             }
@@ -143,6 +149,7 @@ class RemoteOutput(BaseOutput):
         body, content_type = _multipart_encode(
             fields={
                 "experiment": ev.run_name,
+                "project": ev.project or "",
                 "tag": ev.tag,
                 "step": str(ev.step or 0),
                 "type": ev.kind,

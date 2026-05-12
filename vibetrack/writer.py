@@ -1,6 +1,6 @@
 """SummaryWriter — drop-in replacement for tensorboard.SummaryWriter.
 
-Also supports W&B-style log() calls via the module-level API.
+Also supports dict-style log() calls via the module-level API.
 """
 
 from __future__ import annotations
@@ -528,7 +528,7 @@ class SummaryWriter:
         max_queue: int = 10,
         flush_secs: int = 120,
         filename_suffix: str = "",
-        # W&B-style extras
+        # Module-level API extras
         project: Optional[str] = None,
         name: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
@@ -536,6 +536,7 @@ class SummaryWriter:
         system_metrics_interval: float = SYSTEM_METRICS_INTERVAL,
         project_folder: Optional[str] = None,
         rank: Optional[Union[int, str]] = None,
+        resume: bool = False,
     ) -> None:
         """Open (or resume) an experiment row in the central / project DB.
 
@@ -566,6 +567,10 @@ class SummaryWriter:
             rank: Process rank for distributed training. ``None`` reads
                 ``RANK`` / ``LOCAL_RANK`` from the environment; ``"all"``
                 forces every rank to log; an int gates on ``rank == 0``.
+            resume: Force append to an existing same-name experiment instead
+                of auto-suffixing when the first written step overlaps. Used
+                by remote ingest, where one logical step may arrive as several
+                HTTP requests.
         """
         # Resolve log_dir — mimic TensorBoard's default behaviour
         if log_dir is None:
@@ -644,6 +649,9 @@ class SummaryWriter:
                 self._pending = False
                 self._exp_id = existing["id"]
                 self._db.purge_experiment_from_step(self._exp_id, purge_step)
+            elif existing is not None and resume:
+                self._pending = False
+                self._exp_id = existing["id"]
             elif existing is not None:
                 self._pending = True
                 self._pending_existing_id = existing["id"]
@@ -2009,7 +2017,7 @@ class SummaryWriter:
 
         return self._best_effort_emit("add hparams", _op)
 
-    # ── W&B-style log() ─────────────────────────────────────────
+    # ── Dict-style log() ────────────────────────────────────────
 
     def log(
         self,
@@ -2017,7 +2025,7 @@ class SummaryWriter:
         step: Optional[int] = None,
         commit: bool = True,
     ) -> Any:
-        """W&B-compatible log call: ``writer.log({"loss": 0.5, "acc": 0.9})``."""
+        """Dict-style log call: ``writer.log({"loss": 0.5, "acc": 0.9})``."""
         if not self._enabled or self._closed:
             return null_handle()
         from .types import Image, Audio, Video, Artifact

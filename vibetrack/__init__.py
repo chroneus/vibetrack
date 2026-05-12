@@ -6,7 +6,7 @@ Example usage:
     writer = SummaryWriter("my_project/run_1")
     writer.add_scalar("loss", 0.5, step)
 
-    # W&B style
+    # Module-level API
     import vibetrack
     vibetrack.init(project="my_project", name="run_1", config={"lr": 0.01})
     vibetrack.log({"loss": 0.5, "acc": 0.9})
@@ -62,7 +62,7 @@ __all__ = [
     "SummaryWriter",
     "ExperimentReader",
     "RunReader",
-    # W&B-style module API
+    # Module-level logging API
     "init",
     "log",
     "finish",
@@ -83,7 +83,7 @@ __all__ = [
     "Artifact",
 ]
 
-# ── W&B-style module-level API ──────────────────────────────────
+# ── Module-level logging API ────────────────────────────────────
 
 _active_writer: Optional[SummaryWriter] = None
 _step: int = 0
@@ -107,7 +107,7 @@ def init(
     to: Optional[Union[str, list, tuple]] = None,
     **kwargs: Any,
 ) -> SummaryWriter:
-    """Initialize a new run (W&B-style).
+    """Initialize a new run.
 
     Only rank 0 logs by default.  Other ranks get a no-op writer.
     Set ``rank="all"`` to force every rank to log.
@@ -154,7 +154,7 @@ def init(
 
 
 def log(data: Dict[str, Any], step: Optional[int] = None, **kwargs: Any) -> None:
-    """Log metrics for the current step (W&B-style).
+    """Log metrics for the current step.
 
     ::
 
@@ -174,7 +174,7 @@ def log(data: Dict[str, Any], step: Optional[int] = None, **kwargs: Any) -> None
 
 
 def finish() -> None:
-    """Flush and close the active writer (W&B-style)."""
+    """Flush and close the active writer."""
     global _active_writer
     if _active_writer is not None:
         try:

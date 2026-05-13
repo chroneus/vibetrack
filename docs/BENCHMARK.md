@@ -1,3 +1,132 @@
+# Scalar logging benchmark
+
+In-process scalar logging — vibetrack vs TensorBoard (`torch.utils.tensorboard`) vs MLflow with its **default file-store backend**. Each row writes N total scalars round-robin across 4 tags, then reopens the store cold and reads back.
+
+The benchmark source used to produce these numbers is embedded at the bottom of
+this document.
+
+## Environment
+
+- Ryzen 9 5950X · 46 GiB RAM · Linux 6.17 · Python 3.13.12
+- vibetrack 0.1a0 · tensorboard 2.20.0 · mlflow 3.11.1
+- Single process, no GPU/network
+
+## Results
+
+### N = 1,000 writes, 4 tags
+
+| tool        | write   | write rate    | read 1 tag           | read all tags         |
+|-------------|--------:|--------------:|---------------------:|----------------------:|
+| vibetrack   |  0.02 s |    65,077 /s  |   0.7 ms (250 pts)   |    1.2 ms (1,000 pts) |
+| tensorboard |  0.04 s |    28,283 /s  |  12.0 ms (250 pts)   |   11.6 ms (1,000 pts) |
+| mlflow      |  0.42 s |     2,362 /s  |   0.7 ms (250 pts)   |    3.5 ms (1,000 pts) |
+
+### N = 100,000 writes, 4 tags
+
+| tool        | write    | write rate    | read 1 tag             | read all tags             |
+|-------------|---------:|--------------:|-----------------------:|--------------------------:|
+| vibetrack   |   2.26 s |   44,174 /s   |   21.8 ms (25,000 pts) |    78.5 ms (100,000 pts)  |
+| tensorboard |   3.22 s |   31,101 /s   | 1141.8 ms (25,000 pts) |  1160.6 ms (100,000 pts)  |
+| mlflow      |  38.08 s |    2,626 /s   |   24.0 ms (25,000 pts) |   188.2 ms (100,000 pts)  |
+
+### N = 1,000,000 writes, 4 tags
+
+| tool        | write    | write rate    | read 1 tag                | read all tags                 |
+|-------------|---------:|--------------:|--------------------------:|------------------------------:|
+| vibetrack   |  24.12 s |   41,465 /s   |   219.5 ms (250,000 pts)  |    952.5 ms (1,000,000 pts)   |
+| tensorboard |  31.72 s |   31,521 /s   | 11834.3 ms (250,000 pts)  |  12140.7 ms (1,000,000 pts)   |
+| mlflow      | 389.81 s |    2,565 /s   |  4300.0 ms (250,000 pts)  |  18942.3 ms (1,000,000 pts)   |
+
+## Charts
+
+Bars at N = 1,000,000 (the most representative scale). Render natively on GitHub.
+
+**Write throughput — higher is better**
+
+```mermaid
+---
+config:
+    xyChart:
+        width: 700
+        height: 320
+---
+xychart-beta
+    title "Scalars written per second (N=1M, 4 tags)"
+    x-axis ["vibetrack", "tensorboard", "mlflow"]
+    y-axis "writes/sec" 0 --> 50000
+    bar [41465, 31521, 2565]
+```
+
+**Read-all-tags latency — lower is better**
+
+```mermaid
+---
+config:
+    xyChart:
+        width: 700
+        height: 320
+---
+xychart-beta
+    title "Cold read of all 1M points (seconds)"
+    x-axis ["vibetrack", "tensorboard", "mlflow"]
+    y-axis "seconds" 0 --> 20
+    bar [0.95, 12.14, 18.94]
+```
+
+**Read-one-tag latency — lower is better**
+
+```mermaid
+---
+config:
+    xyChart:
+        width: 700
+        height: 320
+---
+xychart-beta
+    title "Cold read of a single tag (250K points, ms)"
+    x-axis ["vibetrack", "tensorboard", "mlflow"]
+    y-axis "milliseconds" 0 --> 12000
+    bar [219, 11834, 4300]
+```
+
+## Takeaways
+
+**Writes.** vibetrack sustains ~40 k scalars/s and is **~1.4× faster than TensorBoard**, **~16× faster than MLflow** across all scales. TensorBoard's bottleneck is protobuf serialization plus its async event-file writer; vibetrack batches into SQLite transactions. MLflow's `log_metric` writes one append per call to the file store, which doesn't amortize.
+
+**Reads.** vibetrack wins by 10–50× at 100K+. TensorBoard's `EventAccumulator.Reload()` parses and aggregates the entire event file before returning a single tag — that's the ~12 s ceiling at 1 M points regardless of which tag you ask for. vibetrack uses an indexed SQL query, so a single tag is much cheaper than reading everything. MLflow's file store is fast for small reads but degrades roughly linearly: 1 M points takes ~19 s.
+
+**MLflow caveats.** Numbers above use the default **file** backend (`./mlruns`). MLflow can be much faster *or* slower depending on configuration — `mlflow.log_metrics(dict, step=...)` (one bulk call per step) closes much of the write-rate gap, and the SQLite tracking backend is actually ~10× **slower** than the file store on this workload due to per-call SQLAlchemy + autocommit overhead. The file backend is also flagged deprecated as of February 2026.
+
+**Variance.** Single runs. On this box, repeats were stable to within a few percent.
+
+## How to reproduce
+
+The commands below assume the embedded source is being run as `bench_scalars.py`.
+
+```bash
+# default sweep — 1k, 100k, 1M for all three tools, MLflow file backend
+python bench_scalars.py
+
+# fast smoke test
+python bench_scalars.py --scales 1000
+
+# switch MLflow to its SQLite backend
+python bench_scalars.py --mlflow-backend sqlite
+
+# write JSON + markdown
+python bench_scalars.py --out results.json --md results.md
+```
+
+## Caveats
+
+- "Cold read" reopens the store but the OS page cache is warm from the write — realistic for "load dashboard right after training," optimistic for "load it hours later."
+- TensorBoard writes go through its async `EventFileWriter` thread; we include `close()` in timings so the queue drains.
+- vibetrack's system-metrics collector is disabled in the bench (`system_metrics_interval=0`) so background sampling doesn't pollute timings.
+- Per-scalar API only (`add_scalar` / `log_metric`). Bulk APIs would change MLflow's numbers most of all.
+
+## Benchmark source
+
+```python
 """Reusable scalar-logging benchmark: vibetrack vs TensorBoard vs MLflow.
 
 Measures, per tool:
@@ -12,13 +141,13 @@ In-process only (no HTTP). MLflow uses the SQLite tracking backend.
 Usage::
 
     # quick smoke test
-    python benchmark/bench_scalars.py --scales 1000 --tools vibetrack tensorboard mlflow
+    python bench_scalars.py --scales 1000 --tools vibetrack tensorboard mlflow
 
     # full sweep (slow — MLflow at 1M takes several minutes)
-    python benchmark/bench_scalars.py --scales 1000 100000 1000000
+    python bench_scalars.py --scales 1000 100000 1000000
 
     # write JSON + markdown summary
-    python benchmark/bench_scalars.py --out bench.json --md bench.md
+    python bench_scalars.py --out bench.json --md bench.md
 """
 
 from __future__ import annotations
@@ -31,9 +160,9 @@ import shutil
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 
 @dataclass
@@ -66,9 +195,6 @@ def _tag_for(i: int, k: int) -> str:
     return f"metric_{i % k}"
 
 
-# ── vibetrack ─────────────────────────────────────────────────────
-
-
 def run_vibetrack(scratch: Path, n: int, k: int) -> BenchResult:
     from vibetrack import SummaryWriter
     from vibetrack.reader import RunReader
@@ -80,11 +206,10 @@ def run_vibetrack(scratch: Path, n: int, k: int) -> BenchResult:
         log_dir=str(project / "run1"),
         project_folder=str(project),
         name="bench",
-        system_metrics_interval=0,  # don't sample CPU/GPU mid-bench
+        system_metrics_interval=0,
     )
     gc.collect()
     t0 = time.perf_counter()
-    # per-tag step counters keep step monotonic per tag
     counters = [0] * k
     for i in range(n):
         idx = i % k
@@ -95,7 +220,6 @@ def run_vibetrack(scratch: Path, n: int, k: int) -> BenchResult:
 
     disk_bytes = _dir_size(project)
 
-    # Cold reader
     gc.collect()
     t0 = time.perf_counter()
     reader = RunReader(project_folder=str(project))
@@ -129,9 +253,6 @@ def run_vibetrack(scratch: Path, n: int, k: int) -> BenchResult:
     )
 
 
-# ── TensorBoard (torch.utils.tensorboard) ─────────────────────────
-
-
 def run_tensorboard(scratch: Path, n: int, k: int) -> BenchResult:
     from torch.utils.tensorboard import SummaryWriter as TBWriter
     from tensorboard.backend.event_processing.event_accumulator import (
@@ -154,9 +275,6 @@ def run_tensorboard(scratch: Path, n: int, k: int) -> BenchResult:
 
     disk_bytes = _dir_size(logdir)
 
-    # EventAccumulator caps stored points by default — bump generously so
-    # we actually compare reading "all" of them. Setting to 0 disables the
-    # cap; we mirror that by passing explicit huge limits.
     size_guidance = {
         "scalars": 0,
         "histograms": 1,
@@ -196,9 +314,6 @@ def run_tensorboard(scratch: Path, n: int, k: int) -> BenchResult:
     )
 
 
-# ── MLflow (SQLite backend) ───────────────────────────────────────
-
-
 def run_mlflow(scratch: Path, n: int, k: int, backend: str = "file") -> BenchResult:
     import mlflow
     from mlflow.tracking import MlflowClient
@@ -233,7 +348,6 @@ def run_mlflow(scratch: Path, n: int, k: int, backend: str = "file") -> BenchRes
 
     disk_bytes = _dir_size(root)
 
-    # Cold reader — fresh client + tracking URI
     gc.collect()
     mlflow.set_tracking_uri(tracking_uri)
     client = MlflowClient(tracking_uri=tracking_uri)
@@ -292,7 +406,7 @@ def render_markdown(results: List[BenchResult]) -> str:
     lines.append("# Scalar logging benchmark")
     lines.append("")
     lines.append(
-        "In-process scalar throughput across vibetrack, TensorBoard, and MLflow (SQLite backend). See `benchmark/bench_scalars.py`."
+        "In-process scalar throughput across vibetrack, TensorBoard, and MLflow."
     )
     lines.append("")
     by_scale: Dict[int, List[BenchResult]] = {}
@@ -311,9 +425,11 @@ def render_markdown(results: List[BenchResult]) -> str:
         )
         for r in rows:
             lines.append(
-                f"| {r.tool} | {r.write_seconds:.2f}s | {fmt_rate(r.points_written, r.write_seconds)} | "
+                f"| {r.tool} | {r.write_seconds:.2f}s | "
+                f"{fmt_rate(r.points_written, r.write_seconds)} | "
                 f"{fmt_bytes(r.disk_bytes)} | {r.read_one_tag_seconds*1000:.1f}ms "
-                f"({r.points_read_one:,} pts) | {r.read_all_tags_seconds*1000:.1f}ms "
+                f"({r.points_read_one:,} pts) | "
+                f"{r.read_all_tags_seconds*1000:.1f}ms "
                 f"({r.points_read_all:,} pts) |"
             )
         lines.append("")
@@ -390,9 +506,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     continue
                 results.append(r)
                 print(
-                    f"    write {r.write_seconds:.2f}s ({fmt_rate(r.points_written, r.write_seconds)})  "
+                    f"    write {r.write_seconds:.2f}s "
+                    f"({fmt_rate(r.points_written, r.write_seconds)})  "
                     f"disk {fmt_bytes(r.disk_bytes)}  "
-                    f"read1 {r.read_one_tag_seconds*1000:.1f}ms  readall {r.read_all_tags_seconds*1000:.1f}ms",
+                    f"read1 {r.read_one_tag_seconds*1000:.1f}ms  "
+                    f"readall {r.read_all_tags_seconds*1000:.1f}ms",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -414,3 +532,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+```

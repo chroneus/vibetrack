@@ -256,8 +256,8 @@ Tabs are data-driven; Settings is always shown:
 
 ## Benchmarks
 
-`benchmark/bench_scalars.py` runs the scalar throughput benchmark used in
-`benchmark/BENCHMARK.md`. vibetrack sustains ~40k scalars/s and reads back 10–50×
+`docs/BENCHMARK.md` includes the scalar throughput benchmark source and results.
+vibetrack sustains ~40k scalars/s and reads back 10–50×
 faster than TensorBoard at 1 M points.
 
 ## Development

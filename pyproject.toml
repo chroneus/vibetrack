@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibetrack"
-version = "0.1a0"
-description = "Lightweight experiment tracking — drop-in compatible with TensorBoard and W&B APIs."
+version = "0.1.0"
+description = "Modern experiment tracking — drop-in compatible with TensorBoard and W&B APIs."
 readme = "README.md"
 authors = [
   { name = "Sergei Chicherin", email = "serenkiy@ieee.org" },
@@ -26,7 +26,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-media = ["numpy", "Pillow"]
 telegram = ["python-telegram-bot>=20.0"]
 all = [
     "fastapi>=0.100.0",

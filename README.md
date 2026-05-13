@@ -1,15 +1,21 @@
 # vibetrack
 
-Lightweight experiment tracking.
+Modern experiment tracking.
+
+![vibetrack showcase](docs/showcase.gif)
 
 Key features:
-    Send experiment results to elsewhere: Telegram/Slack/Jupyter/Gradio/MCP
-    Run locally but could receive experiment data over network via REST API. 
-    Open formats: store experiment data in sqlite and local files. 
-    Image2image comparison. 
-    Rich UI.
-    TensorBoard-compatible logging APIs
-    MCP server with results
+
+- Send experiment results elsewhere: Telegram, Slack, Jupyter, Gradio, and MCP.
+- Run locally while receiving experiment data over the network via REST API.
+- Use open formats: experiment data is stored in SQLite and local files.
+- Compare image-to-image results.
+- Use a rich UI to show, hide, delete, and customize runs.
+- TensorBoard SummaryWriter compatible drop-in APIs.
+- Query results through the MCP server.
+- Fast scalar logging; see the [benchmark report](docs/BENCHMARK.md).
+
+
 
 
 
@@ -33,37 +39,27 @@ for step in range(100):
     writer.add_scalar("acc", step / 100, step)
 writer.close()
 ```
-
-### Module-level API
-
-```python
-import vibetrack
-
-vibetrack.init(project="my_project", name="run_1", config={"lr": 0.01, "epochs": 50})
-for step in range(100):
-    vibetrack.log({"loss": 1.0 / (step + 1), "acc": step / 100})
-vibetrack.finish()
-```
+See [API.md](docs/API.md) for SummaryWriter and module-level logging examples.
 
 ### Launch the dashboard
 
 ```bash
-vibetrack
-# -> Web UI on http://0.0.0.0:6116
+vibetrack --listen 0.0.0.0:6116
+# -> Web UI on http://you_server:6116
 # -> MCP is also mounted when installed with vibetrack[all] on Python 3.10+
 ```
 
-### Viewers and destinations
+### Viewers and destinations syntax
 
 ```python
-from vibetrack import SummaryWriter
 
 writer = SummaryWriter("runs/exp1", project_folder="my_project")
 writer.to("console").to("slack", every="15m")
+writer.to("remote", url="http://server:8080", token="devtoken")
 writer.add_scalar("loss", 0.5, step=0).to("telegram")
 ```
 
-See [VIEWERS.md](VIEWERS.md) for web, console, Slack, Telegram, Gradio,
+See [VIEWERS.md](docs/VIEWERS.md) for web, console, Slack, Telegram, Gradio,
 Jupyter, custom viewers, remote forwarding, credentials, and HTTP ingest.
 
 # vibetrack Architecture
@@ -138,110 +134,92 @@ flowchart TB
 ```
 
 
-## API reference
+# FAQ
 
-### SummaryWriter
+## How do I collect results from another server?
+
+Run a vibetrack ingest server on the machine that should receive results:
+
+```bash
+vibetrack --listen 0.0.0.0:8080 --token devtoken --project-folder /srv/runs
+```
+
+Then forward events from the training machine:
 
 ```python
 from vibetrack import SummaryWriter
 
-writer = SummaryWriter("runs/exp1", name="experiment_name", project_folder="project/")
-
-# Scalars
-writer.add_scalar("loss", 0.5, step=0)
-writer.add_scalars("metrics", {"train_loss": 0.5, "val_loss": 0.6}, step=0)
-
-# Images — accepts file paths, numpy arrays, or PIL Images
-writer.add_image("samples", "path/to/image.png", step=0)
-
-# Audio — accepts file paths or numpy waveforms
-writer.add_audio("speech", waveform_array, step=0, sample_rate=16000)
-
-# Video
-writer.add_video("rollout", "path/to/video.mp4", step=0)
-
-# Artifacts — any file with optional metadata
-writer.add_artifact("checkpoint", "model.pt", step=0, metadata={"val_acc": 0.95})
-
-# Text
-writer.add_text("notes", "Training started with lr=0.01", step=0)
-
-# Histograms
-writer.add_histogram("weights", weight_tensor, step=0)
-
-# Hyperparameters
-writer.add_hparams({"lr": 0.01, "batch_size": 32}, {"best_acc": 0.95})
-
-writer.close()
+writer = SummaryWriter("runs/exp1", project_folder="my_project")
+writer.to("remote", url="http://server:8080", token="devtoken")
 ```
 
-### Module-level logging API
+See [VIEWERS.md](docs/VIEWERS.md#remote-event-forwarding) for remote forwarding
+and direct HTTP ingest.
+
+## How do I use separate databases on one machine?
+
+By default, vibetrack writes to `~/.vibetrack/vibetrack.db`. Pass
+`project_folder` to keep a separate `vibetrack.db` inside that project folder.
 
 ```python
-import vibetrack
-from vibetrack import Image, Audio, Video, Artifact
+from vibetrack import SummaryWriter
 
-vibetrack.init(project="nlp", name="bert-finetune", config={"lr": 3e-5})
-
-# Log scalars
-vibetrack.log({"loss": 0.3, "acc": 0.92})
-
-# Log media with wrapper types
-vibetrack.log({"sample": Image("output.png")})
-vibetrack.log({"audio": Audio("clip.wav", sample_rate=22050)})
-vibetrack.log({"demo": Video("result.mp4")})
-vibetrack.log({"model": Artifact("best_model.pt", metadata={"epoch": 10})})
-
-# Access config
-vibetrack.config["lr"]  # 3e-5
-
-vibetrack.finish()
+writer = SummaryWriter("runs/exp1", project_folder="projects/cv")
 ```
 
-## Distributed training (torchrun)
-
-vibetrack automatically detects `RANK` / `LOCAL_RANK` environment variables. Only rank 0 logs data — all other ranks get a silent no-op writer.
+Open that database in the dashboard with the same folder:
 
 ```bash
-torchrun --nproc_per_node=4 --nnodes=2 train.py
+vibetrack --project-folder projects/cv
 ```
 
+## How does vibetrack work with distributed training?
+
+vibetrack automatically detects `RANK` / `LOCAL_RANK`. Only rank 0 logs by
+default; other ranks get a silent no-op writer.
+
 ```python
-# train.py — no code changes needed
 from vibetrack import SummaryWriter
 
 writer = SummaryWriter("runs/distributed", project_folder="project/")
-# Only rank 0 writes to the database. Other ranks silently skip.
 writer.add_scalar("loss", loss.item(), step)
 writer.close()
 ```
 
-Force all ranks to log:
+To force every rank to log, pass `rank="all"`:
 
 ```python
 writer = SummaryWriter("runs/distributed", rank="all")
 ```
 
-## System metrics
+## Can vibetrack collect system resources?
 
-Built-in collection of CPU, GPU, memory, and disk metrics. Runs in a background thread.
+Yes. vibetrack can collect CPU, GPU, memory, and project disk metrics in a
+background thread.
 
 ```python
-writer = SummaryWriter("runs/exp1", system_metrics_interval=3600)  # every hour (default)
+writer = SummaryWriter("runs/exp1", system_metrics_interval=3600)  # every hour
 ```
 
-Collected metrics: `system/cpu_percent`, `system/mem_used_gb`, `system/disk_free_gb`, `gpu/utilization`, `gpu/memory_used_gb`, `gpu/temperature`, and automatic alerts when resources are critically low.
+Collected metrics include `system/cpu_percent`, `system/mem_used_gb`,
+`system/disk_free_gb`, `gpu/utilization`, `gpu/memory_used_gb`, and
+`gpu/temperature`. Use `system_metrics_interval=0` to disable collection.
 
-## MCP server
+## How do I run the MCP server for an LLM agent?
 
-MCP lets LLM apps query experiment data and compact metric/image analysis tools.
-See [MCP.md](MCP.md) for tools, resources, standalone server usage, and the LLM
-demo.
-
-## CLI
+Install MCP dependencies, then run the standalone MCP server:
 
 ```bash
-vibetrack                           # default  
+pip install vibetrack[all]
+vibetrack --viewer mcp --project-folder my_project/
+```
+
+See [MCP.md](docs/MCP.md) for MCP endpoints, tools, resources, and agent usage.
+
+## What CLI commands are available?
+
+```bash
+vibetrack                           # default
 vibetrack [PROJECT_FOLDER]          # Launch dashboard (web + ingest; MCP with vibetrack[all] on Python 3.10+)
 vibetrack --port 8080               # Custom port
 vibetrack --token SECRET            # Protect ingest endpoints
@@ -249,9 +227,10 @@ vibetrack --listen 0.0.0.0:9009     # Open server on separate port
 vibetrack migrate PROJECT_FOLDER    # Merge legacy per-run DBs into project DB
 ```
 
-## Configuration
+## How is vibetrack configured?
 
-Settings are stored in `~/.vibetrack/config.json` (global) or per-project via the API:
+Settings are stored in `~/.vibetrack/config.json`. The web UI can also write
+project-scoped settings through its Settings tab.
 
 ```json
 {

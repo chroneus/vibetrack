@@ -13,11 +13,12 @@ Requirements:
     pip install vibetrack[all] numpy httpx
 
 Example with Ollama:
-    ollama pull llama3.1
+    ollama pull qwen3-coder:30b
     LLM_BASE_URL=http://127.0.0.1:11434/v1 \
     LLM_API_KEY=ollama \
-    LLM_MODEL=llama3.1 \
+    LLM_MODEL=qwen3-coder:30b \
     python examples/arch_search_mcp.py
+
 
 Example with OpenAI:
     LLM_BASE_URL=https://api.openai.com/v1 \
@@ -38,7 +39,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import numpy as np
@@ -51,9 +53,15 @@ MCP_URL = f"http://127.0.0.1:{MCP_PORT}/mcp"
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://127.0.0.1:11434/v1").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama3.1")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen3-coder:30b")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 LLM_MAX_TURNS = int(os.getenv("LLM_MAX_TURNS", "12"))
+LLM_UNLOAD_ON_EXIT = os.getenv("LLM_UNLOAD_ON_EXIT", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 
 ARCHITECTURES = [
@@ -78,6 +86,8 @@ Decide which run is best for production. Focus on validation loss, convergence
 speed, and parameter count. Mention the evidence you used. Keep the answer
 under 220 words.
 """
+
+REQUIRED_MCP_TOOLS = ("list_experiments", "compare_scalar", "analyze_scalar", "get_hparams")
 
 
 def relu(x: np.ndarray) -> np.ndarray:
@@ -137,6 +147,36 @@ def train(cfg: Dict[str, Any], epochs: int = 260) -> List[tuple[int, float, floa
 def parameter_count(layers: Iterable[int]) -> int:
     sizes = [1] + list(layers) + [1]
     return sum(a * b + b for a, b in zip(sizes, sizes[1:]))
+
+
+def validation_scorecard_text() -> str:
+    """Compact deterministic fallback context for models that over-call tools."""
+    rows = []
+    for cfg in ARCHITECTURES:
+        history = train(cfg)
+        best_epoch, _best_train, best_val = min(history, key=lambda row: row[2])
+        final_epoch, _final_train, final_val = history[-1]
+        rows.append(
+            {
+                "name": cfg["name"],
+                "params": parameter_count(cfg["layers"]),
+                "best_epoch": best_epoch,
+                "best_val": best_val,
+                "final_epoch": final_epoch,
+                "final_val": final_val,
+            }
+        )
+
+    rows.sort(key=lambda row: row["final_val"])
+    lines = ["Validation scorecard; lower loss/val is better:"]
+    for row in rows:
+        lines.append(
+            f"- {row['name']}: final={row['final_val']:.5f} "
+            f"at epoch {row['final_epoch']}, best={row['best_val']:.5f} "
+            f"at epoch {row['best_epoch']}, params={row['params']}"
+        )
+    lines.append(f"Lowest final loss/val: {rows[0]['name']}.")
+    return "\n".join(lines)
 
 
 def seed_experiments() -> None:
@@ -233,6 +273,38 @@ def tool_result_text(result: Any) -> str:
     return "\n".join(parts)
 
 
+def ollama_base_url() -> Optional[str]:
+    parsed = urlsplit(LLM_BASE_URL)
+    if not parsed.scheme or not parsed.netloc:
+        return None
+    hostname = parsed.hostname or ""
+    is_ollama = LLM_API_KEY == "ollama" or parsed.port == 11434 or "ollama" in hostname
+    if not is_ollama:
+        return None
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def unload_ollama_model() -> None:
+    if not LLM_UNLOAD_ON_EXIT:
+        return
+    base_url = ollama_base_url()
+    if not base_url:
+        return
+
+    print(f"4. Unloading Ollama model: {LLM_MODEL}")
+    try:
+        response = httpx.post(
+            f"{base_url}/api/generate",
+            json={"model": LLM_MODEL, "prompt": "", "stream": False, "keep_alive": 0},
+            timeout=30,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"   warning: could not unload Ollama model: {exc}")
+    else:
+        print("   unloaded\n")
+
+
 async def list_mcp_tools(session: Any) -> List[Dict[str, Any]]:
     result = await session.list_tools()
     tools = []
@@ -254,18 +326,20 @@ async def list_mcp_tools(session: Any) -> List[Dict[str, Any]]:
 async def chat_completion(
     client: httpx.AsyncClient,
     messages: List[Dict[str, Any]],
-    tools: List[Dict[str, Any]],
+    tools: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "temperature": LLM_TEMPERATURE,
+    }
+    if tools:
+        payload.update({"tools": tools, "tool_choice": "auto"})
+
     response = await client.post(
         f"{LLM_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-        json={
-            "model": LLM_MODEL,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-            "temperature": LLM_TEMPERATURE,
-        },
+        json=payload,
         timeout=120,
     )
     response.raise_for_status()
@@ -302,18 +376,47 @@ async def ask_llm_via_mcp() -> None:
             ]
 
             async with httpx.AsyncClient() as client:
+                used_tools: List[str] = []
                 for _ in range(LLM_MAX_TURNS):
                     message = await chat_completion(client, messages, tools)
                     messages.append(message)
                     tool_calls = message.get("tool_calls") or []
+                    missing_tools = [
+                        name for name in REQUIRED_MCP_TOOLS if name not in used_tools
+                    ]
 
                     if not tool_calls:
-                        print("=== LLM recommendation ===")
-                        print(message.get("content", "").strip())
-                        return
+                        content = (message.get("content") or "").strip()
+                        if missing_tools:
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Continue with the required MCP tool calls before "
+                                        f"the final recommendation. Still missing: "
+                                        f"{', '.join(missing_tools)}."
+                                    ),
+                                }
+                            )
+                            continue
+                        if content:
+                            print("=== LLM recommendation ===")
+                            print(content)
+                            return
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Your previous response was empty. Provide the final "
+                                    "recommendation in plain text using the tool results."
+                                ),
+                            }
+                        )
+                        continue
 
                     for call in tool_calls:
                         name = call["function"]["name"]
+                        used_tools.append(name)
                         raw_args = call["function"].get("arguments") or {}
                         if isinstance(raw_args, str):
                             try:
@@ -332,7 +435,25 @@ async def ask_llm_via_mcp() -> None:
                             }
                         )
 
-            raise RuntimeError("LLM did not finish within LLM_MAX_TURNS")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Stop calling tools now. Based only on the MCP tool "
+                            "results already in this conversation, give the final "
+                            "production recommendation in under 220 words.\n\n"
+                            f"{validation_scorecard_text()}"
+                        ),
+                    }
+                )
+                message = await chat_completion(client, messages)
+                content = (message.get("content") or "").strip()
+                if content:
+                    print("=== LLM recommendation ===")
+                    print(content)
+                    return
+
+            raise RuntimeError("LLM did not provide a final recommendation")
 
 
 def main() -> None:
@@ -344,6 +465,7 @@ def main() -> None:
         proc.terminate()
         with contextlib.suppress(Exception):
             proc.wait(timeout=5)
+        unload_ollama_model()
         print("\nDone.")
 
 

@@ -1,19 +1,19 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibetrack"
 version = "0.1.0"
-description = "Modern experiment tracking — drop-in compatible with TensorBoard and W&B APIs."
+description = "Modern experiment tracking — drop-in compatible with TensorBoard SummaryWriter."
 readme = "README.md"
 authors = [
   { name = "Sergei Chicherin", email = "serenkiy@ieee.org" },
 ]
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]

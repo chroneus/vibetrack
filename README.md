@@ -2,7 +2,7 @@
 
 Modern experiment tracking.
 
-![vibetrack showcase](docs/showcase.gif)
+![vibetrack showcase](https://raw.githubusercontent.com/chroneus/vibetrack/main/docs/showcase.gif)
 
 Key features:
 
@@ -13,7 +13,7 @@ Key features:
 - Use a rich UI to show, hide, delete, and customize runs.
 - TensorBoard SummaryWriter compatible drop-in APIs.
 - Query results through the MCP server.
-- Fast scalar logging; see the [benchmark report](docs/BENCHMARK.md).
+- Fast scalar logging; see the [benchmark report](https://github.com/chroneus/vibetrack/blob/main/docs/BENCHMARK.md).
 
 
 
@@ -39,7 +39,7 @@ for step in range(100):
     writer.add_scalar("acc", step / 100, step)
 writer.close()
 ```
-See [API.md](docs/API.md) for SummaryWriter and module-level logging examples.
+See [API.md](https://github.com/chroneus/vibetrack/blob/main/docs/API.md) for SummaryWriter and module-level logging examples.
 
 ### Launch the dashboard
 
@@ -59,7 +59,7 @@ writer.to("remote", url="http://server:8080", token="devtoken")
 writer.add_scalar("loss", 0.5, step=0).to("telegram")
 ```
 
-See [VIEWERS.md](docs/VIEWERS.md) for web, console, Slack, Telegram, Gradio,
+See [VIEWERS.md](https://github.com/chroneus/vibetrack/blob/main/docs/VIEWERS.md) for web, console, Slack, Telegram, Gradio,
 Jupyter, custom viewers, remote forwarding, credentials, and HTTP ingest.
 
 # vibetrack Architecture
@@ -153,7 +153,7 @@ writer = SummaryWriter("runs/exp1", project_folder="my_project")
 writer.to("remote", url="http://server:8080", token="devtoken")
 ```
 
-See [VIEWERS.md](docs/VIEWERS.md#remote-event-forwarding) for remote forwarding
+See [VIEWERS.md](https://github.com/chroneus/vibetrack/blob/main/docs/VIEWERS.md#remote-event-forwarding) for remote forwarding
 and direct HTTP ingest.
 
 ## How do I use separate databases on one machine?
@@ -214,7 +214,7 @@ pip install vibetrack[all]
 vibetrack --viewer mcp --project-folder my_project/
 ```
 
-See [MCP.md](docs/MCP.md) for MCP endpoints, tools, resources, and agent usage.
+See [MCP.md](https://github.com/chroneus/vibetrack/blob/main/docs/MCP.md) for MCP endpoints, tools, resources, and agent usage.
 
 ## What CLI commands are available?
 

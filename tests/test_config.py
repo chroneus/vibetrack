@@ -36,7 +36,7 @@ class TestDefaults:
         assert cfg["web"]["auto_refresh"] == 5
         assert cfg["web"]["raw_scalar_opacity"] == 0.17
         assert cfg["web"]["x_axis_mode"] == "step"
-        assert cfg["gradio"]["share"] is False
+        assert cfg["gradio"]["share"] is True
 
 
 class TestSaveAndLoad:
@@ -67,7 +67,7 @@ class TestSaveAndLoad:
         assert loaded["smooth_weight"] == 0.6
         assert loaded["web"]["theme"] == "light"
         assert loaded["web"]["raw_scalar_opacity"] == 0.17
-        assert loaded["gradio"]["share"] is False
+        assert loaded["gradio"]["share"] is True
 
     def test_viewer_specific_section(self, tmp_path):
         save_config(

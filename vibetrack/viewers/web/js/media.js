@@ -34,9 +34,13 @@ function _imgUpdateCompareToolbar() {
 
 function _imgClearSelection() {
   _imgCompareSelection.forEach(s => {
-    if (s.cellEl) s.cellEl.classList.remove('img-selected');
-    const cb = s.cellEl && s.cellEl.querySelector('.img-select-cb');
+    if (!s.cellEl) return;
+    s.cellEl.classList.remove('img-selected');
+    const cb = s.cellEl.querySelector('.img-select-cb');
     if (cb) cb.checked = false;
+    const badge = s.cellEl.querySelector('.img-pin-badge');
+    if (badge) badge.remove();
+    if (s.cellEl._unpinFn) s.cellEl._unpinFn();
   });
   _imgCompareSelection.length = 0;
   _imgUpdateCompareToolbar();
@@ -48,6 +52,13 @@ function _imgToggleSelect(exp, tag, step, path, cellEl, checked) {
     if (idx === -1 && _imgCompareSelection.length < 6) {
       _imgCompareSelection.push({ exp, tag, step, path, cellEl });
       cellEl.classList.add('img-selected');
+      let badge = cellEl.querySelector('.img-pin-badge');
+      if (!badge) {
+        badge = document.createElement('div');
+        badge.className = 'img-pin-badge';
+        cellEl.appendChild(badge);
+      }
+      badge.textContent = 'step ' + step;
     } else if (idx === -1) {
       // At limit
       const cb = cellEl.querySelector('.img-select-cb');
@@ -58,6 +69,9 @@ function _imgToggleSelect(exp, tag, step, path, cellEl, checked) {
     if (idx !== -1) {
       _imgCompareSelection.splice(idx, 1);
       cellEl.classList.remove('img-selected');
+      const badge = cellEl.querySelector('.img-pin-badge');
+      if (badge) badge.remove();
+      if (cellEl._unpinFn) cellEl._unpinFn();
     }
   }
   _imgUpdateCompareToolbar();
@@ -74,8 +88,8 @@ function _imgOpenCompare() {
   const ov = document.createElement('div'); ov.className = 'fs-overlay';
   ov.innerHTML = '<div class="fs-header"><h2>Image Comparison</h2><div class="fs-header-right">' +
     '<div class="cmp-mode-bar">' +
-    '<button data-mode="slider" class="active">Slider</button>' +
-    '<button data-mode="toggle">Toggle</button>' +
+    '<button data-mode="toggle" class="active">Toggle</button>' +
+    '<button data-mode="slider">Slider</button>' +
     '<button data-mode="magnifier">Magnifier</button>' +
     '<button data-mode="blend">Blend</button></div>' +
     '<div class="cmp-zoom-bar" title="Zoom (click % to reset)">' +
@@ -106,7 +120,7 @@ function _imgOpenCompare() {
 
   const body = ov.querySelector('.fs-body');
   let activePair = 0;
-  let activeMode = 'slider';
+  let activeMode = 'toggle';
   let toggleSide = 0; // 0 = first image, 1 = second
 
   // Mode switcher
@@ -373,6 +387,7 @@ function _imgBuildAnimate(container, entries, tag) {
     cells[exp] = img;
     cellEls[exp] = cell;
     placeholders[exp] = placeholder;
+    cell._unpinFn = () => renderFrame(parseInt(slider.value));
     img.style.cursor = 'pointer';
     img.addEventListener('click', () => {
       const step = steps[parseInt(slider.value)];
@@ -391,34 +406,19 @@ function _imgBuildAnimate(container, entries, tag) {
     stepLabel.textContent = 'Step ' + step + ' / ' + steps[steps.length - 1];
     slider.value = idx;
     expNames.forEach(exp => {
+      // Cells pinned in compare selection stay frozen at their chosen step.
+      if (_imgCompareSelection.some(s => s.cellEl === cellEls[exp])) return;
       const path = byExp[exp][step];
       if (path) {
         cells[exp].src = mediaUrl(path);
         cells[exp].style.display = '';
         placeholders[exp].style.display = 'none';
       } else {
-        // Drop the previous src so the browser doesn't keep a frame buffered
-        // (and avoids a broken-img icon flash on the next paint).
         cells[exp].removeAttribute('src');
         cells[exp].style.display = 'none';
         placeholders[exp].style.display = '';
         const msg = placeholders[exp].querySelector('.img-placeholder-msg');
         if (msg) msg.textContent = 'no frame @ step ' + step;
-      }
-      // Update selection metadata to current step
-      const si = _imgCompareSelection.findIndex(s => s.cellEl === cellEls[exp]);
-      if (si !== -1) {
-        if (path) {
-          _imgCompareSelection[si].step = step;
-          _imgCompareSelection[si].path = path;
-        } else {
-          // Image not available at this step, deselect
-          _imgCompareSelection.splice(si, 1);
-          cellEls[exp].classList.remove('img-selected');
-          const cb = cellEls[exp].querySelector('.img-select-cb');
-          if (cb) cb.checked = false;
-          _imgUpdateCompareToolbar();
-        }
       }
     });
   }

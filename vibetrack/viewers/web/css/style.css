@@ -630,6 +630,21 @@
       border-radius: 4px;
     }
 
+    .img-pin-badge {
+      position: absolute;
+      bottom: 28px;
+      left: 6px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.72em;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 3px;
+      pointer-events: none;
+      z-index: 3;
+      opacity: 0.92;
+    }
+
     .video-label {
       display: flex;
       align-items: center;

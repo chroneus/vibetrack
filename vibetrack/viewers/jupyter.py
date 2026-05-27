@@ -52,16 +52,19 @@ class JupyterOutput(BaseOutput):
 
     def show(self, **kwargs: Any) -> None:
         """Start server (if needed) and render in the calling cell."""
-        host         = kwargs.get("host",         self._host)
-        port         = kwargs.get("port",         self._port)
-        height       = kwargs.get("height",       self._height)
+        host = kwargs.get("host", self._host)
+        port = kwargs.get("port", self._port)
+        height = kwargs.get("height", self._height)
         display_mode = kwargs.get("display_mode", self._display_mode)
 
         if not self._is_notebook():
             from .web import WebOutput
+
             web = WebOutput(self.project_folder, project=self.project)
             effective_port = port or 6116
-            print(f"vibetrack jupyter: not in a notebook — starting web server at http://{host}:{effective_port}")
+            print(
+                f"vibetrack jupyter: not in a notebook — starting web server at http://{host}:{effective_port}"
+            )
             web._serve_uvicorn(None, host, effective_port, token=None)
             return
 
@@ -117,6 +120,7 @@ class JupyterOutput(BaseOutput):
         self._server_url = f"http://{host}:{port}"
 
         from .web import WebOutput
+
         web = WebOutput(self.project_folder, project=self.project)
         self._server_thread = web.start_in_thread(host=host, port=port)
 
@@ -129,7 +133,9 @@ class JupyterOutput(BaseOutput):
             except OSError:
                 time.sleep(0.1)
 
-    def _render(self, height: Optional[int] = None, display_mode: Optional[str] = None) -> None:
+    def _render(
+        self, height: Optional[int] = None, display_mode: Optional[str] = None
+    ) -> None:
         if height is None:
             height = self._height
         if display_mode is None:

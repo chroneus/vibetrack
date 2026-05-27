@@ -30,12 +30,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib import error as _urlerr
 from urllib import request as _urlreq
 
+from ..types import MEDIA_KINDS as _MEDIA_KINDS
 from .base import BaseOutput
 from .event import LogEvent
 
 _log = logging.getLogger(__name__)
 
-_MEDIA_KINDS = ("image", "audio", "video", "artifact")
 _LOG_KINDS = ("scalar", "text", "histogram")
 
 
@@ -63,7 +63,9 @@ class RemoteOutput(BaseOutput):
         if not events or self._degraded:
             return
         if not self.url:
-            self._fail("RemoteOutput: no url set; pass url=… to .to() or set VIBETRACK_REMOTE_URL")
+            self._fail(
+                "RemoteOutput: no url set; pass url=… to .to() or set VIBETRACK_REMOTE_URL"
+            )
             return
 
         log_groups: Dict[Tuple[str, Optional[int]], Dict[str, Dict[str, Any]]] = {}

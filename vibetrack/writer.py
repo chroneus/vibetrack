@@ -6,6 +6,7 @@ Also supports dict-style log() calls via the module-level API.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -27,6 +28,8 @@ from .viewers.event import (
     NullEventHandle,
     null_handle,
 )
+
+_log = logging.getLogger(__name__)
 
 _DEFAULT_LOGDIR = "runs"
 
@@ -785,8 +788,16 @@ class SummaryWriter:
                 project=self._project,
                 **creds,
             )
-        except TypeError:
-            # Fall back for adapters that don't accept project/project_folder kwargs
+        except TypeError as type_exc:
+            # Fall back for adapters that don't accept project/project_folder
+            # kwargs. Log the original signature mismatch so a later failure
+            # in the fallback path is debuggable.
+            _log.debug(
+                "load adapter %r: signature mismatch on first attempt: %s — "
+                "retrying without project kwargs",
+                name,
+                type_exc,
+            )
             try:
                 adapter = adapter_cls(**creds)  # type: ignore[assignment]
             except Exception as exc:
@@ -804,11 +815,16 @@ class SummaryWriter:
         return self
 
     def _get_executor(self) -> ThreadPoolExecutor:
+        # Lazy init is guarded by ``_dispatch_lock`` so concurrent flushers
+        # (e.g. the flush timer and a user thread) can't each create their
+        # own executor and orphan one of them.
         if self._dispatch_executor is None:
-            self._dispatch_executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix=f"vibetrack-dispatch-{self._run_name}",
-            )
+            with self._dispatch_lock:
+                if self._dispatch_executor is None:
+                    self._dispatch_executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix=f"vibetrack-dispatch-{self._run_name}",
+                    )
         return self._dispatch_executor
 
     def _emit(self, event: LogEvent) -> None:
@@ -2070,10 +2086,26 @@ class SummaryWriter:
     # ── Lifecycle ───────────────────────────────────────────────
 
     def _flush_locked(self) -> None:
-        """Flush buffer. Caller must hold _buffer_lock."""
-        if self._db is not None and self._scalar_buffer:
-            self._db.add_scalars_bulk(self._scalar_buffer)
-            self._scalar_buffer.clear()
+        """Flush buffer. Caller must hold ``_buffer_lock``.
+
+        The buffer is detached **before** the DB write so that a failing
+        write cannot pin the same batch and force it to be retried (and
+        re-fail) forever. On exception, the rows are dropped and the
+        error is propagated to the caller's error handler; ``_db`` may
+        be in a degraded state but new scalars can continue to buffer.
+        """
+        if self._db is None or not self._scalar_buffer:
+            return
+        batch = self._scalar_buffer
+        self._scalar_buffer = []
+        try:
+            self._db.add_scalars_bulk(batch)
+        except Exception:
+            _log.warning(
+                "vibetrack: dropping %d buffered scalars after DB write failure",
+                len(batch),
+            )
+            raise
 
     def _start_flush_timer(self) -> None:
         if self._flush_secs <= 0 or self._closed or not self._enabled:
@@ -2216,16 +2248,22 @@ class SummaryWriter:
             self._pending_config = None
 
     def _on_precache_flush(self, id_remap: Dict[int, int]) -> None:
-        """Called by Database after precache materializes to remap IDs."""
-        # Remap pending ID if resolution hasn't happened yet
-        if self._pending and self._pending_existing_id in id_remap:
-            self._pending_existing_id = id_remap[self._pending_existing_id]
-        old_id = self._exp_id
-        if old_id in id_remap:
-            new_id = id_remap[old_id]
-            self._exp_id = new_id
-            # Remap any buffered scalars that haven't been flushed yet
-            with self._buffer_lock:
+        """Called by Database after precache materializes to remap IDs.
+
+        All mutations happen under ``_buffer_lock`` so a concurrent
+        ``add_scalar()`` cannot observe a half-updated ``_exp_id`` and
+        append a row under the obsolete in-memory ID (which would be
+        silently dropped on the next flush).
+        """
+        with self._buffer_lock:
+            # Remap pending ID if resolution hasn't happened yet
+            if self._pending and self._pending_existing_id in id_remap:
+                self._pending_existing_id = id_remap[self._pending_existing_id]
+            old_id = self._exp_id
+            if old_id in id_remap:
+                new_id = id_remap[old_id]
+                self._exp_id = new_id
+                # Remap any buffered scalars that haven't been flushed yet
                 self._scalar_buffer = [
                     (new_id if r[0] == old_id else r[0], r[1], r[2], r[3], r[4])
                     for r in self._scalar_buffer

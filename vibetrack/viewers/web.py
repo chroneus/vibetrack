@@ -14,6 +14,7 @@ string placeholders (``__DATA_JSON__``, ``__PROJECT_JSON__``, ``__PROJECTS_JSON_
 replaced at render time.
 """
 
+import collections
 import functools
 import hmac
 import json
@@ -21,10 +22,12 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 from ..compare import find_all_tags  # noqa: F401  (re-exported for tests)
 from ..config import load_config, save_config
@@ -35,6 +38,67 @@ _WEB_DIR = Path(__file__).parent / "web"
 _INDEX_PATH = _WEB_DIR / "index.html"
 
 _SYSTEM_PREFIXES = ("system/", "gpu/")
+
+# In-process rate limiter for state-mutating endpoints. 10 requests per
+# second per source IP is generous for a human clicking buttons but
+# stops a script from wiping a project in a tight loop.
+_MUTATION_RATE_WINDOW_SEC = 1.0
+_MUTATION_RATE_LIMIT = 10
+_mutation_rate_lock = threading.Lock()
+_mutation_rate_state: Dict[str, Deque[float]] = collections.defaultdict(
+    collections.deque
+)
+
+
+def _rate_limit_mutation(client_ip: str) -> bool:
+    """Return ``True`` if *client_ip* is allowed another mutation.
+
+    Sliding-window: any caller exceeding ``_MUTATION_RATE_LIMIT`` requests
+    within ``_MUTATION_RATE_WINDOW_SEC`` is throttled.
+    """
+    now = time.monotonic()
+    cutoff = now - _MUTATION_RATE_WINDOW_SEC
+    with _mutation_rate_lock:
+        bucket = _mutation_rate_state[client_ip]
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= _MUTATION_RATE_LIMIT:
+            return False
+        bucket.append(now)
+        return True
+
+
+def _client_ip(request: Any) -> str:
+    """Best-effort client IP for rate limiting (no spoofing protection)."""
+    client = getattr(request, "client", None)
+    if client is not None and getattr(client, "host", None):
+        return str(client.host)
+    return "unknown"
+
+
+def _is_same_origin(request: Any, allowed_host: str) -> bool:
+    """Check that Origin/Referer (if present) match the bound host.
+
+    Browsers send ``Origin`` on cross-origin POST/DELETE; a missing
+    header is treated as same-origin (curl, server-side scripts). When
+    present, the host portion must match the server's bound host —
+    that's enough to block CSRF from another page in the same browser.
+    """
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if not origin:
+        return True
+    try:
+        parsed_host = urlparse(origin).hostname or ""
+    except ValueError:
+        return False
+    if not parsed_host:
+        return False
+    # Treat any loopback variant as equivalent — uvicorn binds 127.0.0.1
+    # but the browser may navigate via "localhost".
+    loopbacks = {"localhost", "127.0.0.1", "::1"}
+    if parsed_host in loopbacks and allowed_host in loopbacks:
+        return True
+    return parsed_host == allowed_host
 
 
 @functools.lru_cache(maxsize=1)
@@ -113,6 +177,10 @@ def _resolve_media_path(log_dir: str, rel_path: str) -> str:
 
 def _scalar_series(exp: ExperimentReader, tag: str) -> Dict[str, list]:
     rows = exp.scalars(tag)
+    return _scalar_series_from_rows(rows)
+
+
+def _scalar_series_from_rows(rows: List[Dict[str, Any]]) -> Dict[str, list]:
     return {
         "steps": [r["step"] for r in rows],
         "values": [r["value"] for r in rows],
@@ -226,36 +294,51 @@ def _embedding_payload(
 
 
 def _serialize_experiment(exp: ExperimentReader) -> Dict[str, Any]:
-    """Build the JSON-ready dict for a single experiment."""
+    """Build the JSON-ready dict for a single experiment.
+
+    All per-media data is fetched with a single SQL query per kind via
+    the ``ExperimentReader.all_*`` bulk loaders, instead of one query
+    per tag — eliminating the N+1 pattern that scaled badly with the
+    number of tags.
+    """
     log_dir = exp.log_dir
 
-    all_tags = exp.scalar_tags()
+    all_scalar_data = exp.all_scalars()
+    all_tags = sorted(all_scalar_data.keys())
     regular_tags = [t for t in all_tags if not t.startswith(_SYSTEM_PREFIXES)]
     system_tags = [t for t in all_tags if t.startswith(_SYSTEM_PREFIXES)]
-    scalars = {tag: _scalar_series(exp, tag) for tag in regular_tags}
-    system_scalars = {tag: _scalar_series(exp, tag) for tag in system_tags}
+    scalars = {
+        tag: _scalar_series_from_rows(all_scalar_data[tag]) for tag in regular_tags
+    }
+    system_scalars = {
+        tag: _scalar_series_from_rows(all_scalar_data[tag]) for tag in system_tags
+    }
 
     images = {
         tag: [
             {"step": r["step"], "path": _resolve_media_path(log_dir, r["path"])}
-            for r in exp.images(tag)
+            for r in rows
         ]
-        for tag in exp.image_tags()
+        for tag, rows in exp.all_images().items()
     }
     audio_data = {
         tag: [
             {"step": r["step"], "path": _resolve_media_path(log_dir, r["path"])}
-            for r in exp.audio(tag)
+            for r in rows
         ]
-        for tag in exp.audio_tags()
+        for tag, rows in exp.all_audio().items()
     }
     video_data = {
         tag: [
             {"step": r["step"], "path": _resolve_media_path(log_dir, r["path"])}
-            for r in exp.video(tag)
+            for r in rows
         ]
-        for tag in exp.video_tags()
+        for tag, rows in exp.all_video().items()
     }
+    # all_artifacts() returns parsed metadata dicts; _serialize_experiment
+    # historically downstreamed raw JSON strings, so keep both forms in
+    # the dict (``metadata`` for the parsed object, used by _is_kind).
+    raw_artifacts_parsed = exp.all_artifacts()
     raw_artifacts = {
         tag: [
             {
@@ -263,9 +346,9 @@ def _serialize_experiment(exp: ExperimentReader) -> Dict[str, Any]:
                 "path": _resolve_media_path(log_dir, r["path"]),
                 "metadata": r["metadata"],
             }
-            for r in exp.artifacts(tag)
+            for r in rows
         ]
-        for tag in exp.artifact_tags()
+        for tag, rows in raw_artifacts_parsed.items()
     }
 
     def _is_kind(item: Dict[str, Any], *kinds: str) -> bool:
@@ -344,15 +427,14 @@ def _serialize_experiment(exp: ExperimentReader) -> Dict[str, Any]:
         if leftover:
             artifacts[tag] = leftover
     text_data = {
-        tag: [{"step": r["step"], "value": r["value"]} for r in exp.texts(tag)]
-        for tag in exp.text_tags()
+        tag: [{"step": r["step"], "value": r["value"]} for r in rows]
+        for tag, rows in exp.all_texts().items()
     }
     histogram_data = {
         tag: [
-            {"step": r["step"], "bins": r["bins"], "counts": r["counts"]}
-            for r in exp.histograms(tag)
+            {"step": r["step"], "bins": r["bins"], "counts": r["counts"]} for r in rows
         ]
-        for tag in exp.histogram_tags()
+        for tag, rows in exp.all_histograms().items()
     }
 
     return {
@@ -644,9 +726,49 @@ class WebOutput(BaseOutput):
             db = self._reader._db
             return [p for p in (db.list_projects() if db else []) if p]
 
+        # ── Auth / CSRF / rate-limit dependencies ─────────────
+        # Defined here (before any route decorator) so they're in scope
+        # when ``@app.get(..., dependencies=[Depends(_check_token)])``
+        # decorators are evaluated at module import time.
+
+        async def _check_token(request: Request) -> None:
+            """Bearer-token auth used on every route when a token is set.
+
+            When ``token`` is ``None`` (the default), no auth is enforced
+            — preserving the localhost-only convenience for dev use. When
+            ``token`` is supplied (typically with a non-loopback host),
+            *all* routes require it, not just ingest. Constant-time
+            comparison prevents a timing oracle.
+            """
+            if not token:
+                return
+            auth = request.headers.get("Authorization", "")
+            if not hmac.compare_digest(auth, f"Bearer {token}"):
+                raise HTTPException(status_code=401, detail="unauthorized")
+
+        # Back-compat alias for ingest routes that previously used a
+        # separate dependency name.
+        _check_listen_auth = _check_token
+
+        async def _check_mutation(request: Request) -> None:
+            """Auth + CSRF + rate-limit gate for state-mutating endpoints.
+
+            Layered defenses:
+              1. Bearer token (when configured) — primary auth.
+              2. Origin/Referer match — blocks CSRF from a same-browser
+                 page on a different origin even when no token is set.
+              3. Per-IP sliding-window rate limit — caps damage from a
+                 runaway loop or buggy client.
+            """
+            await _check_token(request)
+            if not _is_same_origin(request, host):
+                raise HTTPException(status_code=403, detail="cross-origin denied")
+            if not _rate_limit_mutation(_client_ip(request)):
+                raise HTTPException(status_code=429, detail="rate limit exceeded")
+
         # ── Index / data ──────────────────────────────────────
 
-        @app.get("/")
+        @app.get("/", dependencies=[Depends(_check_token)])
         def index() -> HTMLResponse:
             if is_central and self.project is None:
                 projects = _all_projects()
@@ -681,38 +803,38 @@ class WebOutput(BaseOutput):
             data = _build_data(self._resolve_experiments(experiments))
             return HTMLResponse(_render(data, None, []))
 
-        @app.get("/api/data")
+        @app.get("/api/data", dependencies=[Depends(_check_token)])
         def api_data() -> list:
             return _build_data(self._resolve_experiments(experiments))
 
-        @app.get("/api/data/{project}")
+        @app.get("/api/data/{project}", dependencies=[Depends(_check_token)])
         def api_data_project(project: str) -> Any:
             db = self._reader._db
             if db is None or not db.list_experiments(project=project):
                 return JSONResponse({"error": "not found"}, status_code=404)
             return _build_data(_experiments_for_project(db, project))
 
-        @app.get("/api/projects")
+        @app.get("/api/projects", dependencies=[Depends(_check_token)])
         def api_projects() -> List[str]:
             return _all_projects()
 
         # ── Config ────────────────────────────────────────────
 
-        @app.get("/api/config")
+        @app.get("/api/config", dependencies=[Depends(_check_token)])
         def get_config() -> dict:
             return load_config(project=config_project)
 
-        @app.get("/api/config/{project}")
+        @app.get("/api/config/{project}", dependencies=[Depends(_check_token)])
         def get_config_project(project: str) -> dict:
             return load_config(project=project)
 
-        @app.post("/api/config")
+        @app.post("/api/config", dependencies=[Depends(_check_mutation)])
         async def set_config(request: Request) -> dict:
             data = await request.json()
             save_config(data, project=config_project)
             return load_config(project=config_project)
 
-        @app.post("/api/config/{project}")
+        @app.post("/api/config/{project}", dependencies=[Depends(_check_mutation)])
         async def set_config_project(request: Request, project: str) -> dict:
             data = await request.json()
             save_config(data, project=project)
@@ -720,7 +842,7 @@ class WebOutput(BaseOutput):
 
         # ── Rename / delete / move ────────────────────────────
 
-        @app.post("/api/rename")
+        @app.post("/api/rename", dependencies=[Depends(_check_mutation)])
         async def rename_exp(request: Request) -> JSONResponse:
             body = await request.json()
             project = body.get("project") or self._reader.project
@@ -732,7 +854,7 @@ class WebOutput(BaseOutput):
             )
             return JSONResponse(data, status_code=status)
 
-        @app.post("/api/rename/{project}")
+        @app.post("/api/rename/{project}", dependencies=[Depends(_check_mutation)])
         async def rename_exp_project(request: Request, project: str) -> JSONResponse:
             body = await request.json()
             data, status = _handle_rename(
@@ -743,7 +865,7 @@ class WebOutput(BaseOutput):
             )
             return JSONResponse(data, status_code=status)
 
-        @app.delete("/api/experiment")
+        @app.delete("/api/experiment", dependencies=[Depends(_check_mutation)])
         async def delete_exp(request: Request) -> JSONResponse:
             body = await request.json()
             project = body.get("project") or self._reader.project
@@ -754,7 +876,7 @@ class WebOutput(BaseOutput):
             )
             return JSONResponse(data, status_code=status)
 
-        @app.delete("/api/project/{project}")
+        @app.delete("/api/project/{project}", dependencies=[Depends(_check_mutation)])
         def delete_project(project: str) -> JSONResponse:
             db = self._reader._db
             if db is None:
@@ -769,7 +891,7 @@ class WebOutput(BaseOutput):
                     _cleanup_experiment_files(str(log_dir))
             return JSONResponse({"ok": True})
 
-        @app.post("/api/move-logdir")
+        @app.post("/api/move-logdir", dependencies=[Depends(_check_mutation)])
         async def move_logdir(request: Request) -> JSONResponse:
             body = await request.json()
             data, status = _handle_move_logdir(
@@ -781,7 +903,7 @@ class WebOutput(BaseOutput):
 
         # ── Media ─────────────────────────────────────────────
 
-        @app.get("/media")
+        @app.get("/media", dependencies=[Depends(_check_token)])
         def serve_media(path: str = ""):  # type: ignore[no-untyped-def]
             """Serve media files by absolute path."""
             if not path:
@@ -819,12 +941,6 @@ class WebOutput(BaseOutput):
                 system_metrics_interval=0,
                 resume=True,
             )
-
-        async def _check_listen_auth(request: Request):
-            if token:
-                auth = request.headers.get("Authorization", "")
-                if not hmac.compare_digest(auth, f"Bearer {token}"):
-                    raise HTTPException(status_code=401, detail="unauthorized")
 
         @app.post("/{project}/listen/log")
         async def listen_log(
@@ -922,7 +1038,7 @@ class WebOutput(BaseOutput):
         # ── Project-scoped index (must be registered last so fixed
         #     paths above take precedence over ``/{project}``) ──
 
-        @app.get("/{project}")
+        @app.get("/{project}", dependencies=[Depends(_check_token)])
         def project_index(project: str) -> HTMLResponse:
             db = self._reader._db
             if db is None:

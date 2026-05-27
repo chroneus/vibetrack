@@ -556,7 +556,14 @@ class MCPOutput(BaseOutput):
 
     def _build_mcp(self) -> Any:
         """Build the FastMCP instance (deferred so host/port can be set first)."""
-        from mcp.server.fastmcp import FastMCP
+        try:
+            from mcp.server.fastmcp import FastMCP
+        except ImportError as exc:
+            raise ImportError(
+                "The MCP viewer requires the optional `mcp` package "
+                "(Python 3.10+). Install it with: "
+                "pip install 'vibetrack[mcp]'"
+            ) from exc
 
         mcp = FastMCP("vibetrack", **self._mcp_kwargs)
         self._mcp = mcp

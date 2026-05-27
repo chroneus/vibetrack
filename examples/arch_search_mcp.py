@@ -87,7 +87,12 @@ speed, and parameter count. Mention the evidence you used. Keep the answer
 under 220 words.
 """
 
-REQUIRED_MCP_TOOLS = ("list_experiments", "compare_scalar", "analyze_scalar", "get_hparams")
+REQUIRED_MCP_TOOLS = (
+    "list_experiments",
+    "compare_scalar",
+    "analyze_scalar",
+    "get_hparams",
+)
 
 
 def relu(x: np.ndarray) -> np.ndarray:

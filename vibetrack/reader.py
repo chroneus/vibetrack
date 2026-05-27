@@ -3,11 +3,32 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .db import Database, central_db_path
+
+_log = logging.getLogger(__name__)
+
+
+def _load_artifact_json(abs_path: str) -> Dict[str, Any]:
+    """Load a JSON artifact, logging (rather than swallowing) read errors.
+
+    Returns the parsed payload, or ``{}`` if the file is missing or
+    malformed. A ``WARNING`` is emitted with the failing path and
+    exception so corrupted artifacts are visible in logs instead of
+    presenting as silently-empty data.
+    """
+    if not abs_path:
+        return {}
+    try:
+        with open(abs_path, "rb") as fh:
+            return json.loads(fh.read())
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        _log.warning("vibetrack reader: failed to load artifact %s: %s", abs_path, exc)
+        return {}
 
 
 class ExperimentReader:
@@ -216,13 +237,7 @@ class ExperimentReader:
         """Per-step PR-curve payloads with parsed precision/recall points."""
         out: List[Dict[str, Any]] = []
         for r in self.artifacts(tag):
-            payload: Dict[str, Any] = {}
-            try:
-                if r["abs_path"]:
-                    with open(r["abs_path"], "rb") as fh:
-                        payload = json.loads(fh.read())
-            except (OSError, json.JSONDecodeError):
-                payload = {}
+            payload = _load_artifact_json(r["abs_path"])
             out.append(
                 {
                     "step": r["step"],
@@ -269,13 +284,7 @@ class ExperimentReader:
         """Per-step mesh payloads with parsed vertices / colors / faces."""
         out: List[Dict[str, Any]] = []
         for r in self.artifacts(tag):
-            payload: Dict[str, Any] = {}
-            try:
-                if r["abs_path"]:
-                    with open(r["abs_path"], "rb") as fh:
-                        payload = json.loads(fh.read())
-            except (OSError, json.JSONDecodeError):
-                payload = {}
+            payload = _load_artifact_json(r["abs_path"])
             out.append(
                 {
                     "step": r["step"],
@@ -306,13 +315,7 @@ class ExperimentReader:
         """
         out: List[Dict[str, Any]] = []
         for r in self.artifacts(tag):
-            payload: Dict[str, Any] = {}
-            try:
-                if r["abs_path"]:
-                    with open(r["abs_path"], "rb") as fh:
-                        payload = json.loads(fh.read())
-            except (OSError, json.JSONDecodeError):
-                payload = {}
+            payload = _load_artifact_json(r["abs_path"])
             meta = r.get("metadata") or {}
             sprite_rel = meta.get("sprite_path")
             sprite_abs = self.resolve_media_path(sprite_rel) if sprite_rel else None
@@ -342,6 +345,64 @@ class ExperimentReader:
 
     def histogram_tags(self) -> List[str]:
         return self._db.get_histogram_tags(self.experiment_id)
+
+    # ── Bulk loaders (single-query equivalents of the per-tag methods) ──
+    #
+    # These eliminate the N+1 query pattern used by the web/console
+    # viewers: a single SQL ``SELECT * WHERE experiment_id=?`` per kind,
+    # grouped by tag in Python. For an experiment with many tags this
+    # turns dozens of DB round-trips into one.
+
+    def all_scalars(self) -> Dict[str, List[Dict[str, Any]]]:
+        """All scalar tags → rows for this experiment, in a single query."""
+        return self._db.get_all_scalars(self.experiment_id)
+
+    def all_texts(self) -> Dict[str, List[Dict[str, Any]]]:
+        return self._db.get_all_texts(self.experiment_id)
+
+    def all_images(self) -> Dict[str, List[Dict[str, Any]]]:
+        """All image tags → rows, with ``abs_path`` resolved per row."""
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for tag, rows in self._db.get_all_images(self.experiment_id).items():
+            out[tag] = [
+                {**r, "abs_path": self.resolve_media_path(r["path"])} for r in rows
+            ]
+        return out
+
+    def all_audio(self) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for tag, rows in self._db.get_all_audio(self.experiment_id).items():
+            out[tag] = [
+                {**r, "abs_path": self.resolve_media_path(r["path"])} for r in rows
+            ]
+        return out
+
+    def all_video(self) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for tag, rows in self._db.get_all_video(self.experiment_id).items():
+            out[tag] = [
+                {**r, "abs_path": self.resolve_media_path(r["path"])} for r in rows
+            ]
+        return out
+
+    def all_artifacts(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Artifact tags → rows, with metadata parsed and ``abs_path`` resolved."""
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for tag, rows in self._db.get_all_artifacts(self.experiment_id).items():
+            out[tag] = [
+                {
+                    "step": r["step"],
+                    "path": r["path"],
+                    "abs_path": self.resolve_media_path(r["path"]),
+                    "metadata": json.loads(r["metadata"]) if r["metadata"] else {},
+                    "wall_time": r["wall_time"],
+                }
+                for r in rows
+            ]
+        return out
+
+    def all_histograms(self) -> Dict[str, List[Dict[str, Any]]]:
+        return self._db.get_all_histograms(self.experiment_id)
 
     def hparams(self) -> Dict[str, Any]:
         return self._db.get_hparams(self.experiment_id)

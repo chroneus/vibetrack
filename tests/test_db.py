@@ -315,7 +315,12 @@ class TestPrecache:
         db.close()
 
     def test_timeout_triggers_flush(self, tmp_path):
-        """After precache_secs expires, timer should materialize the DB."""
+        """After precache_secs expires, timer should materialize the DB.
+
+        Uses ``wait_for_materialize`` (an internal event) rather than a
+        fixed ``time.sleep`` — eliminates the race window on loaded CI
+        machines without slowing the happy path.
+        """
         db_path = tmp_path / "timeout.db"
         db = Database(db_path, precache_secs=0.3)
 
@@ -323,7 +328,7 @@ class TestPrecache:
         db.add_scalar(exp_id, "loss", 0.5, 0)
 
         assert not db_path.exists()
-        time.sleep(0.8)
+        assert db.wait_for_materialize(timeout=5.0), "materialization timed out"
         assert db_path.exists()
 
         db2 = Database(db_path)
@@ -385,8 +390,9 @@ class TestPrecache:
         rows = [(exp_id, "loss", i, float(i), t) for i in range(200)]
         db.add_scalars_bulk(rows)
 
-        # Sleep until just after timer fires, then immediately close
-        time.sleep(0.2)
+        # Wait until the timer has materialized, then immediately close.
+        # Deterministic wait instead of fixed-duration sleep.
+        assert db.wait_for_materialize(timeout=5.0), "materialization timed out"
         db.close()
 
         db2 = Database(db_path)
@@ -396,3 +402,90 @@ class TestPrecache:
             len(result) == 200
         ), f"Expected 200 rows, got {len(result)} (possible duplication)"
         db2.close()
+
+
+class TestBulkLoaders:
+    """``get_all_*`` should return ``{tag: rows}`` in a single query."""
+
+    def test_get_all_scalars(self, tmp_path):
+        db_path = tmp_path / "bulk_scalars.db"
+        db = Database(db_path)
+        exp_id = db.create_experiment("run")
+        db.add_scalar(exp_id, "loss", 1.0, 0)
+        db.add_scalar(exp_id, "loss", 0.5, 1)
+        db.add_scalar(exp_id, "acc", 0.9, 0)
+        result = db.get_all_scalars(exp_id)
+        assert set(result) == {"loss", "acc"}
+        assert [r["step"] for r in result["loss"]] == [0, 1]
+        assert [r["value"] for r in result["loss"]] == [1.0, 0.5]
+        assert [r["value"] for r in result["acc"]] == [0.9]
+        db.close()
+
+    def test_get_all_images(self, tmp_path):
+        db_path = tmp_path / "bulk_images.db"
+        db = Database(db_path)
+        exp_id = db.create_experiment("run")
+        db.add_image(exp_id, "sample", "media/img_0.png", 0)
+        db.add_image(exp_id, "sample", "media/img_1.png", 1)
+        db.add_image(exp_id, "grid", "media/grid_0.png", 0)
+        result = db.get_all_images(exp_id)
+        assert set(result) == {"sample", "grid"}
+        assert len(result["sample"]) == 2
+        assert len(result["grid"]) == 1
+        db.close()
+
+    def test_get_all_scalars_precache(self, tmp_path):
+        """Bulk loader must also work when data is still in-memory."""
+        db_path = tmp_path / "bulk_precache.db"
+        db = Database(db_path, precache_secs=60)
+        exp_id = db.create_experiment("run")
+        for i in range(5):
+            db.add_scalar(exp_id, "loss", float(i), i)
+        result = db.get_all_scalars(exp_id)
+        assert set(result) == {"loss"}
+        assert len(result["loss"]) == 5
+        assert [r["step"] for r in result["loss"]] == [0, 1, 2, 3, 4]
+        db.close()
+
+
+class TestPrecacheFailureRecovery:
+    """If precache materialization raises, caches must be preserved."""
+
+    def test_materialize_failure_preserves_caches(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "fail.db"
+        db = Database(db_path, precache_secs=60)
+        exp_id = db.create_experiment("run")
+        db.add_scalar(exp_id, "loss", 1.0, 0)
+        db.add_scalar(exp_id, "loss", 2.0, 1)
+
+        # Force ``add_scalars_bulk`` to fail during the replay; this happens
+        # *after* the precache flag has flipped, so the failure path must
+        # restore it and keep the in-memory rows intact.
+        orig = db.add_scalars_bulk
+
+        call_count = {"n": 0}
+
+        def explode(rows):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("simulated DB failure")
+            return orig(rows)
+
+        monkeypatch.setattr(db, "add_scalars_bulk", explode)
+
+        with pytest.raises(RuntimeError, match="simulated DB failure"):
+            db._materialize()
+
+        # Cache should still hold the rows, ready for retry.
+        assert db._precache_active
+        assert len(db._cache_scalars) == 2
+        # And the read API still returns them via the cache path.
+        rows = db.get_scalars(exp_id, "loss")
+        assert len(rows) == 2
+        db.close()
+
+    def test_wait_for_materialize_immediate_non_precache(self, tmp_path):
+        db = Database(tmp_path / "imm.db", precache_secs=0)
+        # Non-precache DBs are "materialized" from the start.
+        assert db.wait_for_materialize(timeout=0.0)
+        db.close()

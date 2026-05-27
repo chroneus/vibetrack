@@ -300,8 +300,16 @@ class TestMCPOutput:
                 return self._series.get(tag, [])
 
         exps = [
-            Exp("baseline", 1, {"loss": [{"step": 0, "value": 4.0}, {"step": 1, "value": 2.0}]}),
-            Exp("candidate", 2, {"loss": [{"step": 0, "value": 4.0}, {"step": 1, "value": 1.5}]}),
+            Exp(
+                "baseline",
+                1,
+                {"loss": [{"step": 0, "value": 4.0}, {"step": 1, "value": 2.0}]},
+            ),
+            Exp(
+                "candidate",
+                2,
+                {"loss": [{"step": 0, "value": 4.0}, {"step": 1, "value": 1.5}]},
+            ),
             Exp("missing", 3, {}),
         ]
 
@@ -394,7 +402,9 @@ class TestNotificationCredentials:
     def isolated_config(self, tmp_path, monkeypatch):
         cfg_dir = tmp_path / "cfg"
         monkeypatch.setattr("vibetrack.config.config_dir", lambda: cfg_dir)
-        monkeypatch.setattr("vibetrack.config.config_path", lambda: cfg_dir / "config.json")
+        monkeypatch.setattr(
+            "vibetrack.config.config_path", lambda: cfg_dir / "config.json"
+        )
         return cfg_dir
 
     def test_telegram_can_opt_into_config_credentials(
@@ -714,9 +724,13 @@ class TestRemoteOutput:
             w.add_image("samples", str(img), 0)
 
         media_posts = [r for r in recorded if r["path"] == "/media"]
-        assert media_posts, f"expected /media POST, got paths={[r['path'] for r in recorded]}"
-        assert media_posts[0]["headers"].get("Content-Type", "").startswith(
-            "multipart/form-data"
+        assert (
+            media_posts
+        ), f"expected /media POST, got paths={[r['path'] for r in recorded]}"
+        assert (
+            media_posts[0]["headers"]
+            .get("Content-Type", "")
+            .startswith("multipart/form-data")
         )
         assert b'name="experiment"' in media_posts[0]["body"]
         assert b"r2" in media_posts[0]["body"]
@@ -730,7 +744,9 @@ class TestRemoteOutput:
             w.add_hparams({"lr": 0.01}, {"final_loss": 0.1})
 
         hp_posts = [r for r in recorded if r["path"] == "/hparams"]
-        assert hp_posts, f"expected /hparams POST, got paths={[r['path'] for r in recorded]}"
+        assert (
+            hp_posts
+        ), f"expected /hparams POST, got paths={[r['path'] for r in recorded]}"
         body = json.loads(hp_posts[0]["body"])
         assert body["experiment"] == "r3"
         assert body["hparams"] == {"lr": 0.01}

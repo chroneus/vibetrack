@@ -105,17 +105,26 @@ class ConsoleOutput(BaseOutput):
                 )
 
         # ── Media summary ─────────────────────────────────────────
+        # Bulk-load each media kind in a single query instead of one
+        # per tag (was N+1 — visibly slow with many tags).
         media_rows = []
         for exp in exps:
-            n_img = sum(len(exp.images(t)) for t in exp.image_tags())
-            n_aud = sum(len(exp.audio(t)) for t in exp.audio_tags())
-            n_vid = sum(len(exp.video(t)) for t in exp.video_tags())
+            all_imgs = exp.all_images()
+            all_aud = exp.all_audio()
+            all_vid = exp.all_video()
+            all_arts = exp.all_artifacts()
+            n_img = sum(len(v) for v in all_imgs.values())
+            n_aud = sum(len(v) for v in all_aud.values())
+            n_vid = sum(len(v) for v in all_vid.values())
             # Models and PR curves share the artifacts table but have their
             # own conceptual home — count separately so they don't get
             # silently lumped into "Artifacts".
             n_mod = len(exp.model_tags())
             n_pr = len(exp.pr_curve_tags())
-            n_art = sum(len(exp.artifacts(t)) for t in exp.user_artifact_tags())
+            user_art_set = set(exp.user_artifact_tags())
+            n_art = sum(
+                len(rows) for tag, rows in all_arts.items() if tag in user_art_set
+            )
             if n_img + n_aud + n_vid + n_art + n_mod + n_pr > 0:
                 media_rows.append((exp.name, n_img, n_aud, n_vid, n_art, n_mod, n_pr))
         if media_rows:
@@ -179,25 +188,31 @@ class ConsoleOutput(BaseOutput):
                     step = e["step"] if e["step"] is not None else "—"
                     lines.append(f"    step={step}: {body}")
 
-        n_img = sum(len(exp.images(t)) for t in exp.image_tags())
-        n_aud = sum(len(exp.audio(t)) for t in exp.audio_tags())
-        n_vid = sum(len(exp.video(t)) for t in exp.video_tags())
+        # Bulk-load each media kind in one query (was N+1 over tags).
+        all_imgs = exp.all_images()
+        all_aud = exp.all_audio()
+        all_vid = exp.all_video()
+        all_arts = exp.all_artifacts()
+        all_hist = exp.all_histograms()
         user_art_tags = exp.user_artifact_tags()
-        n_art = sum(len(exp.artifacts(t)) for t in user_art_tags)
         model_tags = exp.model_tags()
-        n_mod = sum(len(exp.models(t)) for t in model_tags)
         pr_tags = exp.pr_curve_tags()
-        n_pr = sum(len(exp.pr_curves(t)) for t in pr_tags)
-        n_hist = sum(len(exp.histograms(t)) for t in exp.histogram_tags())
+        n_img = sum(len(v) for v in all_imgs.values())
+        n_aud = sum(len(v) for v in all_aud.values())
+        n_vid = sum(len(v) for v in all_vid.values())
+        n_art = sum(len(all_arts.get(t, [])) for t in user_art_tags)
+        n_mod = sum(len(all_arts.get(t, [])) for t in model_tags)
+        n_pr = sum(len(all_arts.get(t, [])) for t in pr_tags)
+        n_hist = sum(len(v) for v in all_hist.values())
         if any((n_img, n_aud, n_vid, n_art, n_mod, n_pr, n_hist)):
             lines.append("")
             lines.append("Media:")
             if n_img:
-                lines.append(f"  images:     {n_img:>4}  tags={exp.image_tags()}")
+                lines.append(f"  images:     {n_img:>4}  tags={sorted(all_imgs)}")
             if n_aud:
-                lines.append(f"  audio:      {n_aud:>4}  tags={exp.audio_tags()}")
+                lines.append(f"  audio:      {n_aud:>4}  tags={sorted(all_aud)}")
             if n_vid:
-                lines.append(f"  video:      {n_vid:>4}  tags={exp.video_tags()}")
+                lines.append(f"  video:      {n_vid:>4}  tags={sorted(all_vid)}")
             if n_art:
                 lines.append(f"  artifacts:  {n_art:>4}  tags={user_art_tags}")
             if n_mod:
@@ -205,7 +220,7 @@ class ConsoleOutput(BaseOutput):
             if n_pr:
                 lines.append(f"  pr_curves:  {n_pr:>4}  tags={pr_tags}")
             if n_hist:
-                lines.append(f"  histograms: {n_hist:>4}  tags={exp.histogram_tags()}")
+                lines.append(f"  histograms: {n_hist:>4}  tags={sorted(all_hist)}")
 
         return "\n".join(lines)
 

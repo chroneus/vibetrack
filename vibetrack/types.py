@@ -16,6 +16,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+#: The set of ``LogEvent.kind`` values that carry an on-disk file payload.
+#: Centralized here so adapters (Slack, remote, etc.) don't drift apart.
+MEDIA_KINDS = ("image", "audio", "video", "artifact")
+
 
 class Image:
     """Wrapper for logging images via ``log()``.

@@ -23,6 +23,19 @@ from ._summary import format_metric as _format_metric
 from ._summary import render_scalar_chart_png as _render_chart_png
 from .base import BaseOutput
 
+
+def _import_telegram_bot() -> Any:
+    """Import ``telegram.Bot`` with a helpful error if the dep is missing."""
+    try:
+        from telegram import Bot
+    except ImportError as exc:
+        raise ImportError(
+            "The Telegram viewer requires the optional `python-telegram-bot` "
+            "package. Install it with: pip install 'vibetrack[telegram]'"
+        ) from exc
+    return Bot
+
+
 _log = logging.getLogger(__name__)
 
 
@@ -72,7 +85,7 @@ class TelegramOutput(BaseOutput):
             return
         import asyncio
 
-        from telegram import Bot
+        Bot = _import_telegram_bot()
 
         bot = Bot(token=self.token)
 
@@ -173,7 +186,7 @@ class TelegramOutput(BaseOutput):
         )
         import asyncio
 
-        from telegram import Bot
+        Bot = _import_telegram_bot()
 
         bot = Bot(token=self.token)
 

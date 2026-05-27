@@ -212,7 +212,9 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
         hparams = data.get("hparams") or {}
         metrics = data.get("metrics") or {}
         if not isinstance(hparams, dict) or not isinstance(metrics, dict):
-            raise HTTPException(status_code=400, detail="hparams/metrics must be objects")
+            raise HTTPException(
+                status_code=400, detail="hparams/metrics must be objects"
+            )
         project_name = data.get("project")
         writer = _new_writer(experiment, project_name)
         try:

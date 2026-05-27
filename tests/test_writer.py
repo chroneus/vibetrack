@@ -1211,3 +1211,49 @@ class TestResumeRestart:
         actual = {e.log_dir for e in reader.experiments()}
         assert actual == log_dirs
         reader.close()
+
+
+class TestWriteFailureRecovery:
+    """Writer must not get wedged when the DB layer raises."""
+
+    def test_flush_exception_clears_buffer(self, project_folder, monkeypatch):
+        """A failing ``add_scalars_bulk`` should detach rows so the next
+        flush sees an empty buffer, not the same failing batch."""
+        w = SummaryWriter(
+            str(project_folder / "run_a"),
+            name="run_a",
+            project_folder=str(project_folder),
+            system_metrics_interval=0,
+        )
+        try:
+            calls = {"n": 0}
+            orig = w._db.add_scalars_bulk
+
+            def boom(rows):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("simulated DB failure")
+                return orig(rows)
+
+            monkeypatch.setattr(w._db, "add_scalars_bulk", boom)
+
+            # First flush: writer's internal flush path will raise inside
+            # the dispatcher. We invoke ``_flush_locked`` directly to
+            # exercise the buffer-detach contract regardless of caller.
+            w.add_scalar("loss", 1.0, 0)
+            with pytest.raises(RuntimeError):
+                with w._buffer_lock:
+                    w._flush_locked()
+
+            # Buffer is now empty — the failing batch was dropped, not
+            # retried in a loop.
+            assert w._scalar_buffer == []
+
+            # Subsequent writes should work normally.
+            w.add_scalar("loss", 2.0, 1)
+            w.flush()
+            rows = w._db.get_scalars(w._exp_id, "loss")
+            assert len(rows) == 1
+            assert rows[0]["value"] == 2.0
+        finally:
+            w.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -10,6 +11,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+
+_log = logging.getLogger(__name__)
 
 _SCHEMA_VERSION = 3
 
@@ -144,7 +147,12 @@ class Database:
     def __init__(self, path: str | Path, precache_secs: float = 0) -> None:
         self.path = Path(path)
         self._local = threading.local()
-        self._lock = threading.Lock()
+        # ``RLock`` so ``_materialize`` (which acquires the lock) can be
+        # called re-entrantly from a code path that already holds it
+        # (e.g. ``_check_and_maybe_materialize``). Avoids the previous
+        # manual release/re-acquire pattern, which leaked the lock if
+        # the re-acquire ever failed.
+        self._lock = threading.RLock()
 
         # ── Precache state ──────────────────────────────────────
         self._precache_secs = precache_secs
@@ -155,6 +163,12 @@ class Database:
         self._precache_timer: Optional[threading.Timer] = None
         self._materializing = False
         self._remap_callbacks: List[Callable[[Dict[int, int]], None]] = []
+        # Set the moment materialization finishes (successfully or not).
+        # Tests can wait on this rather than polling with ``time.sleep``.
+        self._materialized_event = threading.Event()
+        if not self._precache_active:
+            # Non-precache databases are "materialized" immediately.
+            self._materialized_event.set()
 
         # In-memory caches (used only during precache)
         self._cache_experiments: List[Dict[str, Any]] = []
@@ -198,7 +212,13 @@ class Database:
         self._remap_callbacks.append(cb)
 
     def _materialize(self) -> None:
-        """Flush in-memory caches to SQLite and switch to direct mode."""
+        """Flush in-memory caches to SQLite and switch to direct mode.
+
+        If any replay step raises, the precache flag is restored so the
+        in-memory caches remain authoritative and the caller can retry,
+        rather than silently losing data. Remap callbacks fire only on
+        full success so writers don't switch over to a half-populated DB.
+        """
         with self._lock:
             if not self._precache_active:
                 return  # already materialized
@@ -208,110 +228,128 @@ class Database:
             with self._connect() as conn:
                 self._init_schema(conn)
 
-            # 2. Flip flag so replayed writes go to SQLite
-            self._precache_active = False
+            try:
+                # 2. Flip flag so replayed writes go to SQLite
+                self._precache_active = False
 
-            # 3. Replay experiments, build ID remap
-            id_remap: Dict[int, int] = {}
-            for exp in self._cache_experiments:
-                config = json.loads(exp["config"]) if exp["config"] else None
-                real_id = self.create_experiment(
-                    exp["name"],
-                    config,
-                    project=exp.get("project", ""),
-                    log_dir=exp.get("log_dir", ""),
-                )
-                id_remap[exp["id"]] = real_id
+                # 3. Replay experiments, build ID remap
+                id_remap: Dict[int, int] = {}
+                for exp in self._cache_experiments:
+                    config = json.loads(exp["config"]) if exp["config"] else None
+                    real_id = self.create_experiment(
+                        exp["name"],
+                        config,
+                        project=exp.get("project", ""),
+                        log_dir=exp.get("log_dir", ""),
+                    )
+                    id_remap[exp["id"]] = real_id
 
-            # 4. Replay scalars (bulk)
-            if self._cache_scalars:
-                remapped = [
-                    (id_remap.get(r[0], r[0]), r[1], r[2], r[3], r[4])
-                    for r in self._cache_scalars
-                ]
-                self.add_scalars_bulk(remapped)
+                # 4. Replay scalars (bulk)
+                if self._cache_scalars:
+                    remapped = [
+                        (id_remap.get(r[0], r[0]), r[1], r[2], r[3], r[4])
+                        for r in self._cache_scalars
+                    ]
+                    self.add_scalars_bulk(remapped)
 
-            # 5. Replay texts
-            for row in self._cache_texts:
-                self.add_text(
-                    id_remap.get(row[0], row[0]),
-                    row[1],
-                    row[3],
-                    row[2],
-                    row[4],
-                )
-
-            # 6. Replay images
-            for row in self._cache_images:
-                self.add_image(
-                    id_remap.get(row[0], row[0]),
-                    row[1],
-                    row[3],
-                    row[2],
-                    row[4],
-                )
-
-            # 7. Replay histograms (bins/counts already JSON strings)
-            for row in self._cache_histograms:
-                with self._connect() as conn:
-                    conn.execute(
-                        "INSERT INTO histograms"
-                        "(experiment_id, tag, step, bins, counts, wall_time) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            id_remap.get(row[0], row[0]),
-                            row[1],
-                            row[2],
-                            row[3],
-                            row[4],
-                            row[5],
-                        ),
+                # 5. Replay texts
+                for row in self._cache_texts:
+                    self.add_text(
+                        id_remap.get(row[0], row[0]),
+                        row[1],
+                        row[3],
+                        row[2],
+                        row[4],
                     )
 
-            # 8. Replay hparams (value already JSON string)
-            for row in self._cache_hparams:
-                with self._connect() as conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO hparams"
-                        "(experiment_id, key, value) VALUES (?, ?, ?)",
-                        (id_remap.get(row[0], row[0]), row[1], row[2]),
+                # 6. Replay images
+                for row in self._cache_images:
+                    self.add_image(
+                        id_remap.get(row[0], row[0]),
+                        row[1],
+                        row[3],
+                        row[2],
+                        row[4],
                     )
 
-            # 9. Replay audio
-            for row in self._cache_audio:
-                self.add_audio(
-                    id_remap.get(row[0], row[0]),
-                    row[1],
-                    row[3],
-                    row[2],
-                    row[4],
-                    row[5],
-                )
+                # 7. Replay histograms (bins/counts already JSON strings)
+                for row in self._cache_histograms:
+                    with self._connect() as conn:
+                        conn.execute(
+                            "INSERT INTO histograms"
+                            "(experiment_id, tag, step, bins, counts, wall_time) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                id_remap.get(row[0], row[0]),
+                                row[1],
+                                row[2],
+                                row[3],
+                                row[4],
+                                row[5],
+                            ),
+                        )
 
-            # 10. Replay video
-            for row in self._cache_video:
-                self.add_video(
-                    id_remap.get(row[0], row[0]),
-                    row[1],
-                    row[3],
-                    row[2],
-                    row[4],
-                )
+                # 8. Replay hparams (value already JSON string)
+                for row in self._cache_hparams:
+                    with self._connect() as conn:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO hparams"
+                            "(experiment_id, key, value) VALUES (?, ?, ?)",
+                            (id_remap.get(row[0], row[0]), row[1], row[2]),
+                        )
 
-            # 11. Replay artifacts
-            for row in self._cache_artifacts:
-                self.add_artifact(
-                    id_remap.get(row[0], row[0]),
-                    row[1],
-                    row[3],
-                    row[4],
-                    row[2],
-                    row[5],
-                )
+                # 9. Replay audio
+                for row in self._cache_audio:
+                    self.add_audio(
+                        id_remap.get(row[0], row[0]),
+                        row[1],
+                        row[3],
+                        row[2],
+                        row[4],
+                        row[5],
+                    )
 
-            # 12. Fire callbacks
+                # 10. Replay video
+                for row in self._cache_video:
+                    self.add_video(
+                        id_remap.get(row[0], row[0]),
+                        row[1],
+                        row[3],
+                        row[2],
+                        row[4],
+                    )
+
+                # 11. Replay artifacts
+                for row in self._cache_artifacts:
+                    self.add_artifact(
+                        id_remap.get(row[0], row[0]),
+                        row[1],
+                        row[3],
+                        row[4],
+                        row[2],
+                        row[5],
+                    )
+            except Exception:
+                # Restore precache flag so caches remain authoritative;
+                # the caller can retry materialization on the next write.
+                # NB: partial writes that did commit will remain in the DB
+                # (SQLite auto-commits per add_* call); a clean rollback
+                # would require unifying these calls under one explicit
+                # transaction, which is out of scope here.
+                self._precache_active = True
+                _log.exception(
+                    "vibetrack: precache materialization failed at %s; "
+                    "keeping in-memory caches for retry",
+                    self.path,
+                )
+                raise
+
+            # 12. Fire callbacks (only after successful materialize)
             for cb in self._remap_callbacks:
-                cb(id_remap)
+                try:
+                    cb(id_remap)
+                except Exception:
+                    _log.exception("vibetrack: precache remap callback %r failed", cb)
 
             # 13. Clear caches
             self._cache_experiments.clear()
@@ -324,21 +362,35 @@ class Database:
             self._cache_video.clear()
             self._cache_artifacts.clear()
 
+            # 14. Signal any waiters that materialization is complete.
+            self._materialized_event.set()
+
+    def wait_for_materialize(self, timeout: Optional[float] = None) -> bool:
+        """Block until precache materialization completes.
+
+        Returns ``True`` if the database is materialized (or was never in
+        precache mode), ``False`` if the timeout expired first. Intended
+        for tests so they don't have to poll with ``time.sleep``.
+        """
+        return self._materialized_event.wait(timeout)
+
     def _check_and_maybe_materialize(self) -> bool:
         """If precache deadline has passed, materialize. Must hold self._lock.
 
         Returns True if we just materialized (caller should use SQLite path).
+
+        ``_lock`` is an ``RLock``, so we can hold it across the call to
+        ``_materialize`` (which re-acquires it internally) without
+        manually releasing/re-acquiring.
         """
         if self._materializing:
             return not self._precache_active
         if time.time() >= self._precache_deadline:
             self._materializing = True
-            self._lock.release()
             try:
                 self._materialize()
             finally:
                 self._materializing = False
-                self._lock.acquire()
             return True
         return False
 
@@ -1440,6 +1492,177 @@ class Database:
                 ids,
             )
             return len(ids)
+
+    # ── Bulk get-all-by-experiment helpers ──────────────────────
+    #
+    # Each ``get_all_*`` returns ``Dict[tag, List[row]]`` in a *single*
+    # SQL query, replacing the N+1 pattern of ``for tag in get_*_tags():
+    # rows = get_*(tag)`` used by the web/console viewers. Precache mode
+    # is supported by grouping the in-memory cache instead of the DB.
+
+    def _group_cache_by_tag(
+        self,
+        cache: List[Tuple[Any, ...]],
+        experiment_id: int,
+        row_builder: Callable[[Tuple[Any, ...]], Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for r in cache:
+            if r[0] != experiment_id:
+                continue
+            out.setdefault(r[1], []).append(row_builder(r))
+        for tag in out:
+            out[tag].sort(key=lambda d: d["step"])
+        return out
+
+    def _group_rows_by_tag(self, rows: List[Any]) -> Dict[str, List[Dict[str, Any]]]:
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for r in rows:
+            d = dict(r)
+            tag = d.pop("tag")
+            out.setdefault(tag, []).append(d)
+        return out
+
+    def get_all_scalars(self, experiment_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if not self._check_and_maybe_materialize():
+                        return self._group_cache_by_tag(
+                            self._cache_scalars,
+                            experiment_id,
+                            lambda r: {"step": r[2], "value": r[3], "wall_time": r[4]},
+                        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag, step, value, wall_time FROM scalars "
+                "WHERE experiment_id=? ORDER BY tag, step",
+                (experiment_id,),
+            ).fetchall()
+            return self._group_rows_by_tag(rows)
+
+    def get_all_texts(self, experiment_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if not self._check_and_maybe_materialize():
+                        return self._group_cache_by_tag(
+                            self._cache_texts,
+                            experiment_id,
+                            lambda r: {"step": r[2], "value": r[3], "wall_time": r[4]},
+                        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag, step, value, wall_time FROM texts "
+                "WHERE experiment_id=? ORDER BY tag, step",
+                (experiment_id,),
+            ).fetchall()
+            return self._group_rows_by_tag(rows)
+
+    def get_all_images(self, experiment_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if not self._check_and_maybe_materialize():
+                        return self._group_cache_by_tag(
+                            self._cache_images,
+                            experiment_id,
+                            lambda r: {"step": r[2], "path": r[3], "wall_time": r[4]},
+                        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag, step, path, wall_time FROM images "
+                "WHERE experiment_id=? ORDER BY tag, step",
+                (experiment_id,),
+            ).fetchall()
+            return self._group_rows_by_tag(rows)
+
+    def get_all_audio(self, experiment_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if not self._check_and_maybe_materialize():
+                        return self._group_cache_by_tag(
+                            self._cache_audio,
+                            experiment_id,
+                            lambda r: {
+                                "step": r[2],
+                                "path": r[3],
+                                "sample_rate": r[4],
+                                "wall_time": r[5],
+                            },
+                        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag, step, path, sample_rate, wall_time FROM audio "
+                "WHERE experiment_id=? ORDER BY tag, step",
+                (experiment_id,),
+            ).fetchall()
+            return self._group_rows_by_tag(rows)
+
+    def get_all_video(self, experiment_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if not self._check_and_maybe_materialize():
+                        return self._group_cache_by_tag(
+                            self._cache_video,
+                            experiment_id,
+                            lambda r: {"step": r[2], "path": r[3], "wall_time": r[4]},
+                        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag, step, path, wall_time FROM video "
+                "WHERE experiment_id=? ORDER BY tag, step",
+                (experiment_id,),
+            ).fetchall()
+            return self._group_rows_by_tag(rows)
+
+    def get_all_artifacts(self, experiment_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if not self._check_and_maybe_materialize():
+                        return self._group_cache_by_tag(
+                            self._cache_artifacts,
+                            experiment_id,
+                            lambda r: {
+                                "step": r[2],
+                                "path": r[3],
+                                "metadata": r[4],
+                                "wall_time": r[5],
+                            },
+                        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag, step, path, metadata, wall_time FROM artifacts "
+                "WHERE experiment_id=? ORDER BY tag, step",
+                (experiment_id,),
+            ).fetchall()
+            return self._group_rows_by_tag(rows)
+
+    def get_all_histograms(self, experiment_id: int) -> Dict[str, List[Dict[str, Any]]]:
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active:
+                    if not self._check_and_maybe_materialize():
+                        return self._group_cache_by_tag(
+                            self._cache_histograms,
+                            experiment_id,
+                            lambda r: {
+                                "step": r[2],
+                                "bins": r[3],
+                                "counts": r[4],
+                                "wall_time": r[5],
+                            },
+                        )
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag, step, bins, counts, wall_time FROM histograms "
+                "WHERE experiment_id=? ORDER BY tag, step",
+                (experiment_id,),
+            ).fetchall()
+            return self._group_rows_by_tag(rows)
 
     # ── Cleanup ─────────────────────────────────────────────────
 

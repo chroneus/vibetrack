@@ -35,12 +35,12 @@ from urllib import parse as _urlparse
 from urllib import request as _urlreq
 
 from ..config import load_config
+from ..types import MEDIA_KINDS as _MEDIA_KINDS
 from .base import BaseOutput
 
 _log = logging.getLogger(__name__)
 
 _SLACK_API = "https://slack.com/api"
-_MEDIA_KINDS = ("image", "audio", "video", "artifact")
 
 
 class SlackOutput(BaseOutput):

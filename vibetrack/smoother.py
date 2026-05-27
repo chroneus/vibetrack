@@ -4,28 +4,23 @@ from __future__ import annotations
 
 import inspect
 import math
-from typing import List, Sequence
+from collections import deque
+from typing import Deque, List, Sequence
 
 
 def ema(
     values: Sequence[float],
     weight: float = 0.6,
 ) -> List[float]:
-    """Exponential moving average (TensorBoard-style).
+    """Exponential moving average (TensorBoard-style, debiased).
 
     ``weight`` in [0, 1) — 0 means no smoothing, close to 1 means heavy smoothing.
-    This matches TensorBoard's smoothing slider exactly.
+    This matches TensorBoard's smoothing slider exactly: a running
+    numerator/denominator pair de-biases the result so the very first
+    point is not dragged down toward zero.
     """
     if not values:
         return []
-    smoothed: List[float] = []
-    last = values[0]
-    for v in values:
-        # De-bias like TensorBoard: keep a running numerator/denominator
-        last = weight * last + (1 - weight) * v
-        smoothed.append(last)
-
-    # TensorBoard applies de-biasing
     debiased: List[float] = []
     num = 0.0
     den = 0.0
@@ -33,7 +28,6 @@ def ema(
         num = weight * num + (1 - weight) * v
         den = weight * den + (1 - weight)
         debiased.append(num / den)
-
     return debiased
 
 
@@ -46,19 +40,23 @@ def moving_average(
     Each output is the arithmetic mean of the last *window* inputs.
     For the first few points where fewer than *window* values are
     available, the mean is taken over whatever is available.
+
+    Memory is O(window) regardless of input length — the underlying
+    deque self-trims as values fall out of the sliding window.
     """
     if not values or window < 1:
         return list(values)
     result: List[float] = []
-    buf: List[float] = []
+    buf: Deque[float] = deque(maxlen=window)
     running_sum = 0.0
     for v in values:
+        if len(buf) == window:
+            # About to evict the oldest element — subtract it first so
+            # ``running_sum`` stays in sync with the deque contents.
+            running_sum -= buf[0]
         buf.append(v)
         running_sum += v
-        if len(buf) > window:
-            running_sum -= buf[-window - 1]
-        n = min(len(buf), window)
-        result.append(running_sum / n)
+        result.append(running_sum / len(buf))
     return result
 
 

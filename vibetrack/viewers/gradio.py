@@ -186,7 +186,7 @@ class GradioOutput(BaseOutput):
         return out
 
     @staticmethod
-    def _empty_run(event: Any) -> Dict[str, Any]:
+    def _run_template(event: Any) -> Dict[str, Any]:
         return {
             "name": getattr(event, "run_name", "run"),
             "project": getattr(event, "project", None) or "",
@@ -223,12 +223,12 @@ class GradioOutput(BaseOutput):
         }
 
     @staticmethod
-    def _append_unique(items: List[str], value: str) -> None:
+    def _add_tag_if_absent(items: List[str], value: str) -> None:
         if value not in items:
             items.append(value)
 
     @staticmethod
-    def _append_row_once(
+    def _add_row_if_absent(
         rows: List[Dict[str, Any]],
         row: Dict[str, Any],
         keys: Sequence[str],
@@ -243,10 +243,15 @@ class GradioOutput(BaseOutput):
         self, data: List[Dict[str, Any]], events: Sequence[Any]
     ) -> None:
         by_name = {run["name"]: run for run in data}
+        # Ephemeral O(1) lookup: ``(run_name, scalar_key, tag) → {step: idx}``.
+        # Built lazily on first access by walking the series once, then
+        # kept in sync as we append. Replaces a per-event O(n) ``index()``
+        # scan that turned a hot live-update path into O(n²).
+        scalar_indexes: Dict[Tuple[str, str, str], Dict[int, int]] = {}
         for event in events:
             run = by_name.get(event.run_name)
             if run is None:
-                run = self._empty_run(event)
+                run = self._run_template(event)
                 by_name[event.run_name] = run
                 data.append(run)
 
@@ -257,51 +262,57 @@ class GradioOutput(BaseOutput):
                     "system_scalars" if tag.startswith(_SYSTEM_PREFIXES) else "scalars"
                 )
                 tag_key = "system_tags" if tag.startswith(_SYSTEM_PREFIXES) else "tags"
-                self._append_unique(run[tag_key], tag)
+                self._add_tag_if_absent(run[tag_key], tag)
                 series = run[scalar_key].setdefault(
                     tag,
                     {"steps": [], "values": [], "wall_times": []},
                 )
-                if step in series["steps"]:
-                    idx = series["steps"].index(step)
-                    series["values"][idx] = event.value
-                    series["wall_times"][idx] = event.walltime
+                idx_key = (event.run_name, scalar_key, tag)
+                idx_map = scalar_indexes.get(idx_key)
+                if idx_map is None:
+                    idx_map = {s: i for i, s in enumerate(series["steps"])}
+                    scalar_indexes[idx_key] = idx_map
+                existing = idx_map.get(step)
+                if existing is not None:
+                    series["values"][existing] = event.value
+                    series["wall_times"][existing] = event.walltime
                     continue
+                idx_map[step] = len(series["steps"])
                 series["steps"].append(step)
                 series["values"].append(event.value)
                 series["wall_times"].append(event.walltime)
             elif event.kind == "image":
-                self._append_unique(run["image_tags"], tag)
-                self._append_row_once(
+                self._add_tag_if_absent(run["image_tags"], tag)
+                self._add_row_if_absent(
                     run["images"].setdefault(tag, []),
                     {"step": step, "path": event.value},
                     ("step", "path"),
                 )
             elif event.kind == "audio":
-                self._append_unique(run["audio_tags"], tag)
-                self._append_row_once(
+                self._add_tag_if_absent(run["audio_tags"], tag)
+                self._add_row_if_absent(
                     run["audio_data"].setdefault(tag, []),
                     {"step": step, "path": event.value},
                     ("step", "path"),
                 )
             elif event.kind == "video":
-                self._append_unique(run["video_tags"], tag)
-                self._append_row_once(
+                self._add_tag_if_absent(run["video_tags"], tag)
+                self._add_row_if_absent(
                     run["video_data"].setdefault(tag, []),
                     {"step": step, "path": event.value},
                     ("step", "path"),
                 )
             elif event.kind == "text":
-                self._append_unique(run["text_tags"], tag)
-                self._append_row_once(
+                self._add_tag_if_absent(run["text_tags"], tag)
+                self._add_row_if_absent(
                     run["text_data"].setdefault(tag, []),
                     {"step": step, "value": event.value},
                     ("step", "value"),
                 )
             elif event.kind == "histogram":
-                self._append_unique(run["histogram_tags"], tag)
+                self._add_tag_if_absent(run["histogram_tags"], tag)
                 value = event.value if isinstance(event.value, dict) else {}
-                self._append_row_once(
+                self._add_row_if_absent(
                     run["histogram_data"].setdefault(tag, []),
                     {
                         "step": step,
@@ -321,37 +332,37 @@ class GradioOutput(BaseOutput):
                 meta = dict((event.extra or {}).get("metadata") or {})
                 row = {"step": step, "path": event.value, "metadata": meta}
                 if event.kind == "figure":
-                    self._append_unique(run["figure_tags"], tag)
-                    self._append_row_once(
+                    self._add_tag_if_absent(run["figure_tags"], tag)
+                    self._add_row_if_absent(
                         run["figures"].setdefault(tag, []), row, ("step", "path")
                     )
                 elif event.kind == "graph":
-                    self._append_unique(run["model_tags"], tag)
-                    self._append_unique(run["graph_tags"], tag)
-                    self._append_row_once(
+                    self._add_tag_if_absent(run["model_tags"], tag)
+                    self._add_tag_if_absent(run["graph_tags"], tag)
+                    self._add_row_if_absent(
                         run["models"].setdefault(tag, []), row, ("step", "path")
                     )
-                    self._append_row_once(
+                    self._add_row_if_absent(
                         run["graphs"].setdefault(tag, []), row, ("step", "path")
                     )
                 elif event.kind == "pr_curve":
-                    self._append_unique(run["pr_curve_tags"], tag)
-                    self._append_row_once(
+                    self._add_tag_if_absent(run["pr_curve_tags"], tag)
+                    self._add_row_if_absent(
                         run["pr_curves"].setdefault(tag, []), row, ("step", "path")
                     )
                 elif event.kind == "mesh":
-                    self._append_unique(run["mesh_tags"], tag)
-                    self._append_row_once(
+                    self._add_tag_if_absent(run["mesh_tags"], tag)
+                    self._add_row_if_absent(
                         run["meshes"].setdefault(tag, []), row, ("step", "path")
                     )
                 elif event.kind == "embedding":
-                    self._append_unique(run["embedding_tags"], tag)
-                    self._append_row_once(
+                    self._add_tag_if_absent(run["embedding_tags"], tag)
+                    self._add_row_if_absent(
                         run["embeddings"].setdefault(tag, []), row, ("step", "path")
                     )
                 else:
-                    self._append_unique(run["artifact_tags"], tag)
-                    self._append_row_once(
+                    self._add_tag_if_absent(run["artifact_tags"], tag)
+                    self._add_row_if_absent(
                         run["artifacts"].setdefault(tag, []), row, ("step", "path")
                     )
             elif event.kind == "hparams" and isinstance(event.value, dict):

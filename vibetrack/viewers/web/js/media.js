@@ -4,11 +4,12 @@
 // ── Images ───────────────────────────────────────────────────
 const _imgAnimTimers = {};
 function _imgAnimPlaying() { return Object.values(_imgAnimTimers).some(Boolean); }
-const _imgCompareSelection = []; // { exp, tag, step, path, cellEl }
+const _imgCompareSelection = []; // { exp, tag, step, path, cellEl, sliderEl }
+const _imgTimelineMarkerCallbacks = []; // functions to refresh markers
 
 function _imgUpdateCompareToolbar() {
   let bar = document.getElementById('compare-toolbar');
-  if (_imgCompareSelection.length < 2) {
+  if (_imgCompareSelection.length < 1) {
     if (bar) bar.style.display = 'none';
     return;
   }
@@ -21,60 +22,88 @@ function _imgUpdateCompareToolbar() {
   bar.style.display = '';
   bar.innerHTML = '';
   const lbl = document.createElement('span');
-  lbl.textContent = _imgCompareSelection.length + ' images selected';
+  lbl.textContent = _imgCompareSelection.length + ' image' + (_imgCompareSelection.length > 1 ? 's' : '') + ' selected';
+  // Show tag info for cross-tag awareness
+  const tags = [...new Set(_imgCompareSelection.map(s => s.tag))];
+  if (tags.length > 1) {
+    const tagInfo = document.createElement('span');
+    tagInfo.className = 'cmp-tag-info';
+    tagInfo.textContent = '(' + tags.length + ' tags)';
+    lbl.appendChild(tagInfo);
+  }
   const clearBtn = document.createElement('button');
   clearBtn.textContent = 'Clear';
   clearBtn.addEventListener('click', _imgClearSelection);
   const cmpBtn = document.createElement('button');
   cmpBtn.textContent = 'Compare';
   cmpBtn.className = 'cmp-btn-primary';
+  cmpBtn.disabled = _imgCompareSelection.length < 2;
   cmpBtn.addEventListener('click', _imgOpenCompare);
   bar.append(lbl, clearBtn, cmpBtn);
 }
 
 function _imgClearSelection() {
+  const seen = new Set();
   _imgCompareSelection.forEach(s => {
-    if (!s.cellEl) return;
+    if (!s.cellEl || seen.has(s.cellEl)) return;
+    seen.add(s.cellEl);
     s.cellEl.classList.remove('img-selected');
     const cb = s.cellEl.querySelector('.img-select-cb');
     if (cb) cb.checked = false;
-    const badge = s.cellEl.querySelector('.img-pin-badge');
-    if (badge) badge.remove();
+    s.cellEl.querySelectorAll('.img-pin-badge').forEach(b => b.remove());
     if (s.cellEl._unpinFn) s.cellEl._unpinFn();
   });
   _imgCompareSelection.length = 0;
   _imgUpdateCompareToolbar();
+  _imgRefreshAllTimelineMarkers();
+}
+
+function _imgRefreshAllTimelineMarkers() {
+  _imgTimelineMarkerCallbacks.forEach(fn => fn());
 }
 
 function _imgToggleSelect(exp, tag, step, path, cellEl, checked) {
-  const idx = _imgCompareSelection.findIndex(s => s.cellEl === cellEl);
+  const stepIdx = _imgCompareSelection.findIndex(s => s.cellEl === cellEl && s.step === step);
   if (checked) {
-    if (idx === -1 && _imgCompareSelection.length < 6) {
+    if (stepIdx === -1 && _imgCompareSelection.length < 6) {
       _imgCompareSelection.push({ exp, tag, step, path, cellEl });
       cellEl.classList.add('img-selected');
-      let badge = cellEl.querySelector('.img-pin-badge');
-      if (!badge) {
-        badge = document.createElement('div');
-        badge.className = 'img-pin-badge';
-        cellEl.appendChild(badge);
-      }
-      badge.textContent = 'step ' + step;
-    } else if (idx === -1) {
-      // At limit
+      _imgUpdateCellBadges(cellEl);
+    } else if (stepIdx === -1) {
       const cb = cellEl.querySelector('.img-select-cb');
       if (cb) cb.checked = false;
       return;
     }
   } else {
-    if (idx !== -1) {
-      _imgCompareSelection.splice(idx, 1);
-      cellEl.classList.remove('img-selected');
-      const badge = cellEl.querySelector('.img-pin-badge');
-      if (badge) badge.remove();
-      if (cellEl._unpinFn) cellEl._unpinFn();
+    if (stepIdx !== -1) {
+      _imgCompareSelection.splice(stepIdx, 1);
+      _imgUpdateCellBadges(cellEl);
+      const remaining = _imgCompareSelection.filter(s => s.cellEl === cellEl);
+      if (!remaining.length) {
+        cellEl.classList.remove('img-selected');
+        if (cellEl._unpinFn) cellEl._unpinFn();
+      }
     }
   }
   _imgUpdateCompareToolbar();
+  _imgRefreshAllTimelineMarkers();
+}
+
+function _imgUpdateCellBadges(cellEl) {
+  cellEl.querySelectorAll('.img-pin-badge').forEach(b => b.remove());
+  const pins = _imgCompareSelection.filter(s => s.cellEl === cellEl);
+  if (!pins.length) return;
+  const badge = document.createElement('div');
+  badge.className = 'img-pin-badge';
+  badge.textContent = pins.map(p => 'step ' + p.step).join(', ');
+  cellEl.appendChild(badge);
+}
+
+function _imgSyncCellCheckbox(cellEl, steps, sliderIdx) {
+  const cb = cellEl.querySelector('.img-select-cb');
+  if (!cb) return;
+  const step = steps[sliderIdx];
+  cb.checked = _imgCompareSelection.some(s => s.cellEl === cellEl && s.step === step);
 }
 
 function _imgOpenCompare() {
@@ -141,7 +170,21 @@ function _imgOpenCompare() {
     pairNav.className = 'compare-pair-nav';
     pairs.forEach((pair, pi) => {
       const btn = document.createElement('button');
-      btn.textContent = _truncExp(pair[0].exp) + ' vs ' + _truncExp(pair[1].exp);
+      const crossTag = pair[0].tag !== pair[1].tag;
+      const crossStep = pair[0].step !== pair[1].step;
+      const sameExp = pair[0].exp === pair[1].exp;
+      let labelA, labelB;
+      if (crossTag) {
+        labelA = _truncExp(pair[0].tag) + ':' + pair[0].step;
+        labelB = _truncExp(pair[1].tag) + ':' + pair[1].step;
+      } else if (sameExp && crossStep) {
+        labelA = 'step ' + pair[0].step;
+        labelB = 'step ' + pair[1].step;
+      } else {
+        labelA = _truncExp(pair[0].exp) + (crossStep ? ':' + pair[0].step : '');
+        labelB = _truncExp(pair[1].exp) + (crossStep ? ':' + pair[1].step : '');
+      }
+      btn.textContent = labelA + ' vs ' + labelB;
       btn.addEventListener('click', () => { toggleSide = 0; renderPair(pi); });
       pairNav.appendChild(btn);
     });
@@ -343,25 +386,40 @@ function _imgBuildAnimate(container, entries, tag) {
 
   const wrap = document.createElement('div'); wrap.className = 'img-animate';
 
-  // Controls — hide play/slider entirely for single-step tags (would render
-  // as "Step 0 / 0" with a stuck slider). The cell label still gets the
-  // step number through the cell-level UI; nothing here to interact with.
+  // Controls — hide play/slider entirely for single-step tags
   const ctrl = document.createElement('div'); ctrl.className = 'img-animate-controls';
   const playBtn = document.createElement('button'); playBtn.innerHTML = '&#9654;'; playBtn.title = 'Play';
   const stepLabel = document.createElement('span'); stepLabel.className = 'step-label';
+  const sliderWrap = document.createElement('div'); sliderWrap.className = 'timeline-slider-wrap';
   const slider = document.createElement('input'); slider.type = 'range';
   slider.min = 0; slider.max = Math.max(0, steps.length - 1); slider.value = 0;
+  const markerTrack = document.createElement('div'); markerTrack.className = 'timeline-markers';
+  sliderWrap.append(slider, markerTrack);
   if (steps.length > 1) {
-    ctrl.append(playBtn, slider, stepLabel);
+    ctrl.append(playBtn, sliderWrap, stepLabel);
     wrap.appendChild(ctrl);
   }
 
+  // Timeline marker refresh for this tag
+  function refreshMarkers() {
+    markerTrack.innerHTML = '';
+    const selected = _imgCompareSelection.filter(s => s.tag === tag);
+    if (!selected.length || steps.length < 2) return;
+    selected.forEach(s => {
+      const stepIdx = steps.indexOf(s.step);
+      if (stepIdx === -1) return;
+      const pct = (stepIdx / (steps.length - 1)) * 100;
+      const marker = document.createElement('div');
+      marker.className = 'timeline-marker';
+      marker.style.left = pct + '%';
+      marker.title = s.exp + ' — step ' + s.step;
+      markerTrack.appendChild(marker);
+    });
+  }
+  _imgTimelineMarkerCallbacks.push(refreshMarkers);
+
   // Viewport
   const viewport = document.createElement('div'); viewport.className = 'img-animate-viewport';
-  // Create one cell per experiment. Each cell holds an <img> AND a same-sized
-  // placeholder div; renderFrame toggles between them so the grid row stays
-  // vertically aligned even when an experiment is missing a frame at the
-  // current step.
   const cells = {};
   const cellEls = {};
   const placeholders = {};
@@ -369,7 +427,7 @@ function _imgBuildAnimate(container, entries, tag) {
     const cell = document.createElement('div'); cell.className = 'animate-cell';
     const img = document.createElement('img'); img.alt = exp;
     const placeholder = document.createElement('div'); placeholder.className = 'img-placeholder';
-    placeholder.style.display = 'none';  // renderFrame switches this on first paint
+    placeholder.style.display = 'none';
     const phMsg = document.createElement('span'); phMsg.className = 'img-placeholder-msg';
     placeholder.appendChild(phMsg);
     const cb = document.createElement('input'); cb.type = 'checkbox'; cb.className = 'img-select-cb';
@@ -377,8 +435,14 @@ function _imgBuildAnimate(container, entries, tag) {
     cb.addEventListener('change', () => {
       const step = steps[parseInt(slider.value)];
       const path = byExp[exp][step];
-      if (path) _imgToggleSelect(exp, tag, step, path, cell, cb.checked);
-      else cb.checked = false;
+      if (!path) { cb.checked = false; return; }
+      const alreadyPinned = _imgCompareSelection.some(s => s.cellEl === cell && s.step === step);
+      if (alreadyPinned) {
+        _imgToggleSelect(exp, tag, step, path, cell, false);
+      } else {
+        _imgToggleSelect(exp, tag, step, path, cell, true);
+      }
+      _imgSyncCellCheckbox(cell, steps, parseInt(slider.value));
     });
     const lbl = document.createElement('div'); lbl.className = 'cell-label';
     lbl.innerHTML = `<span class="exp" style="color:${expColors[exp] || 'var(--muted)'}">${escapeHtml(exp)}</span>`;
@@ -406,8 +470,7 @@ function _imgBuildAnimate(container, entries, tag) {
     stepLabel.textContent = 'Step ' + step + ' / ' + steps[steps.length - 1];
     slider.value = idx;
     expNames.forEach(exp => {
-      // Cells pinned in compare selection stay frozen at their chosen step.
-      if (_imgCompareSelection.some(s => s.cellEl === cellEls[exp])) return;
+      _imgSyncCellCheckbox(cellEls[exp], steps, idx);
       const path = byExp[exp][step];
       if (path) {
         cells[exp].src = mediaUrl(path);
@@ -449,14 +512,25 @@ function _imgBuildAnimate(container, entries, tag) {
     renderFrame(parseInt(slider.value));
   });
 
-  // Preload first frame
+  // Click on marker track to jump to that step
+  markerTrack.addEventListener('click', e => {
+    if (steps.length < 2) return;
+    const rect = markerTrack.getBoundingClientRect();
+    const pct = (e.clientX - rect.left) / rect.width;
+    const idx = Math.round(pct * (steps.length - 1));
+    stopAnim();
+    renderFrame(Math.max(0, Math.min(idx, steps.length - 1)));
+  });
+
   renderFrame(0);
+  refreshMarkers();
 }
 
 function buildImages() {
-  // Clear selection and animation timers
+  // Clear selection, animation timers, and marker callbacks
   _imgCompareSelection.length = 0;
   _imgUpdateCompareToolbar();
+  _imgTimelineMarkerCallbacks.length = 0;
   Object.keys(_imgAnimTimers).forEach(k => {
     if (_imgAnimTimers[k]) clearInterval(_imgAnimTimers[k]);
     delete _imgAnimTimers[k];

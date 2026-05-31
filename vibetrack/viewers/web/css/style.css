@@ -524,6 +524,55 @@
       min-width: 120px;
     }
 
+    .timeline-slider-wrap {
+      position: relative;
+      flex: 1;
+      min-width: 120px;
+      display: flex;
+      align-items: center;
+    }
+
+    .timeline-slider-wrap input[type=range] {
+      width: 100%;
+      min-width: unset;
+    }
+
+    .timeline-markers {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    .timeline-markers:has(.timeline-marker) {
+      pointer-events: auto;
+      cursor: pointer;
+    }
+
+    .timeline-marker {
+      position: absolute;
+      top: 50%;
+      width: 10px;
+      height: 10px;
+      margin-left: -5px;
+      margin-top: -5px;
+      border-radius: 50%;
+      background: var(--accent);
+      border: 2px solid var(--bg);
+      box-shadow: 0 0 0 1px var(--accent), 0 1px 4px rgba(0,0,0,0.3);
+      z-index: 2;
+      pointer-events: none;
+      animation: marker-pop 0.2s ease-out;
+    }
+
+    @keyframes marker-pop {
+      from { transform: scale(0); }
+      to { transform: scale(1); }
+    }
+
     .img-animate-controls .step-label {
       font-size: 0.85em;
       color: var(--accent);
@@ -785,6 +834,18 @@
     .compare-toolbar span {
       color: var(--muted);
       font-size: 0.85em;
+    }
+
+    .compare-toolbar .cmp-tag-info {
+      margin-left: 6px;
+      font-size: 0.9em;
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    .compare-toolbar .cmp-btn-primary:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
     }
 
     .compare-toolbar button {

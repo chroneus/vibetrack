@@ -47,6 +47,19 @@ function _setupProjectSwitcher() {
   projName.addEventListener('click', e => { e.stopPropagation(); menu.classList.toggle('open'); });
   document.addEventListener('click', () => menu.classList.remove('open'));
   menu.addEventListener('click', e => e.stopPropagation());
+
+  // Rename icon
+  const renameIcon = document.createElement('span');
+  renameIcon.className = 'project-rename-btn';
+  renameIcon.title = 'Rename project';
+  renameIcon.textContent = '✎';
+  renameIcon.addEventListener('click', e => {
+    e.stopPropagation();
+    menu.classList.remove('open');
+    startProjectRename();
+  });
+  projName.parentNode.insertBefore(renameIcon, menu);
+
   const delBtn = document.getElementById('delete-project-btn');
   document.getElementById('danger-zone-card').style.display = '';
   delBtn.addEventListener('click', () => {
@@ -56,6 +69,72 @@ function _setupProjectSwitcher() {
       .then(res => { if (res.ok) { localStorage.removeItem('vt_last_project'); window.location = '/'; } else alert('Delete failed: ' + (res.error || 'unknown')); })
       .catch(() => alert('Delete failed'));
   });
+}
+
+function startProjectRename() {
+  const projName = document.getElementById('project-name');
+  const oldName = window.VT_PROJECT;
+  const input = document.createElement('input');
+  input.className = 'project-rename-input';
+  input.value = oldName;
+  const renameBtn = document.querySelector('.project-rename-btn');
+  if (renameBtn) renameBtn.style.display = 'none';
+  projName.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let committing = false;
+  function commitProjectRename() {
+    if (committing) return;
+    committing = true;
+    const newName = input.value.trim();
+    if (!newName || newName === oldName) { committing = false; cancelProjectRename(); return; }
+    if (newName.includes('/')) {
+      const parts = newName.split('/', 2);
+      if (!confirm(
+        'Move all experiments from "' + oldName + '" into project "' + parts[0] +
+        '" with base name "' + parts[1] + '"?\n\nThis cannot be undone.'
+      )) { committing = false; cancelProjectRename(); return; }
+    }
+    fetch('/api/rename-project/' + encodeURIComponent(oldName), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ new_name: newName }),
+    })
+    .then(r => r.json())
+    .then(res => {
+      if (res.ok) {
+        const target = res.new_project || res.target_project || newName.split('/')[0];
+        localStorage.setItem('vt_last_project', target);
+        window.location = '/' + encodeURIComponent(target);
+      } else {
+        alert('Rename failed: ' + (res.error || 'unknown'));
+        cancelProjectRename();
+      }
+    })
+    .catch(() => { alert('Rename failed'); cancelProjectRename(); });
+  }
+
+  function cancelProjectRename() {
+    const span = document.createElement('span');
+    span.id = 'project-name';
+    span.textContent = oldName;
+    span.classList.add('has-menu');
+    input.replaceWith(span);
+    if (renameBtn) renameBtn.style.display = '';
+    span.addEventListener('click', e => {
+      e.stopPropagation();
+      document.getElementById('project-menu').classList.toggle('open');
+    });
+  }
+
+  input.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); commitProjectRename(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancelProjectRename(); }
+  });
+  input.addEventListener('click', e => e.stopPropagation());
+  input.addEventListener('blur', () => commitProjectRename());
 }
 
 // ── Hide-chart keyboard shortcut and tray toggle ─────────────

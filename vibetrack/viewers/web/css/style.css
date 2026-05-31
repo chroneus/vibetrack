@@ -204,6 +204,34 @@
       color: var(--accent);
     }
 
+    .project-rename-btn {
+      opacity: 0;
+      margin-left: 6px;
+      color: var(--muted);
+      font-size: 0.6em;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      vertical-align: middle;
+    }
+    h1:hover .project-rename-btn {
+      opacity: 1;
+    }
+    .project-rename-btn:hover {
+      color: var(--accent);
+    }
+    .project-rename-input {
+      background: var(--bg);
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      border-radius: 4px;
+      padding: 2px 8px;
+      font-size: 1em;
+      font-weight: bold;
+      outline: none;
+      min-width: 120px;
+      font-family: inherit;
+    }
+
     #project-menu {
       display: none;
       position: absolute;

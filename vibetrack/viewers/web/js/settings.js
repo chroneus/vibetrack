@@ -52,7 +52,7 @@ let refreshTimer = null;
 let _lastDataText = null;
 
 function _userIsBusy() {
-  if (document.querySelector('.exp-rename-input')) return true;
+  if (document.querySelector('.exp-rename-input, .project-rename-input')) return true;
   const ae = document.activeElement;
   if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return true;
   for (const m of document.querySelectorAll('audio, video')) {

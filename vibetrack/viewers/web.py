@@ -608,6 +608,61 @@ def _handle_move_logdir(db: Any, old_dir: str, new_dir: str) -> Tuple[dict, int]
     return {"ok": True}, 200
 
 
+def _handle_rename_project(
+    db: Any,
+    old_project: str,
+    new_name: str,
+) -> Tuple[dict, int]:
+    """Rename a project or migrate experiments via slash syntax."""
+    new_name = new_name.strip()
+    if not new_name:
+        return {"error": "name cannot be empty"}, 400
+    if db is None:
+        return {"error": "no database"}, 500
+
+    experiments = db.list_experiments(project=old_project)
+    if not experiments:
+        return {"error": "project not found"}, 404
+
+    if "/" not in new_name:
+        if new_name == old_project:
+            return {"ok": True, "new_project": new_name}, 200
+        success, conflicts = db.rename_project(old_project, new_name)
+        if not success:
+            if conflicts:
+                return {
+                    "error": "name conflicts in target project: " + ", ".join(conflicts)
+                }, 409
+            return {"error": "project not found"}, 404
+        return {"ok": True, "new_project": new_name}, 200
+
+    # Slash syntax: "target_project/experiment_base_name"
+    parts = new_name.split("/", 1)
+    target_project = parts[0].strip()
+    base_exp_name = parts[1].strip()
+    if not target_project or not base_exp_name:
+        return {"error": "invalid format — use 'project/name'"}, 400
+
+    moved = []
+    for i, exp in enumerate(experiments):
+        if len(experiments) == 1:
+            exp_name = base_exp_name
+        else:
+            exp_name = base_exp_name if i == 0 else f"{base_exp_name} ({i + 1})"
+
+        existing = db.get_experiment_by_name(exp_name, project=target_project)
+        if existing is not None:
+            exp_name = db.find_next_suffix_name(
+                base_exp_name if i == 0 else exp_name, target_project
+            )
+
+        if not db.move_experiment_to_project(int(exp["id"]), target_project, exp_name):
+            return {"error": f"failed to move experiment '{exp['name']}'"}, 500
+        moved.append({"old": exp["name"], "new": exp_name})
+
+    return {"ok": True, "target_project": target_project, "moved": moved}, 200
+
+
 class WebOutput(BaseOutput):
     """Serve an interactive web dashboard."""
 
@@ -898,6 +953,19 @@ class WebOutput(BaseOutput):
                 self._reader._db,
                 body.get("old", ""),
                 body.get("new", ""),
+            )
+            return JSONResponse(data, status_code=status)
+
+        @app.post(
+            "/api/rename-project/{project}",
+            dependencies=[Depends(_check_mutation)],
+        )
+        async def rename_project_route(request: Request, project: str) -> JSONResponse:
+            body = await request.json()
+            data, status = _handle_rename_project(
+                self._reader._db,
+                project,
+                body.get("new_name", ""),
             )
             return JSONResponse(data, status_code=status)
 

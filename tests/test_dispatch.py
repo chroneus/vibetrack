@@ -14,7 +14,6 @@ from vibetrack.viewers.base import BaseOutput
 from vibetrack.viewers.event import LogEvent
 from vibetrack.writer import SummaryWriter
 
-
 # ── Fake adapter plumbing ──────────────────────────────────────
 
 _FAKE_REGISTRY: dict = {}

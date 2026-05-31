@@ -14,7 +14,6 @@ import pytest
 
 from vibetrack.smoother import ema, moving_average, gaussian, smooth
 
-
 # ── EMA ──────────────────────────────────────────────────────────────
 
 

@@ -851,6 +851,69 @@ class Database:
             )
             return cur.rowcount > 0
 
+    def move_experiment_to_project(
+        self,
+        experiment_id: int,
+        new_project: str,
+        new_name: Optional[str] = None,
+    ) -> bool:
+        """Move an experiment to a different project, optionally renaming it.
+
+        Returns True on success, False if (project, name) already taken.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            exp = conn.execute(
+                "SELECT name FROM experiments WHERE id=?",
+                (experiment_id,),
+            ).fetchone()
+            if exp is None:
+                return False
+            target_name = new_name if new_name else exp["name"]
+            existing = conn.execute(
+                "SELECT id FROM experiments WHERE project=? AND name=? LIMIT 1",
+                (new_project, target_name),
+            ).fetchone()
+            if existing is not None and existing["id"] != experiment_id:
+                return False
+            conn.execute(
+                "UPDATE experiments SET project=?, name=? WHERE id=?",
+                (new_project, target_name, experiment_id),
+            )
+            return True
+
+    def rename_project(
+        self, old_project: str, new_project: str
+    ) -> Tuple[bool, List[str]]:
+        """Rename a project by updating all its experiments' project field.
+
+        Returns ``(success, conflict_names)``.  When names in *new_project*
+        would collide, returns ``(False, [conflicting_names])``.
+        """
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            experiments = conn.execute(
+                "SELECT id, name FROM experiments WHERE project=?",
+                (old_project,),
+            ).fetchall()
+            if not experiments:
+                return False, []
+            conflicts: List[str] = []
+            for exp in experiments:
+                dup = conn.execute(
+                    "SELECT id FROM experiments " "WHERE project=? AND name=? LIMIT 1",
+                    (new_project, exp["name"]),
+                ).fetchone()
+                if dup is not None:
+                    conflicts.append(exp["name"])
+            if conflicts:
+                return False, conflicts
+            conn.execute(
+                "UPDATE experiments SET project=? WHERE project=?",
+                (new_project, old_project),
+            )
+            return True, []
+
     def update_log_dir(self, experiment_id: int, new_log_dir: str) -> bool:
         """Update the log_dir of an experiment. Returns True if successful."""
         with self._connect() as conn:

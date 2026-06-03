@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibetrack"
-version = "0.1.1"
+version = "0.1.2"
 description = "Modern experiment tracking — drop-in compatible with TensorBoard SummaryWriter."
 readme = "README.md"
 authors = [

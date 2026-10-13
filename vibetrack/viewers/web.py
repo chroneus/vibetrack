@@ -16,12 +16,15 @@ replaced at render time.
 
 import collections
 import functools
+import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 from contextlib import suppress
@@ -30,7 +33,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from ..compare import find_all_tags  # noqa: F401  (re-exported for tests)
-from ..config import load_config, save_config
+from ..config import VIBETRACK_CONFIG_DIR, load_config, save_config
 from ..reader import ExperimentReader, RunReader
 from .base import BaseOutput
 
@@ -110,6 +113,115 @@ def _load_template() -> str:
 # rewritten to include `?v=<stamp>` so a server restart forces browsers to
 # refetch JS/CSS even if their HTTP cache holds the previous version.
 _STATIC_VERSION = str(int(time.time()))
+
+
+@functools.lru_cache(maxsize=32)
+def _video_timeline(path: str, mtime_ns: int, size: int) -> dict:
+    """Probe display-order timestamps on demand; stat keys invalidate replacements."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "frame=best_effort_timestamp_time:stream=width,height,duration",
+         "-of", "json", path], capture_output=True, text=True, check=True, timeout=30)
+    data = json.loads(result.stdout)
+    times = [float(f["best_effort_timestamp_time"]) for f in data.get("frames", [])
+             if "best_effort_timestamp_time" in f]
+    if not times or any(not math.isfinite(t) for t in times):
+        raise ValueError("No valid frame timestamps")
+    if any(b <= a for a, b in zip(times, times[1:])):
+        raise ValueError("Frame timestamps are not strictly increasing")
+    start = times[0]
+    return {"times": [t - start for t in times], "frames": len(times)}
+
+
+# Grid tiles show downscaled previews: decoding dozens of full-resolution PNGs,
+# or opening one video decoder per tile, is what stalls the browser on
+# media-heavy projects. Widths are bucketed so each file has few cached variants.
+_THUMB_DIR = VIBETRACK_CONFIG_DIR / "thumbs"
+_THUMB_WIDTHS = (320, 640, 1280, 2560)
+_VIDEO_SUFFIXES = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v", ".ogv"}
+# Animated / vector formats would lose what makes them useful; serve as-is.
+_THUMB_PASSTHROUGH_SUFFIXES = {".gif", ".svg", ".apng"}
+_THUMB_SAFE_MODES = {"1", "L", "LA", "P", "PA", "RGB", "RGBA"}
+_thumb_slots = threading.BoundedSemaphore(max(1, min(4, os.cpu_count() or 1)))
+
+
+def _thumb_bucket(width: int) -> int:
+    return next((b for b in _THUMB_WIDTHS if b >= width), _THUMB_WIDTHS[-1])
+
+
+def _is_video_path(path: str) -> bool:
+    return Path(path).suffix.lower() in _VIDEO_SUFFIXES
+
+
+def _media_thumbnail(path: str, width: int) -> Optional[Path]:
+    """Return a cached preview of *path* at most *width* px wide.
+
+    ``None`` means the original should be served (already small, or a format
+    we don't re-encode). Videos raise when no poster frame can be extracted.
+    """
+    if Path(path).suffix.lower() in _THUMB_PASSTHROUGH_SUFFIXES:
+        return None
+    stat = os.stat(path)
+    key = hashlib.sha256(
+        f"{path}\0{stat.st_mtime_ns}\0{stat.st_size}\0{width}".encode()
+    ).hexdigest()
+    cache_dir = _THUMB_DIR / key[:2]
+    for cached in (cache_dir / f"{key}.jpg", cache_dir / f"{key}.png"):
+        if cached.is_file():
+            return cached
+    with _thumb_slots:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if _is_video_path(path):
+            return _video_poster(path, width, cache_dir / f"{key}.jpg")
+        return _image_thumbnail(path, width, cache_dir, key)
+
+
+def _video_poster(path: str, width: int, out: Path) -> Path:
+    tmp = out.with_name(f"{out.stem}.{os.getpid()}.{threading.get_ident()}.tmp.jpg")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-frames:v", "1",
+             "-vf", f"scale='min({width},iw)':-2", "-q:v", "3", "-y", str(tmp)],
+            capture_output=True, check=True, timeout=30)
+        if not tmp.is_file() or tmp.stat().st_size == 0:
+            raise ValueError("ffmpeg produced no poster frame")
+        os.replace(tmp, out)
+    finally:
+        with suppress(OSError):
+            tmp.unlink()
+    return out
+
+
+def _image_thumbnail(path: str, width: int, cache_dir: Path, key: str) -> Optional[Path]:
+    try:
+        from PIL import Image, ImageOps  # type: ignore[import-untyped]
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as img:
+            # 16-bit / float images need tone mapping we can't guess; let the browser do it.
+            if img.mode not in _THUMB_SAFE_MODES:
+                return None
+            if img.getexif().get(0x0112, 1) != 1:  # orientation: size the box as displayed
+                img = ImageOps.exif_transpose(img)
+            if img.width <= width:
+                return None
+            img.thumbnail((width, img.height))
+            has_alpha = img.mode in ("LA", "PA", "RGBA") or "transparency" in img.info
+            img = img.convert("RGBA" if has_alpha else "RGB")
+            ext, fmt = ("png", "PNG") if has_alpha else ("jpg", "JPEG")
+            out = cache_dir / f"{key}.{ext}"
+            tmp = cache_dir / f"{key}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                img.save(tmp, format=fmt, quality=88)
+                os.replace(tmp, out)
+            finally:
+                with suppress(OSError):
+                    tmp.unlink()
+            return out
+    except Exception:  # any decode failure falls back to the original
+        logging.getLogger(__name__).debug("thumbnail failed for %s", path, exc_info=True)
+        return None
 
 
 def _json_for_html(obj: Any) -> str:
@@ -983,6 +1095,34 @@ class WebOutput(BaseOutput):
             if os.path.isfile(candidate):
                 return FileResponse(candidate)
             return JSONResponse({"error": "not found"}, status_code=404)
+
+        @app.get("/media/thumb", dependencies=[Depends(_check_token)])
+        def serve_media_thumb(path: str = "", w: int = 640):  # type: ignore[no-untyped-def]
+            """Downscaled image, or a video's first frame, for grid previews."""
+            candidate = os.path.realpath(path)
+            if not path or not _path_is_under(candidate, _get_media_roots(self._reader)) or not os.path.isfile(candidate):
+                return JSONResponse({"error": "not found"}, status_code=404)
+            try:
+                thumb = _media_thumbnail(candidate, _thumb_bucket(w))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                thumb = None
+            if thumb is not None:
+                return FileResponse(thumb)
+            if _is_video_path(candidate):
+                # The client falls back to decoding the first frame itself.
+                return JSONResponse({"error": "preview unavailable"}, status_code=422)
+            return FileResponse(candidate)
+
+        @app.get("/api/video-timeline", dependencies=[Depends(_check_token)])
+        def video_timeline(path: str = ""):
+            candidate = os.path.realpath(path)
+            if not path or not _path_is_under(candidate, _get_media_roots(self._reader)) or not os.path.isfile(candidate):
+                return JSONResponse({"error": "not found"}, status_code=404)
+            try:
+                stat = os.stat(candidate)
+                return JSONResponse(_video_timeline(candidate, stat.st_mtime_ns, stat.st_size))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return JSONResponse({"error": "Frame timestamps unavailable for this video"}, status_code=422)
 
         # ── Ingest (listen) routes ────────────────────────────
 

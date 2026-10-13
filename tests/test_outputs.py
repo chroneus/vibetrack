@@ -942,6 +942,103 @@ class TestMediaPathTraversal:
         assert resp.status_code == 200
 
 
+class TestMediaThumbnails:
+    @pytest.fixture
+    def thumb_app(self, tmp_path, monkeypatch):
+        pytest.importorskip("fastapi")
+        pytest.importorskip("uvicorn")
+        Image = pytest.importorskip("PIL.Image")
+        import uvicorn
+
+        from vibetrack.viewers import web
+        from vibetrack.viewers.web import WebOutput
+
+        monkeypatch.setattr(web, "_THUMB_DIR", tmp_path / "thumbs")
+        project_folder = tmp_path / "project"
+        project_folder.mkdir()
+        sources = {
+            "big": Image.new("RGB", (3000, 750), "red"),
+            "small": Image.new("RGB", (200, 100), "blue"),
+            "alpha": Image.new("RGBA", (2000, 1000), (0, 255, 0, 64)),
+        }
+        with SummaryWriter(
+            str(project_folder / "run_a"), name="run_a", project_folder=str(project_folder)
+        ) as writer:
+            for tag, img in sources.items():
+                src = tmp_path / f"{tag}.png"
+                img.save(src)
+                writer.add_image(tag, str(src), 0)
+            (tmp_path / "broken.mp4").write_bytes(b"not a video")
+            writer.add_video("broken", str(tmp_path / "broken.mp4"), 0)
+
+        captured: dict = {}
+        output = WebOutput(str(project_folder))
+        with mock.patch.object(uvicorn, "run", side_effect=lambda app, **kw: captured.update(app=app)):
+            output._serve_uvicorn(None, "127.0.0.1", 6006)
+        media = project_folder / "run_a" / "media"
+        return captured["app"], media, Image
+
+    def test_large_image_is_downscaled_to_bucket(self, thumb_app):
+        app, media, Image = thumb_app
+        resp = _call_app_route(app, "/media/thumb", path=str(media / "big" / "0.png"), w=500)
+        assert resp.status_code == 200
+        with Image.open(resp.path) as thumb:
+            assert thumb.format == "JPEG"
+            assert thumb.size == (640, 160)
+
+    def test_small_image_served_as_original(self, thumb_app):
+        app, media, _Image = thumb_app
+        original = media / "small" / "0.png"
+        resp = _call_app_route(app, "/media/thumb", path=str(original), w=640)
+        assert Path(resp.path) == original
+
+    def test_alpha_is_preserved(self, thumb_app):
+        app, media, Image = thumb_app
+        resp = _call_app_route(app, "/media/thumb", path=str(media / "alpha" / "0.png"), w=320)
+        with Image.open(resp.path) as thumb:
+            assert thumb.format == "PNG" and thumb.mode == "RGBA"
+            assert thumb.size == (320, 160)
+
+    def test_cache_reused_until_source_changes(self, thumb_app):
+        app, media, Image = thumb_app
+        src = media / "big" / "0.png"
+        first = _call_app_route(app, "/media/thumb", path=str(src), w=640).path
+        with mock.patch("PIL.Image.open", side_effect=AssertionError("cache miss")):
+            assert _call_app_route(app, "/media/thumb", path=str(src), w=640).path == first
+        Image.new("RGB", (2000, 1000), "green").save(src)
+        changed = _call_app_route(app, "/media/thumb", path=str(src), w=640).path
+        assert changed != first
+        with Image.open(changed) as thumb:
+            assert thumb.size == (640, 320)
+
+    def test_rejects_paths_outside_media_roots(self, thumb_app, tmp_path):
+        app, _media, _Image = thumb_app
+        outside = tmp_path / "big.png"
+        assert _call_app_route(app, "/media/thumb", path=str(outside)).status_code == 404
+        assert _call_app_route(app, "/media/thumb", path="/etc/passwd").status_code == 404
+
+    def test_undecodable_video_reports_unavailable(self, thumb_app):
+        app, media, _Image = thumb_app
+        resp = _call_app_route(app, "/media/thumb", path=str(media / "broken" / "0.mp4"))
+        assert resp.status_code == 422
+
+    def test_video_poster_from_first_frame(self, thumb_app, tmp_path):
+        import shutil
+        import subprocess
+
+        if not shutil.which("ffmpeg"):
+            pytest.skip("ffmpeg not installed")
+        from vibetrack.viewers.web import _media_thumbnail
+
+        _app, _media, Image = thumb_app
+        clip = tmp_path / "clip.mp4"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=5",
+             "-t", "1", "-pix_fmt", "yuv420p", "-y", str(clip)], check=True)
+        with Image.open(_media_thumbnail(str(clip), 640)) as poster:
+            assert poster.format == "JPEG" and poster.size == (640, 360)
+
+
 class TestWebProjectRouting:
     @pytest.fixture
     def central_web_app(self, tmp_path, monkeypatch):

@@ -447,6 +447,32 @@
       gap: 16px;
     }
 
+    /* Video previews are often wide strips (e.g. side-by-side comparisons), so
+       the generic 240px media tile makes them unreadably short. Tiles are sized
+       from the widest clip's aspect ratio, overridable via the size slider. */
+    .video-grid {
+      grid-template-columns: repeat(auto-fill, minmax(min(var(--vid-tile, 420px), 100%), 1fr));
+    }
+
+    .video-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+      font-size: 0.85em;
+      color: var(--muted);
+    }
+
+    .video-toolbar input[type=range] {
+      flex: 0 1 240px;
+      accent-color: var(--accent);
+    }
+
+    .vid-size-val {
+      min-width: 52px;
+      font-variant-numeric: tabular-nums;
+    }
+
     .media-card {
       background: var(--card);
       border: 1px solid var(--border);
@@ -636,6 +662,8 @@
     .img-animate-viewport .animate-cell img {
       width: 100%;
       height: auto;
+      /* Square box until decoded, so lazy loading sees real offsets. */
+      aspect-ratio: auto 1 / 1;
       border-radius: 4px;
       border: 1px solid var(--border);
     }
@@ -2007,3 +2035,11 @@
       user-select: text;
       cursor: text;
     }
+
+/* Frame-accurate video comparison controls and readable legends. */
+.vid-cmp-ctrl { flex-wrap: wrap; }
+.vid-cmp-ctrl input[type=number] { width: 6em; color: var(--text); background: var(--bg); border: 1px solid var(--border); padding: 6px; }
+.vid-cmp-ctrl button:disabled { opacity: .4; cursor: default; }
+.vid-cmp-cell .cell-label { color: var(--text); overflow-wrap: anywhere; line-height: 1.5; }
+.vid-cmp-cell .cell-label strong { display:block; }
+.vid-frame-status { padding: 6px 16px; color: var(--muted); font-size: .85em; }

@@ -70,7 +70,12 @@
 
   <!-- Video -->
   <div class="tab-content" id="tab-video">
-    <div class="media-grid" id="video-grid"></div>
+    <div class="video-toolbar">
+      <label for="vid-size">Preview size</label>
+      <input type="range" id="vid-size" min="240" max="1400" step="20">
+      <span id="vid-size-val" class="vid-size-val"></span>
+    </div>
+    <div class="media-grid video-grid" id="video-grid"></div>
   </div>
 
   <!-- Artifacts -->

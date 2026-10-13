@@ -18,6 +18,14 @@ function apiUrl(base) {
 
 function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function mediaUrl(p) { return '/media?path=' + encodeURIComponent(p); }
+// Downscaled preview for a tile `cssWidth` px wide (0 = not laid out yet).
+// Widths snap to the server's buckets so URLs stay stable across small resizes.
+const THUMB_WIDTHS = [320, 640, 1280, 2560];
+function thumbUrl(p, cssWidth) {
+  const px = (cssWidth || 480) * (window.devicePixelRatio || 1);
+  const w = THUMB_WIDTHS.find(b => b >= px) || THUMB_WIDTHS[THUMB_WIDTHS.length - 1];
+  return '/media/thumb?path=' + encodeURIComponent(p) + '&w=' + w;
+}
 function emaSmooth(vals, w) { if (!vals.length) return []; let n = 0, d = 0; return vals.map(v => { n = w * n + (1 - w) * v; d = w * d + (1 - w); return n / d; }); }
 function parseHexColor(color) {
   if (!/^#[0-9a-fA-F]{6}$/.test(color)) return null;
@@ -141,7 +149,13 @@ function openFullscreen(title, buildFn) {
   document.body.appendChild(ov);
   const body = ov.querySelector('.fs-body');
   buildFn(body, ov);
-  const close = () => { ov.remove(); };
+  const close = () => {
+    ov.querySelectorAll('video, audio').forEach(media => {
+      media.pause(); media.removeAttribute('src'); media.load();
+    });
+    ov.remove();
+    document.removeEventListener('keydown', onKey);
+  };
   ov.querySelector('.fs-close').addEventListener('click', close);
   const onKey = e => { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); } };
   document.addEventListener('keydown', onKey);

@@ -59,6 +59,7 @@ function _userIsBusy() {
     if (!m.paused && !m.ended) return true;
   }
   if (_imgAnimPlaying() || _imgCompareSelection.length !== 0) return true;
+  if (_vidCompareSelection.length !== 0 || document.querySelector('.fs-overlay video')) return true;
   const sel = window.getSelection && window.getSelection();
   if (sel && sel.rangeCount && !sel.isCollapsed && sel.toString().length > 2) return true;
   return false;

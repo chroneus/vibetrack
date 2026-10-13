@@ -6,6 +6,10 @@ const _imgAnimTimers = {};
 function _imgAnimPlaying() { return Object.values(_imgAnimTimers).some(Boolean); }
 const _imgCompareSelection = []; // { exp, tag, step, path, cellEl, sliderEl }
 const _imgTimelineMarkerCallbacks = []; // functions to refresh markers
+// Re-picks thumbnail sizes once a tag's grid gets real dimensions (tabs are
+// built while hidden, where every cell measures 0px).
+let _imgResizeObserver = null;
+let _imgGridSignature = null;
 
 function _imgUpdateCompareToolbar() {
   let bar = document.getElementById('compare-toolbar');
@@ -106,8 +110,8 @@ function _imgSyncCellCheckbox(cellEl, steps, sliderIdx) {
   cb.checked = _imgCompareSelection.some(s => s.cellEl === cellEl && s.step === step);
 }
 
-function _imgOpenCompare() {
-  const sel = _imgCompareSelection.slice();
+function _imgOpenCompare(selection = null, onClose = null) {
+  const sel = (Array.isArray(selection) ? selection : _imgCompareSelection).slice();
   if (sel.length < 2) return;
   const pairs = [];
   for (let i = 0; i < sel.length; i++)
@@ -150,6 +154,7 @@ function _imgOpenCompare() {
   const body = ov.querySelector('.fs-body');
   let activePair = 0;
   let activeMode = 'toggle';
+  let sliderObserver = null;
   let toggleSide = 0; // 0 = first image, 1 = second
 
   // Mode switcher
@@ -211,10 +216,23 @@ function _imgOpenCompare() {
   function renderSlider(a, b) {
     widgetWrap.innerHTML = '';
     const slider = document.createElement('img-comparison-slider');
-    const imgA = document.createElement('img'); imgA.slot = 'first'; imgA.src = mediaUrl(a.path);
-    const imgB = document.createElement('img'); imgB.slot = 'second'; imgB.src = mediaUrl(b.path);
+    const imgA = document.createElement('img'); imgA.slot = 'first'; imgA.src = (a.imageUrl || mediaUrl(a.path));
+    const imgB = document.createElement('img'); imgB.slot = 'second'; imgB.src = (b.imageUrl || mediaUrl(b.path));
+    const fit = () => {
+      if (!imgA.naturalWidth || !imgB.naturalWidth) return;
+      const ratio = imgA.naturalWidth / imgA.naturalHeight;
+      const width = Math.min(imgA.naturalWidth, widgetWrap.clientWidth, Math.max(100, window.innerHeight - 220) * ratio);
+      const height = width / ratio;
+      slider.style.width = width + 'px'; slider.style.height = height + 'px';
+      [imgA,imgB].forEach(img => {
+        img.style.width = width + 'px'; img.style.height = height + 'px';
+        img.style.maxWidth = 'none'; img.style.maxHeight = 'none'; img.style.objectFit = 'contain';
+      });
+    };
+    imgA.addEventListener('load',fit); imgB.addEventListener('load',fit);
     slider.append(imgA, imgB);
     widgetWrap.appendChild(slider);
+    sliderObserver = new ResizeObserver(fit); sliderObserver.observe(widgetWrap);
     makeLabels(a, b);
   }
 
@@ -223,7 +241,7 @@ function _imgOpenCompare() {
     const wrap = document.createElement('div'); wrap.className = 'cmp-toggle-wrap';
     const img = document.createElement('img');
     const cur = toggleSide === 0 ? a : b;
-    img.src = mediaUrl(cur.path);
+    img.src = (cur.imageUrl || mediaUrl(cur.path));
     const indicator = document.createElement('div'); indicator.className = 'cmp-toggle-indicator';
     indicator.textContent = (toggleSide + 1) + ' / 2';
     const leftArr = document.createElement('button'); leftArr.className = 'cmp-toggle-arrow left'; leftArr.innerHTML = '&#9664;';
@@ -251,7 +269,7 @@ function _imgOpenCompare() {
     const zoom = 3;
     const cells = [a, b].map(item => {
       const cell = document.createElement('div'); cell.className = 'cmp-mag-cell';
-      const img = document.createElement('img'); img.src = mediaUrl(item.path);
+      const img = document.createElement('img'); img.src = (item.imageUrl || mediaUrl(item.path));
       const lens = document.createElement('div'); lens.className = 'cmp-mag-lens';
       cell.append(img, lens);
       wrap.appendChild(cell);
@@ -294,8 +312,8 @@ function _imgOpenCompare() {
     widgetWrap.innerHTML = '';
     const wrap = document.createElement('div'); wrap.className = 'cmp-blend-wrap';
     const canvas = document.createElement('div'); canvas.className = 'blend-canvas';
-    const imgA = document.createElement('img'); imgA.src = mediaUrl(a.path);
-    const imgB = document.createElement('img'); imgB.src = mediaUrl(b.path); imgB.className = 'blend-top';
+    const imgA = document.createElement('img'); imgA.src = (a.imageUrl || mediaUrl(a.path));
+    const imgB = document.createElement('img'); imgB.src = (b.imageUrl || mediaUrl(b.path)); imgB.className = 'blend-top';
     imgB.style.opacity = blendOpacity;
     canvas.append(imgA, imgB);
     wrap.appendChild(canvas);
@@ -320,6 +338,7 @@ function _imgOpenCompare() {
   }
 
   function renderPair(pi) {
+    if (sliderObserver) { sliderObserver.disconnect(); sliderObserver = null; }
     activePair = pi;
     const [a, b] = pairs[pi];
     // Remove blend controls from previous render
@@ -335,7 +354,7 @@ function _imgOpenCompare() {
   renderPair(0);
 
   // Keyboard
-  const close = () => { ov.remove(); document.removeEventListener('keydown', onKey); };
+  const close = () => { ov.remove(); document.removeEventListener('keydown', onKey); if (sliderObserver) sliderObserver.disconnect(); if (onClose) onClose(); };
   ov.querySelector('.fs-close').addEventListener('click', close);
   const onKey = e => {
     if (e.key === 'Escape') { close(); return; }
@@ -426,6 +445,7 @@ function _imgBuildAnimate(container, entries, tag) {
   expNames.forEach(exp => {
     const cell = document.createElement('div'); cell.className = 'animate-cell';
     const img = document.createElement('img'); img.alt = exp;
+    img.loading = 'lazy'; img.decoding = 'async';
     const placeholder = document.createElement('div'); placeholder.className = 'img-placeholder';
     placeholder.style.display = 'none';
     const phMsg = document.createElement('span'); phMsg.className = 'img-placeholder-msg';
@@ -473,7 +493,8 @@ function _imgBuildAnimate(container, entries, tag) {
       _imgSyncCellCheckbox(cellEls[exp], steps, idx);
       const path = byExp[exp][step];
       if (path) {
-        cells[exp].src = mediaUrl(path);
+        const url = thumbUrl(path, cellEls[exp].clientWidth);
+        if (cells[exp].getAttribute('src') !== url) cells[exp].src = url;
         cells[exp].style.display = '';
         placeholders[exp].style.display = 'none';
       } else {
@@ -524,9 +545,22 @@ function _imgBuildAnimate(container, entries, tag) {
 
   renderFrame(0);
   refreshMarkers();
+  if (typeof ResizeObserver !== 'undefined') {
+    if (!_imgResizeObserver) {
+      _imgResizeObserver = new ResizeObserver(entries => entries.forEach(e => e.target._vtRerender()));
+    }
+    viewport._vtRerender = () => renderFrame(parseInt(slider.value));
+    _imgResizeObserver.observe(viewport);
+  }
 }
 
 function buildImages() {
+  // Auto-refresh fires on any data change (e.g. every new scalar); rebuilding
+  // would re-request and re-decode every image, so skip when images are unchanged.
+  const signature = JSON.stringify(DATA.map(exp => [exp.name, exp.image_tags, exp.images, expColors[exp.name]]));
+  if (signature === _imgGridSignature) return;
+  _imgGridSignature = signature;
+  if (_imgResizeObserver) _imgResizeObserver.disconnect();
   // Clear selection, animation timers, and marker callbacks
   _imgCompareSelection.length = 0;
   _imgUpdateCompareToolbar();
@@ -574,7 +608,7 @@ function buildAudio() {
   DATA.forEach(exp => (exp.audio_tags || []).forEach(tag => (exp.audio_data[tag] || []).forEach(a => {
     n++; const d = document.createElement('div'); d.className = 'media-card'; d.style.marginBottom = '12px';
     d.dataset.dragId = exp.name + '/' + tag + '/' + a.step;
-    d.innerHTML = `<div class="label"><span class="exp" style="color:${expColors[exp.name] || 'var(--muted)'}">${escapeHtml(exp.name)}</span> / <span class="tag">${escapeHtml(tag)}</span> — step ${a.step}</div><audio controls src="${mediaUrl(a.path)}" style="width:100%;padding:0 12px 8px"></audio>`;
+    d.innerHTML = `<div class="label"><span class="exp" style="color:${expColors[exp.name] || 'var(--muted)'}">${escapeHtml(exp.name)}</span> / <span class="tag">${escapeHtml(tag)}</span> — step ${a.step}</div><audio controls preload="none" src="${mediaUrl(a.path)}" style="width:100%;padding:0 12px 8px"></audio>`;
     c.appendChild(d);
   })));
   if (!n) c.innerHTML = '<div class="empty-msg">No audio logged.</div>';
@@ -648,154 +682,348 @@ function _vidToggleSelect(exp, tag, step, path, cardEl, checked) {
   _vidUpdateCompareToolbar();
 }
 
-// Generate a first-frame poster by drawing an actual decoded frame to canvas.
-// Avoids the black placeholder some browsers show with metadata-only preload.
+// Use an already decoded frame; never trigger a decode just for a thumbnail.
 function _vidEnsurePoster(videoEl) {
   if (!videoEl) return;
   const onLoaded = () => {
-    if (videoEl._posterDone) return;
+    if (videoEl._posterDone || videoEl.poster) return;
     const w = videoEl.videoWidth, h = videoEl.videoHeight;
     if (!w || !h) return;
     try {
       const c = document.createElement('canvas');
-      c.width = w; c.height = h;
-      c.getContext('2d').drawImage(videoEl, 0, 0, w, h);
+      const scale = Math.min(1, 480 / Math.max(w, h));
+      c.width = Math.max(1, Math.round(w * scale));
+      c.height = Math.max(1, Math.round(h * scale));
+      c.getContext('2d').drawImage(videoEl, 0, 0, c.width, c.height);
       videoEl.poster = c.toDataURL('image/jpeg', 0.7);
       videoEl._posterDone = true;
     } catch (e) { /* CORS or codec issue — leave default */ }
   };
   videoEl.addEventListener('loadeddata', onLoaded);
   videoEl.addEventListener('seeked', onLoaded);
-  videoEl.addEventListener('loadedmetadata', () => {
-    if (videoEl.readyState >= 2) {
-      onLoaded();
-      return;
-    }
-    try {
-      const target = Math.min(0.001, Math.max(0, (videoEl.duration || 0) - 0.001));
-      videoEl.currentTime = isFinite(target) ? target : 0;
-    } catch (e) {
-      videoEl.load();
-    }
-  });
-  try { videoEl.load(); } catch (e) {}
+}
+
+function _vidRelease(video) {
+  if (video.videoWidth && video.videoHeight) {
+    video.style.aspectRatio = video.videoWidth + ' / ' + video.videoHeight;
+  }
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+}
+
+let _vidGridSignature = null;
+let _vidViewportObserver = null;
+
+// Grid tiles show a server-rendered first frame and keep preload="none", so
+// no video bytes are fetched and no decoder exists until the user hits play.
+// Without a poster (no ffmpeg on the server) fall back to decoding metadata.
+function _vidLoadPoster(video) {
+  const probe = new Image();
+  probe.onload = () => {
+    video.poster = probe.src;
+    _vidAutoSizeFrom(probe.naturalWidth, probe.naturalHeight);
+    if (!video.style.aspectRatio) video.style.aspectRatio = probe.naturalWidth + ' / ' + probe.naturalHeight;
+  };
+  probe.onerror = () => {
+    video._vtPosterFailed = true;
+    if (video.hasAttribute('src') && video.preload === 'none') { video.preload = 'metadata'; video.load(); }
+  };
+  probe.src = thumbUrl(video.dataset.videoPath, video.clientWidth);
+}
+
+function _vidAttach(video) {
+  const usePoster = !!video.dataset.videoPath && !video._vtPosterFailed;
+  if (usePoster && !video.poster && !video._vtPosterRequested) {
+    video._vtPosterRequested = true;
+    _vidLoadPoster(video);
+  }
+  video.preload = usePoster ? 'none' : 'metadata';
+  video.src = video.dataset.videoUrl;
+}
+
+function _vidObserve(video, url) {
+  video.preload = 'none';
+  video.dataset.videoUrl = url;
+  if (typeof IntersectionObserver === 'undefined') {
+    _vidAttach(video);
+    return;
+  }
+  if (!_vidViewportObserver) {
+    _vidViewportObserver = new IntersectionObserver(entries => {
+      entries.forEach(({target, isIntersecting}) => {
+        if (isIntersecting && !target.hasAttribute('src')) {
+          _vidAttach(target);
+        } else if (!isIntersecting && target.hasAttribute('src')) {
+          _vidRelease(target);
+        }
+      });
+    }, {rootMargin: '400px 0px'});
+  }
+  _vidViewportObserver.observe(video);
+}
+
+// ── Video preview sizing ─────────────────────────────────────
+// Clips are frequently wide strips (side-by-side comparisons), which the
+// default 240px media tile squashes to a ~55px-tall sliver. Tile width is
+// derived from the widest clip's aspect ratio so previews land near
+// VID_TARGET_H tall, and the size slider overrides it (persisted).
+const VID_TILE_KEY = 'vt_video_tile';
+const VID_TILE_MIN = 240, VID_TILE_MAX = 1400, VID_TILE_STEP = 20;
+const VID_TARGET_H = 200;
+let _vidAutoAspect = 0;
+
+function _vidStoredTile() {
+  try {
+    const v = parseInt(localStorage.getItem(VID_TILE_KEY));
+    return isFinite(v) && v > 0 ? v : null;
+  } catch (e) { return null; }
+}
+
+function _vidApplyTile(px, persist) {
+  // Snap to the slider's step so the slider, readout and grid never disagree.
+  const snapped = Math.round(px / VID_TILE_STEP) * VID_TILE_STEP;
+  const val = Math.min(VID_TILE_MAX, Math.max(VID_TILE_MIN, snapped));
+  const grid = document.getElementById('video-grid');
+  if (grid) grid.style.setProperty('--vid-tile', val + 'px');
+  const slider = document.getElementById('vid-size');
+  if (slider) slider.value = val;
+  const out = document.getElementById('vid-size-val');
+  if (out) out.textContent = val + 'px';
+  if (persist) { try { localStorage.setItem(VID_TILE_KEY, String(val)); } catch (e) {} }
+}
+
+function _vidInitSizeControl() {
+  const slider = document.getElementById('vid-size');
+  if (!slider || slider._vtBound) return;
+  slider._vtBound = true;
+  slider.addEventListener('input', () => _vidApplyTile(parseInt(slider.value), true));
+}
+
+// Widen the tile to fit the widest clip seen, unless the user has picked a size.
+function _vidAutoSizeFrom(w, h) {
+  if (_vidStoredTile() || !w || !h) return;
+  const aspect = w / h;
+  if (aspect <= _vidAutoAspect) return;
+  _vidAutoAspect = aspect;
+  _vidApplyTile(VID_TARGET_H * aspect, false);
+}
+
+function _vidAutoSize(videoEl) {
+  const apply = () => _vidAutoSizeFrom(videoEl.videoWidth, videoEl.videoHeight);
+  videoEl.addEventListener('loadedmetadata', apply);
+  if (videoEl.readyState >= 1) apply();
 }
 
 function buildVideo() {
+  const signature = JSON.stringify(DATA.map(exp => [exp.name, exp.video_tags, exp.video_data, expColors[exp.name]]));
+  if (signature === _vidGridSignature) return;
+  _vidGridSignature = signature;
+  if (_vidViewportObserver) _vidViewportObserver.disconnect();
+  document.querySelectorAll('#video-grid video').forEach(_vidRelease);
   _vidClearSelection();
+  _vidInitSizeControl();
+  _vidAutoAspect = 0;
   const g = document.getElementById('video-grid'); g.innerHTML = ''; let n = 0;
+  _vidApplyTile(_vidStoredTile() || VID_TILE_MIN, false);
   DATA.forEach(exp => (exp.video_tags || []).forEach(tag => (exp.video_data[tag] || []).forEach(v => {
     n++;
     const d = document.createElement('div'); d.className = 'media-card';
     d.dataset.dragId = exp.name + '/' + tag + '/' + v.step;
     const url = mediaUrl(v.path);
-    d.innerHTML = `<video controls playsinline src="${url}#t=0.001" preload="auto"></video>`
+    const title = `${exp.name} / ${tag} — step ${v.step}`;
+    d.innerHTML = '<video controls playsinline preload="none"></video>'
       + `<div class="label video-label"><span><span class="exp" style="color:${expColors[exp.name] || 'var(--muted)'}">${escapeHtml(exp.name)}</span>`
       + ` / <span class="tag">${escapeHtml(tag)}</span> — step ${v.step}</span>`
       + '<label class="vid-select-label"><input type="checkbox" class="vid-select-cb"><span class="vid-select-text">Compare</span></label></div>';
     const cb = d.querySelector('.vid-select-cb');
     cb.addEventListener('click', e => e.stopPropagation());
     cb.addEventListener('change', () => _vidToggleSelect(exp.name, tag, v.step, v.path, d, cb.checked));
-    _vidEnsurePoster(d.querySelector('video'));
+    const vidEl = d.querySelector('video');
+    vidEl.dataset.videoPath = v.path;
+    _vidEnsurePoster(vidEl);
+    _vidAutoSize(vidEl);
+    addExpandBtn(d, title, body => {
+      document.querySelectorAll('#video-grid video').forEach(v => v.pause());
+      const full = document.createElement('video');
+      full.controls = true; full.autoplay = true; full.playsInline = true; full.src = url;
+      body.appendChild(full);
+    });
     g.appendChild(d);
+    _vidObserve(vidEl, url);
   })));
   if (!n) g.innerHTML = '<div class="empty-msg">No video logged.</div>';
   else enableDragSort(g, 'video');
 }
 
+function _vidFrameIndex(times, time) {
+  let lo = 0, hi = times.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (times[mid] <= time + 0.000001) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+function _vidFrameTime(times, index, duration) {
+  const start = times[index];
+  const end = index + 1 < times.length ? times[index + 1] : duration;
+  return start + Math.max(0, Math.min(0.001, (end - start) / 2));
+}
+
+function _vidSeekDecoded(video, time) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      video.removeEventListener('seeked', ready);
+      video.removeEventListener('loadeddata', ready);
+      video.removeEventListener('error', fail);
+    };
+    const ready = () => {
+      if (!video.seeking && video.readyState >= 2) { cleanup(); resolve(); }
+    };
+    const fail = () => { cleanup(); reject(new Error('Unable to decode the selected frame')); };
+    video.addEventListener('seeked', ready);
+    video.addEventListener('loadeddata', ready);
+    video.addEventListener('error', fail);
+    timer = setTimeout(fail, 15000);
+    if (Math.abs(video.currentTime - time) > 0.00001) video.currentTime = time;
+    ready();
+  });
+}
+
 function _vidOpenCompare() {
   const sel = _vidCompareSelection.slice();
   if (sel.length < 2) return;
-
+  if (_vidViewportObserver) _vidViewportObserver.disconnect();
+  document.querySelectorAll('#video-grid video').forEach(_vidRelease);
   const ov = document.createElement('div'); ov.className = 'fs-overlay';
   ov.innerHTML = '<div class="fs-header"><h2>Video Comparison · ' + sel.length + ' clips</h2>'
     + '<div class="fs-header-right"><button class="fs-close">Close · Esc</button></div></div>'
-    + '<div class="fs-body compare-body" style="padding:0">'
-    + '<div class="vid-cmp-grid"></div>'
-    + '<div class="vid-cmp-ctrl"></div>'
-    + '</div>';
+    + '<div class="fs-body compare-body" style="padding:0"><div class="vid-cmp-grid"></div>'
+    + '<div class="vid-frame-status" role="status">Loading frame timestamps…</div><div class="vid-cmp-ctrl"></div></div>';
   document.body.appendChild(ov);
-
-  const grid = ov.querySelector('.vid-cmp-grid');
-  const ctrl = ov.querySelector('.vid-cmp-ctrl');
-
-  const videos = sel.map(s => {
+  const grid = ov.querySelector('.vid-cmp-grid'), ctrl = ov.querySelector('.vid-cmp-ctrl');
+  const status = ov.querySelector('.vid-frame-status');
+  const legends = [];
+  const videos = sel.map((s, i) => {
     const cell = document.createElement('div'); cell.className = 'vid-cmp-cell';
     const v = document.createElement('video');
-    v.src = mediaUrl(s.path);
-    v.preload = 'auto';
-    v.muted = true;
-    v.playsInline = true;
-    _vidEnsurePoster(v);
+    v.preload = 'metadata'; v.muted = true; v.playsInline = true; v.src = mediaUrl(s.path);
     const lbl = document.createElement('div'); lbl.className = 'cell-label';
-    lbl.innerHTML = `<span class="exp" style="color:${expColors[s.exp] || 'var(--muted)'}">${escapeHtml(s.exp)}</span> / <span class="tag">${escapeHtml(s.tag)}</span> — step ${s.step}`;
-    cell.append(v, lbl);
-    grid.appendChild(cell);
-    return v;
+    const title = document.createElement('strong');
+    title.textContent = String.fromCharCode(65 + i) + ' · ' + s.exp;
+    const detail = document.createElement('div'); detail.textContent = s.tag + ' · step ' + s.step;
+    const frameLabel = document.createElement('div');
+    lbl.append(title, detail, frameLabel); legends.push(frameLabel);
+    cell.append(v, lbl); grid.appendChild(cell); return v;
   });
-
-  const playBtn = document.createElement('button'); playBtn.innerHTML = '&#9654;'; playBtn.title = 'Play / pause';
-  const seek = document.createElement('input'); seek.type = 'range'; seek.min = '0'; seek.max = '1000'; seek.value = '0'; seek.step = '1';
-  const timeLbl = document.createElement('span'); timeLbl.textContent = '0.00s / 0.00s';
-  ctrl.append(playBtn, seek, timeLbl);
-
-  let maxDur = 0;
-  let scrubbing = false;
-  let playing = false;
-
-  function fmt(t) { return (isFinite(t) ? t : 0).toFixed(2) + 's'; }
-  function refreshDur() {
-    maxDur = videos.reduce((m, v) => Math.max(m, isFinite(v.duration) ? v.duration : 0), 0);
-    timeLbl.textContent = fmt(videos[0].currentTime || 0) + ' / ' + fmt(maxDur);
+  function button(text, label) {
+    const b = document.createElement('button'); b.textContent = text; b.title = label;
+    b.setAttribute('aria-label', label); return b;
   }
-  videos.forEach(v => v.addEventListener('loadedmetadata', refreshDur));
-
-  const master = videos[0];
-  master.addEventListener('timeupdate', () => {
-    if (scrubbing || !maxDur) return;
-    const t = master.currentTime;
-    seek.value = String(Math.round((t / maxDur) * 1000));
-    timeLbl.textContent = fmt(t) + ' / ' + fmt(maxDur);
-    videos.slice(1).forEach(v => {
-      const target = Math.min(t, v.duration || t);
-      if (Math.abs(v.currentTime - target) > 0.18) v.currentTime = target;
+  const play = button('▶', 'Play / pause');
+  const prev = button('◀|', 'Previous frame (Left arrow)');
+  const next = button('|▶', 'Next frame (Right arrow)');
+  const inspect = button('Compare frame as images', 'Compare frame as images');
+  const seek = document.createElement('input'); seek.type = 'range'; seek.min = '0'; seek.max = '0'; seek.value = '0'; seek.step = '1'; seek.setAttribute('aria-label', 'Frame');
+  const number = document.createElement('input'); number.type = 'number'; number.min = '1'; number.value = '1'; number.step = '1'; number.setAttribute('aria-label', 'Go to frame');
+  const label = document.createElement('span'); label.textContent = 'Frame —';
+  ctrl.append(play, prev, next, seek, number, label, inspect);
+  let timelines = null, frame = 0, count = 0, playing = false, closed = false, revision = 0;
+  let work = Promise.resolve();
+  const abort = new AbortController();
+  [prev,next,seek,number,inspect].forEach(c => c.disabled = true);
+  function pause() { videos.forEach(v => v.pause()); playing = false; play.textContent = '▶'; }
+  function update() {
+    seek.value = String(frame); number.value = String(frame + 1);
+    label.textContent = `Frame ${frame + 1} / ${count}`;
+    legends.forEach((l,i) => {
+      const t = timelines[i].times[frame];
+      l.textContent = `Frame ${frame + 1} / ${timelines[i].times.length} · ${t.toFixed(3)} s · ${videos[i].videoWidth} × ${videos[i].videoHeight}`;
     });
+    prev.disabled = frame === 0; next.disabled = frame === count - 1;
+  }
+  function go(index) {
+    if (!timelines || closed) return Promise.resolve();
+    pause(); frame = Math.max(0, Math.min(count - 1, Math.round(index)));
+    const selected = frame, request = ++revision;
+    work = work.catch(() => {}).then(async () => {
+      if (closed || request !== revision) return;
+      await Promise.all(videos.map((v,i) => _vidSeekDecoded(v, _vidFrameTime(timelines[i].times, selected, v.duration))));
+      if (!closed && request === revision) update();
+    });
+    work.catch(e => { if (!closed) status.textContent = e.message; });
+    return work;
+  }
+  prev.addEventListener('click', () => go(frame - 1));
+  next.addEventListener('click', () => go(frame + 1));
+  seek.addEventListener('input', () => go(Number(seek.value)));
+  number.addEventListener('input', () => { if (Number.isFinite(number.valueAsNumber)) go(number.valueAsNumber - 1); });
+  play.addEventListener('click', async () => {
+    if (playing) { pause(); if (timelines) await go(_vidFrameIndex(timelines[0].times,videos[0].currentTime)); return; }
+    await work.catch(() => {});
+    if (closed) return;
+    if (timelines && frame === count - 1) await go(0);
+    try { await Promise.all(videos.map(v => v.play())); if (!closed) { playing = true; play.textContent = 'Ⅱ'; } }
+    catch (e) { pause(); status.textContent = 'Playback unavailable: ' + e.message; }
   });
-  master.addEventListener('ended', () => {
-    videos.forEach(v => v.pause());
-    playing = false; playBtn.innerHTML = '&#9654;';
+  videos[0].addEventListener('timeupdate', () => {
+    if (!playing || !timelines) return;
+    frame = Math.min(count - 1,_vidFrameIndex(timelines[0].times,videos[0].currentTime)); update();
+    videos.slice(1).forEach((v,i) => {
+      const target = timelines[i+1].times[frame];
+      if (!v.seeking && v.readyState >= 3 && Math.abs(v.currentTime-target) > .18) v.currentTime = target;
+    });
+    if (frame === count - 1) pause();
   });
-
-  playBtn.addEventListener('click', async () => {
-    if (playing) {
-      videos.forEach(v => v.pause());
-      playing = false; playBtn.innerHTML = '&#9654;';
-    } else {
-      await Promise.all(videos.map(v => v.play().catch(() => {})));
-      playing = true; playBtn.innerHTML = '&#9646;&#9646;';
-    }
+  videos[0].addEventListener('ended', pause);
+  inspect.addEventListener('click', async () => {
+    inspect.disabled = true;
+    try {
+      await go(frame);
+      if (closed) return;
+      const images = await Promise.all(videos.map(async (v,i) => {
+        const canvas = document.createElement('canvas'); canvas.width = v.videoWidth; canvas.height = v.videoHeight;
+        canvas.getContext('2d').drawImage(v,0,0);
+        const blob = await new Promise(resolve => canvas.toBlob(resolve,'image/png'));
+        if (!blob) throw new Error('Unable to capture frame');
+        return {...sel[i], exp: String.fromCharCode(65+i) + ' · ' + sel[i].exp,
+          tag: `${sel[i].tag} · frame ${frame+1} · ${timelines[i].times[frame].toFixed(3)} s`, imageUrl: URL.createObjectURL(blob)};
+      }));
+      if (closed) images.forEach(i => URL.revokeObjectURL(i.imageUrl));
+      else _imgOpenCompare(images, () => images.forEach(i => URL.revokeObjectURL(i.imageUrl)));
+    } catch(e) { if (!closed) status.textContent = e.message; }
+    finally { if (!closed) inspect.disabled = false; }
   });
-
-  seek.addEventListener('input', () => {
-    scrubbing = true;
-    if (!maxDur) return;
-    const t = (parseInt(seek.value) / 1000) * maxDur;
-    videos.forEach(v => { v.currentTime = Math.min(t, v.duration || t); });
-    timeLbl.textContent = fmt(t) + ' / ' + fmt(maxDur);
-  });
-  seek.addEventListener('change', () => { scrubbing = false; });
-
+  const metadata = videos.map(v => new Promise((resolve,reject) => {
+    if (v.readyState >= 1) { resolve(); return; }
+    v.addEventListener('loadedmetadata', resolve, {once:true});
+    v.addEventListener('error', () => reject(new Error('Video metadata unavailable')), {once:true});
+  }));
+  Promise.all([Promise.all(metadata), Promise.all(sel.map(s => fetch('/api/video-timeline?path='+encodeURIComponent(s.path), {signal:abort.signal})
+    .then(async r => { const d=await r.json(); if (!r.ok) throw new Error(d.error); return d; })))]).then(async ([_,data]) => {
+    if (closed) return;
+    timelines = data; count = Math.min(...data.map(d => d.times.length)); seek.max = String(count-1); number.max = String(count);
+    [seek,number,inspect].forEach(c => c.disabled = false);
+    status.textContent = 'Left / Right: one frame · Space: play / pause · Compare frame as images: slider, toggle, magnifier, blend';
+    await go(0);
+  }).catch(e => { if (!closed) status.textContent = 'Frame controls unavailable: ' + e.message; });
   const close = () => {
-    videos.forEach(v => { try { v.pause(); v.src = ''; v.load(); } catch (e) {} });
-    ov.remove();
-    document.removeEventListener('keydown', onKey);
+    closed = true; ++revision; abort.abort(); pause(); videos.forEach(_vidRelease); ov.remove();
+    document.querySelectorAll('#video-grid video').forEach(v => _vidObserve(v,v.dataset.videoUrl));
+    document.removeEventListener('keydown',onKey);
   };
   const onKey = e => {
-    if (e.key === 'Escape') close();
-    else if (e.key === ' ') { e.preventDefault(); playBtn.click(); }
+    if (Array.from(document.querySelectorAll('.fs-overlay')).at(-1) !== ov) return;
+    if (e.key === 'Escape') { close(); return; }
+    if (e.target.matches('input, textarea, [contenteditable=true]')) return;
+    if (e.key === 'ArrowLeft' && timelines) { e.preventDefault(); go(frame-1); }
+    else if (e.key === 'ArrowRight' && timelines) { e.preventDefault(); go(frame+1); }
+    else if (e.key === ' ') { e.preventDefault(); play.click(); }
   };
-  ov.querySelector('.fs-close').addEventListener('click', close);
-  document.addEventListener('keydown', onKey);
+  ov.querySelector('.fs-close').addEventListener('click',close); document.addEventListener('keydown',onKey);
 }
 
 // ── Artifacts ────────────────────────────────────────────────
@@ -912,6 +1140,7 @@ function buildGraphs() {
       if (pngAbs) {
         const img = document.createElement('img');
         img.className = 'model-png';
+        img.loading = 'lazy'; img.decoding = 'async';
         img.alt = `${item.tag} step ${item.step}`;
         img.src = mediaUrl(pngAbs);
         body.appendChild(img);

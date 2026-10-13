@@ -6,7 +6,23 @@ const _colorKey = 'vt_colors_' + (window.VT_PROJECT || '');
 const _savedColors = (() => { try { return JSON.parse(localStorage.getItem(_colorKey)) || {}; } catch { return {}; } })();
 const expColors = {};
 function _saveColors() { try { localStorage.setItem(_colorKey, JSON.stringify(expColors)); } catch {} }
+// Saved colors can repeat: older versions fell back to the first palette color
+// once all 10 were in use, and a new (newest-first, so first-picked) experiment
+// can land on a color an older one saved. Keep one experiment per color —
+// preferring a saved choice — and re-pick the others.
+function _dedupeColors() {
+  const saved = name => Object.hasOwn(_savedColors, name);
+  const owners = new Map();
+  Object.keys(expColors).forEach(name => {
+    const c = expColors[name].toLowerCase();
+    if (!owners.has(c) || (!saved(owners.get(c)) && saved(name))) owners.set(c, name);
+  });
+  Object.keys(expColors).forEach(name => {
+    if (owners.get(expColors[name].toLowerCase()) !== name) expColors[name] = pickDistinctColor(Object.values(expColors));
+  });
+}
 DATA.forEach(d => { expColors[d.name] = _savedColors[d.name] || pickDistinctColor(Object.values(expColors)); });
+_dedupeColors();
 function getExpNames() { return DATA.map(d => d.name); }
 function syncExperimentState() {
   let changed = false;
@@ -17,7 +33,7 @@ function syncExperimentState() {
     }
     activePills.add(name);
   });
-  if (changed) _saveColors();
+  if (changed) { _dedupeColors(); _saveColors(); }
 }
 
 function buildPills() {

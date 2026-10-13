@@ -46,7 +46,9 @@ function pickDistinctColor(usedColors) {
     .filter(c => /^#[0-9a-fA-F]{6}$/.test(c))
     .map(c => c.toLowerCase());
   const unused = COLORS.filter(c => !normalized.includes(c.toLowerCase()));
-  const candidates = unused.length ? unused : COLORS;
+  // Re-picking from an exhausted palette would repeat a color.
+  if (!unused.length) return _pickExtraColor(normalized);
+  const candidates = unused;
   if (!normalized.length) return candidates[0] || COLORS[0];
   let best = candidates[0] || COLORS[0];
   let bestScore = -1;
@@ -57,6 +59,74 @@ function pickDistinctColor(usedColors) {
       best = candidate;
     }
   });
+  return best;
+}
+
+// ── Colors beyond the palette ────────────────────────────────
+// Once all COLORS are in use, pick from a perceptually even OKLCH grid whose
+// lightness/chroma bracket the palette's, taking whichever candidate is
+// farthest (in OKLab) from every color already in use.
+const _oklabCache = new Map();
+function _srgbToLinear(c) { return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; }
+function _linearToSrgb(c) { return c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055; }
+function hexToOklab(hex) {
+  let lab = _oklabCache.get(hex);
+  if (lab) return lab;
+  const [r, g, b] = [1, 3, 5].map(i => _srgbToLinear(parseInt(hex.slice(i, i + 2), 16) / 255));
+  const l = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  lab = [
+    0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+    1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+    0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+  ];
+  _oklabCache.set(hex, lab);
+  return lab;
+}
+// Returns null when the color is outside the sRGB gamut.
+function oklchToHex(L, C, hueDeg) {
+  const h = hueDeg * Math.PI / 180, a = C * Math.cos(h), b = C * Math.sin(h);
+  const l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3;
+  const rgb = [
+    4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+  ];
+  if (rgb.some(c => c < -1e-4 || c > 1 + 1e-4)) return null;
+  return '#' + rgb.map(c => Math.round(_linearToSrgb(Math.min(1, Math.max(0, c))) * 255).toString(16).padStart(2, '0')).join('');
+}
+let _extraColors = null;
+function _extraColorPool() {
+  if (!_extraColors) {
+    _extraColors = [];
+    for (const L of [0.62, 0.72, 0.82])
+      for (const C of [0.08, 0.12, 0.16])
+        for (let h = 0; h < 360; h += 10) {
+          const hex = oklchToHex(L, C, h);
+          if (hex) _extraColors.push(hex);
+        }
+  }
+  return _extraColors;
+}
+function _pickExtraColor(usedHex) {
+  const pool = _extraColorPool();
+  // Every color taken: repeats are unavoidable, so at least spread them out.
+  if (usedHex.length >= COLORS.length + pool.length) return pool[(usedHex.length - COLORS.length) % pool.length];
+  const used = usedHex.map(hexToOklab);
+  let best = null, bestScore = -1;
+  for (let i = 0; i < pool.length; i++) {
+    const p = hexToOklab(pool[i]);
+    let score = Infinity;
+    for (let j = 0; j < used.length && score > bestScore; j++) { // stop once it can't beat the best
+      const u = used[j], dL = p[0] - u[0], da = p[1] - u[1], db = p[2] - u[2];
+      const d = dL * dL + da * da + db * db;
+      if (d < score) score = d;
+    }
+    if (score > bestScore) { bestScore = score; best = pool[i]; }
+  }
   return best;
 }
 function withOpacity(color, opacity) {

@@ -34,6 +34,7 @@ from urllib.parse import urlencode, urlparse
 from ..cli import _bearer_matches, _secret_equals
 from ..compare import find_all_tags  # noqa: F401  (re-exported for tests)
 from ..config import VIBETRACK_CONFIG_DIR, load_public_config, save_public_config
+from ..insights import run_card
 from ..reader import ExperimentReader, RunReader
 from .base import BaseOutput
 
@@ -685,7 +686,19 @@ def _serialize_experiment(exp: ExperimentReader) -> Dict[str, Any]:
         "histogram_tags": list(histogram_data),
         "histogram_data": histogram_data,
         "hparams": exp.hparams(),
+        "run": _run_card_safe(exp),
     }
+
+
+def _run_card_safe(exp: ExperimentReader) -> Dict[str, Any]:
+    """Runs-tab payload; a broken record must not take the dashboard down."""
+    try:
+        return run_card(exp)
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "vibetrack web: run summary failed for %s: %s", exp.name, exc
+        )
+        return {"status": "unknown"}
 
 
 def _build_data(exps: Sequence[ExperimentReader]) -> list:
@@ -1216,6 +1229,18 @@ class WebOutput(BaseOutput):
         def api_projects() -> List[str]:
             return _all_projects()
 
+        @app.get("/api/info", dependencies=[Depends(_check_token)])
+        def api_info() -> dict:
+            """Identify this server; ``vibetrack open`` reuses a matching one."""
+            from .. import __version__
+
+            return {
+                "app": "vibetrack",
+                "version": __version__,
+                "db_path": str(self._reader.db_path),
+                "project_folder": self.project_folder,
+            }
+
         # ── Config ────────────────────────────────────────────
 
         # Config over HTTP never includes notification credentials: they are
@@ -1374,6 +1399,8 @@ class WebOutput(BaseOutput):
                     project_folder=normalized_pf,
                     system_metrics_interval=0,
                     resume=True,
+                    report=False,
+                    track_status=False,
                 )
             return SummaryWriter(
                 _central_ingest_log_dir(name, project_name),
@@ -1381,6 +1408,8 @@ class WebOutput(BaseOutput):
                 project=project_name,
                 system_metrics_interval=0,
                 resume=True,
+                report=False,
+                track_status=False,
             )
 
         def _ingest_project(project: str) -> str:

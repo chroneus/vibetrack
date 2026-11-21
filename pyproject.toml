@@ -57,6 +57,7 @@ include = ["vibetrack*"]
 [tool.setuptools.package-data]
 vibetrack = [
   "py.typed",
+  "agent_guide.md",
   "viewers/web/index.html",
   "viewers/web/css/*.css",
   "viewers/web/js/*.js",

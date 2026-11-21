@@ -38,10 +38,15 @@ vibetrack/
   reader.py          — ExperimentReader + RunReader (central DB or explicit project DB)
   smoother.py        — EMA (TB-style debiased), moving average, gaussian
   compare.py         — Cross-experiment comparison (scalars, hparams, summary tables)
+  insights.py        — Run status, overviews, comparisons + Markdown formatters (CLI, report, web, MCP)
+  _runmeta.py        — Process / git provenance, exit-status mapping, pid liveness
+  commands.py        — Agent CLI: ls, show, compare, open (background dashboard), guide
+  agent_guide.md     — Instructions printed by `vibetrack guide` (shipped as package data)
   types.py           — Media wrapper types: Image, Audio, Video, Artifact
   media.py           — File saving for media (lazy imports, zero-dep at import time)
   sysmetrics.py      — Optional OS/GPU system metrics collection
-  cli.py             — CLI: project-folder workflow, viewer auto-discovery, HTTP ingest, migration
+  cli.py             — CLI: project-folder workflow, viewer auto-discovery, HTTP ingest, migration;
+                       dispatches `ls/show/compare/open/guide` to commands.py
   _graph.py          — PyTorch graph extraction helper for add_graph()
   viewers/
     __init__.py      — Auto-discovery: discover_viewers(), load_viewer()
@@ -94,6 +99,19 @@ vibetrack/
 - **Viewer auto-discovery**: `viewers/__init__.py` scans viewer modules,
   excludes infrastructure files, and maps filename to viewer name (stripping
   `_ui` suffix).
+- **Run lifecycle**: the `run_info` table (no FK, so older versions can still
+  delete experiments) stores status (`running` / `finished` / `failed` /
+  `interrupted`), start / end / heartbeat times and JSON provenance (pid,
+  host, masked argv, cwd, git, error + traceback, `define_metric`
+  declarations). `close()` reads the in-flight exception (`sys.exc_info()`,
+  or `__exit__`); an atexit hook closes still-open writers using
+  `sys.last_value`; readers report a `running` run whose pid is gone as
+  `crashed`. Ingest writers pass `track_status=False, report=False`.
+- **Agent output**: `insights.py` is the single source for `vibetrack ls /
+  show / compare`, the end-of-run report printed to stderr on close
+  (`VIBETRACK_REPORT=0` disables it), the web Runs tab (`run` key of each
+  `/api/data` entry) and the MCP `list_runs` / `run_overview` /
+  `compare_runs` tools. Output is ASCII Markdown or JSON.
 - **Event dispatch**: every `add_*` and dict-style `log()` call returns an
   event handle; use `writer.to("telegram" | "slack" | ...)` for registered
   dispatch or `handle.to(...)` for one-shot forwarding. `every=` accepts
@@ -154,6 +172,9 @@ vibetrack --listen=0.0.0.0:9009 --token=SECRET  # with bearer auth
 vibetrack --host=127.0.0.1 --port=8080          # restrict to localhost only
 vibetrack --viewer=mcp --mcp-transport=sse      # standalone MCP, SSE transport
 vibetrack migrate PROJECT_FOLDER                # merge legacy per-run DBs into project DB
+vibetrack ls | show [RUN] | compare [RUN ...]   # agent-friendly run summaries (--json)
+vibetrack open [RUN ...]                        # reuse/start a background dashboard, open Runs tab
+vibetrack guide [--install]                     # agent instructions; --install writes skill + AGENTS.md
 ```
 
 The legacy `--logdir` flag is accepted as an alias for `--project-folder`.
@@ -227,6 +248,8 @@ truth used by `config.py`, `writer.py`, and the web UI.
 
 Tabs are data-driven; Settings is always shown:
 - **Scalars** — Chart.js line charts with smoothing, experiment pills.
+- **Runs** — one card per run: status, headline metrics, params that differ,
+  latest video / image. Deep links `?run=A&run=B&tab=runs` focus runs.
 - **Images** — lazy-loaded grid, step playback, side-by-side / lens / blend
   comparison.
 - **Audio** — HTML5 audio players.
@@ -248,6 +271,7 @@ Tabs are data-driven; Settings is always shown:
 - `pytest tests/` runs the full suite. Test files live under `tests/`:
   `test_config.py`, `test_db.py`, `test_dispatch.py`, `test_distributed.py`,
   `test_compare.py`, `test_gradio.py`, `test_media.py`, `test_outputs.py`,
+  `test_lifecycle.py`, `test_insights.py`, `test_cli_commands.py`,
   `test_reader.py`, `test_smoother.py`, `test_sysmetrics.py`,
   `test_writer.py`.
 - Use the `tmp_path` fixture for all DB / file tests.

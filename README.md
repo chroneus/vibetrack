@@ -14,10 +14,39 @@ Key features:
 - TensorBoard SummaryWriter compatible drop-in APIs.
 - Query results through the MCP server.
 - Fast scalar logging; see the [benchmark report](https://github.com/chroneus/vibetrack/blob/main/docs/BENCHMARK.md).
+- Built for AI coding agents: run status, compact `ls` / `show` / `compare`
+  output, an end-of-run report, and a dashboard that opens on the results.
 
+## Use with AI coding agents
 
+Tell your agent (Claude Code, Codex, Cursor, ...) to "use vibetrack for this
+experiment". It installs vibetrack and runs `vibetrack guide` to get the
+instrumentation checklist and commands. To make every future session in a
+repository find the guide, run:
 
+```bash
+vibetrack guide --install   # writes .claude/skills/vibetrack/SKILL.md and an AGENTS.md section
+```
 
+What the agent then gets:
+
+- **Every run records its outcome:** `running`, `finished`, `failed` (with the
+  traceback), `interrupted` or `crashed` (process died). It also records the
+  command line, git commit and dirty state, and host.
+- **An end-of-run report on stderr:** config, headline metrics (last and best
+  @step), media files, rank among the project's runs and the dashboard link.
+- **Compact Markdown for comparing runs** (`--json` for structured data):
+
+  ```bash
+  vibetrack ls                       # runs: status, duration, step, headline metrics
+  vibetrack show RUN                 # config, metric trends, media files, errors
+  vibetrack compare [RUN|GLOB ...]   # ranking, params that differ, metric table
+  ```
+
+- **Results shown to you, not just described:** `vibetrack open RUN` starts the
+  dashboard in the background if needed and opens the **Runs** tab. Each run is
+  a card with its status, key metrics, the params that differ and its latest
+  video or image.
 
 ## Install
 
@@ -225,7 +254,16 @@ vibetrack --port 8080               # Custom port
 vibetrack --token SECRET            # Protect ingest endpoints
 vibetrack --listen 0.0.0.0:9009     # Open server on separate port
 vibetrack migrate PROJECT_FOLDER    # Merge legacy per-run DBs into project DB
+
+vibetrack ls [-p PROJECT]           # List runs (status, duration, headline metrics)
+vibetrack show [RUN]                # One run in detail (default: latest)
+vibetrack compare [RUN|GLOB ...]    # Rank runs, diff params, compare metrics
+vibetrack open [RUN ...]            # Open the dashboard on runs (starts it if needed)
+vibetrack guide [--install]         # Instructions for AI coding agents
 ```
+
+`ls`, `show` and `compare` accept `--json`. Add `--project-folder DIR` for
+runs logged with `project_folder=DIR`.
 
 ## How is vibetrack configured?
 

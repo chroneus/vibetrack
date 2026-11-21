@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..compare import compare_hparams, summary_table
+from ..insights import classify_trend as _classify_trend
+from ..insights import compare_runs as compare_runs_payload
+from ..insights import format_compare, format_overview, format_runs
+from ..insights import list_runs as list_runs_payload
+from ..insights import run_overview as run_overview_payload
 from .base import BaseOutput
 from .console import ConsoleOutput
 
@@ -59,40 +64,6 @@ def _percent(numerator: float, denominator: float) -> Optional[float]:
     if denominator == 0:
         return None
     return numerator / abs(denominator) * 100.0
-
-
-def _classify_trend(values: Sequence[float]) -> Dict[str, Any]:
-    if len(values) < 2:
-        return {
-            "direction": "insufficient_data",
-            "positive_steps": 0,
-            "negative_steps": 0,
-            "flat_steps": 0,
-            "consistency": None,
-        }
-    diffs = [b - a for a, b in zip(values, values[1:])]
-    value_range = max(values) - min(values)
-    eps = max(value_range * 1e-6, 1e-12)
-    positive = sum(1 for d in diffs if d > eps)
-    negative = sum(1 for d in diffs if d < -eps)
-    flat = len(diffs) - positive - negative
-    net = values[-1] - values[0]
-    if abs(net) <= eps:
-        direction = "flat"
-        consistency = flat / len(diffs) if diffs else None
-    elif net < 0:
-        consistency = negative / len(diffs)
-        direction = "decreasing" if consistency >= 0.8 else "volatile_decreasing"
-    else:
-        consistency = positive / len(diffs)
-        direction = "increasing" if consistency >= 0.8 else "volatile_increasing"
-    return {
-        "direction": direction,
-        "positive_steps": positive,
-        "negative_steps": negative,
-        "flat_steps": flat,
-        "consistency": consistency,
-    }
 
 
 def _plateau(rows: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -783,6 +754,54 @@ class MCPOutput(BaseOutput):
             if not exps:
                 return json.dumps({"error": "No experiments found"})
             return json.dumps(compare_hparams(exps))
+
+        @mcp.tool()
+        def list_runs(
+            project: Optional[str] = None,
+            limit: int = 30,
+            as_markdown: bool = False,
+        ) -> str:
+            """List runs newest first: status (running/finished/failed/crashed),
+            duration, last step, headline metrics (last and best @step) and
+            media counts. Start here to see what has been run."""
+            exps = reader.experiments(project=project)[: max(1, limit)]
+            rows = list_runs_payload(exps)
+            if as_markdown:
+                return format_runs(rows, project_folder=project_folder)
+            return _json_response(rows)
+
+        @mcp.tool()
+        def run_overview(experiment: str, as_markdown: bool = False) -> str:
+            """Everything about one run without raw series: status, command,
+            git, config, per-metric summary (last/best/trend/curve samples),
+            latest media file paths, text and error traceback."""
+            exps = resolve([experiment])
+            if not exps:
+                return json.dumps({"error": f"Experiment {experiment!r} not found"})
+            ov = run_overview_payload(exps[0])
+            if as_markdown:
+                return format_overview(ov, project_folder=project_folder)
+            return _json_response(ov)
+
+        @mcp.tool()
+        def compare_runs(
+            experiments: Optional[List[str]] = None,
+            metric: Optional[str] = None,
+            goal: Optional[str] = None,
+            as_markdown: bool = False,
+        ) -> str:
+            """Compare runs: ranking by the primary metric (declared, given or
+            auto-selected), params that differ vs. are shared, per-metric
+            last/best table, heuristic param effects and latest media."""
+            exps = resolve(experiments)
+            if not exps:
+                return json.dumps({"error": "No experiments found"})
+            if goal is not None and goal not in ("min", "max"):
+                return json.dumps({"error": "goal must be 'min' or 'max'"})
+            cmp = compare_runs_payload(exps, metric=metric, goal=goal)
+            if as_markdown:
+                return format_compare(cmp, project_folder=project_folder)
+            return _json_response(cmp)
 
         @mcp.tool()
         def run_report(experiment: str) -> str:

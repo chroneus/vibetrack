@@ -48,6 +48,9 @@ Available MCP tools:
 
 | Tool | Purpose |
 | --- | --- |
+| `list_runs` | Runs newest first: status, duration, last step, headline metrics, media counts |
+| `run_overview` | One run: status, command, git, config, metric summaries with trends, latest media paths, errors |
+| `compare_runs` | Ranking by the primary metric, params that differ vs. are shared, metric table, param effects |
 | `list_experiments` | List runs in the active project database |
 | `get_experiment_tags` | Return available scalar/text/media/artifact tags |
 | `get_scalars` | Return raw scalar time series for one tag |
@@ -66,6 +69,10 @@ Available MCP tools:
 
 The analysis tools are designed for LLMs. They avoid forcing the model to fetch
 and parse large raw arrays when a compact answer is enough.
+
+`list_runs`, `run_overview` and `compare_runs` return the same payloads as
+`vibetrack ls / show / compare --json`. Pass `as_markdown=true` to get the
+compact Markdown the CLI prints instead.
 
 Example `analyze_scalar` result:
 

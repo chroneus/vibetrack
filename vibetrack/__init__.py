@@ -66,6 +66,7 @@ __all__ = [
     "init",
     "log",
     "finish",
+    "define_metric",
     "config",
     # Smoothing
     "smooth",
@@ -173,8 +174,21 @@ def log(data: Dict[str, Any], step: Optional[int] = None, **kwargs: Any) -> None
     _step += 1
 
 
+def define_metric(tag: str, goal: Optional[str] = None, primary: bool = False) -> None:
+    """Declare how *tag* is judged (``goal="max"|"min"``) for the active run.
+
+    ::
+
+        vibetrack.define_metric("eval/return", goal="max", primary=True)
+    """
+    if _active_writer is None:
+        _warn("define_metric() called before init(); ignoring")
+        return
+    _active_writer.define_metric(tag, goal=goal, primary=primary)
+
+
 def finish() -> None:
-    """Flush and close the active writer."""
+    """Flush and close the active writer and print the run report."""
     global _active_writer
     if _active_writer is not None:
         try:

@@ -24,6 +24,9 @@ function _dedupeColors() {
 DATA.forEach(d => { expColors[d.name] = _savedColors[d.name] || pickDistinctColor(Object.values(expColors)); });
 _dedupeColors();
 function getExpNames() { return DATA.map(d => d.name); }
+// Runs seen so far: only newly appearing runs are switched on, so pills the
+// user hid (or a focused view) survive auto-refresh.
+const _knownExps = new Set(DATA.map(d => d.name));
 function syncExperimentState() {
   let changed = false;
   getExpNames().forEach(name => {
@@ -31,7 +34,7 @@ function syncExperimentState() {
       expColors[name] = _savedColors[name] || pickDistinctColor(Object.values(expColors));
       changed = true;
     }
-    activePills.add(name);
+    if (!_knownExps.has(name)) { _knownExps.add(name); activePills.add(name); }
   });
   if (changed) { _dedupeColors(); _saveColors(); }
 }

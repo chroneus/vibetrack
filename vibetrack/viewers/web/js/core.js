@@ -358,6 +358,7 @@ function buildTabs() {
   el.innerHTML = '';
   const defs = [
     { id: 'scalars', label: 'Scalars', has: DATA.some(d => (d.tags || []).length > 0 || (d.figure_tags || []).length > 0 || (d.pr_curve_tags || []).length > 0) },
+    { id: 'runs', label: 'Runs', has: DATA.length > 0 },
     { id: 'images', label: 'Images', has: DATA.some(d => (d.image_tags || []).length > 0) },
     { id: 'audio', label: 'Audio', has: DATA.some(d => (d.audio_tags || []).length > 0) },
     { id: 'video', label: 'Video', has: DATA.some(d => (d.video_tags || []).length > 0) },

@@ -2,7 +2,7 @@
 // Runs last; all build* functions have been registered by the prior modules.
 
 function buildAll() {
-  buildCharts();
+  buildCharts(); buildRuns();
   buildImages(); buildAudio(); buildVideo(); buildArtifacts();
   buildGraphs(); buildText(); buildHistograms(); buildHParams(); buildSystem();
   if (typeof buildMeshes === 'function') buildMeshes();
@@ -155,4 +155,4 @@ document.getElementById('hidden-charts-toggle').addEventListener('click', () => 
 _setupProjectSwitcher();
 _wireSettingsInputs();
 buildProjectInfo();
-loadSettings().finally(() => { buildTabs(); buildPills(); buildAll(); });
+loadSettings().finally(() => { applyUrlFocus(); buildTabs(); buildPills(); buildAll(); applyUrlTab(); });

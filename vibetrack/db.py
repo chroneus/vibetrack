@@ -112,6 +112,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
     FOREIGN KEY (experiment_id) REFERENCES experiments(id)
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_exp_tag ON artifacts(experiment_id, tag);
+
+-- Run lifecycle (status, timing, provenance). No FOREIGN KEY on purpose: an
+-- older vibetrack that does not know this table must still be able to delete
+-- experiments, and AUTOINCREMENT ids are never reused, so orphans are inert.
+CREATE TABLE IF NOT EXISTS run_info (
+    experiment_id INTEGER PRIMARY KEY,
+    status        TEXT NOT NULL DEFAULT 'running',
+    started_at    REAL,
+    ended_at      REAL,
+    heartbeat     REAL,
+    info          TEXT   -- JSON: pid, host, argv, cwd, git, error, ...
+);
 """
 
 
@@ -186,6 +198,8 @@ class Database:
         self._cache_artifacts: List[Tuple[int, str, int, str, Optional[str], float]] = (
             []
         )
+        # run_info: exp_id -> merged record (see update_run_info)
+        self._cache_run_info: Dict[int, Dict[str, Any]] = {}
         self._next_synthetic_id = -1
 
         if self._precache_active:
@@ -328,6 +342,10 @@ class Database:
                         row[2],
                         row[5],
                     )
+                # 12. Replay run lifecycle records
+                for eid, rec in self._cache_run_info.items():
+                    with self._connect() as conn:
+                        self._write_run_info(conn, id_remap.get(eid, eid), rec)
             except Exception:
                 # Restore precache flag so caches remain authoritative;
                 # the caller can retry materialization on the next write.
@@ -343,14 +361,15 @@ class Database:
                 )
                 raise
 
-            # 12. Fire callbacks (only after successful materialize)
+            # 13. Fire callbacks (only after successful materialize)
             for cb in self._remap_callbacks:
                 try:
                     cb(id_remap)
                 except Exception:
                     _log.exception("vibetrack: precache remap callback %r failed", cb)
 
-            # 13. Clear caches
+            # 14. Clear caches
+            self._cache_run_info.clear()
             self._cache_experiments.clear()
             self._cache_scalars.clear()
             self._cache_texts.clear()
@@ -361,7 +380,7 @@ class Database:
             self._cache_video.clear()
             self._cache_artifacts.clear()
 
-            # 14. Signal any waiters that materialization is complete.
+            # 15. Signal any waiters that materialization is complete.
             self._materialized_event.set()
 
     def wait_for_materialize(self, timeout: Optional[float] = None) -> bool:
@@ -719,6 +738,7 @@ class Database:
                 "audio",
                 "video",
                 "artifacts",
+                "run_info",
             ]:
                 conn.execute(
                     f"DELETE FROM {table} WHERE experiment_id IN ({placeholders})",
@@ -755,6 +775,7 @@ class Database:
                 "audio",
                 "video",
                 "artifacts",
+                "run_info",
             ]:
                 conn.execute(
                     f"DELETE FROM {table} WHERE experiment_id=?",
@@ -1520,6 +1541,234 @@ class Database:
             ).fetchall()
             return {r["key"]: json.loads(r["value"]) for r in rows}
 
+    # ── Run lifecycle ────────────────────────────────────────────
+
+    _RUN_FIELDS = ("status", "started_at", "ended_at", "heartbeat")
+
+    @staticmethod
+    def _run_row_to_dict(row: Any) -> Dict[str, Any]:
+        try:
+            info = json.loads(row["info"]) if row["info"] else {}
+        except (TypeError, ValueError):
+            info = {}
+        return {
+            "status": row["status"],
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+            "heartbeat": row["heartbeat"],
+            "info": info if isinstance(info, dict) else {},
+        }
+
+    @staticmethod
+    def _write_run_info(
+        conn: sqlite3.Connection, experiment_id: int, rec: Dict[str, Any]
+    ) -> None:
+        conn.execute(
+            "INSERT OR REPLACE INTO run_info"
+            "(experiment_id, status, started_at, ended_at, heartbeat, info) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                experiment_id,
+                rec.get("status") or "running",
+                rec.get("started_at"),
+                rec.get("ended_at"),
+                rec.get("heartbeat"),
+                json.dumps(rec.get("info") or {}, default=str),
+            ),
+        )
+
+    def update_run_info(
+        self,
+        experiment_id: int,
+        info: Optional[Dict[str, Any]] = None,
+        **fields: Any,
+    ) -> None:
+        """Merge lifecycle fields into an experiment's ``run_info`` record.
+
+        *fields* may set ``status``, ``started_at``, ``ended_at`` and
+        ``heartbeat``. ``started_at`` keeps its first value so a resumed run
+        reports when it originally started. *info* is shallow-merged into the
+        stored JSON (``None`` values delete keys).
+        """
+        unknown = set(fields) - set(self._RUN_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown run_info fields: {sorted(unknown)}")
+
+        def merge(rec: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+            out: Dict[str, Any] = dict(rec) if rec else {"status": "running", "info": {}}
+            for key, value in fields.items():
+                if key == "started_at" and out.get("started_at") is not None:
+                    continue
+                out[key] = value
+            if info:
+                merged = dict(out.get("info") or {})
+                for key, value in info.items():
+                    if value is None:
+                        merged.pop(key, None)
+                    else:
+                        merged[key] = value
+                out["info"] = merged
+            return out
+
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active and not self._check_and_maybe_materialize():
+                    self._cache_run_info[experiment_id] = merge(
+                        self._cache_run_info.get(experiment_id)
+                    )
+                    return
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM run_info WHERE experiment_id=?", (experiment_id,)
+            ).fetchone()
+            current = self._run_row_to_dict(row) if row is not None else None
+            self._write_run_info(conn, experiment_id, merge(current))
+
+    def get_run_info(self, experiment_id: int) -> Optional[Dict[str, Any]]:
+        """Return the lifecycle record for one experiment, or ``None``."""
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active and not self._check_and_maybe_materialize():
+                    rec = self._cache_run_info.get(experiment_id)
+                    return dict(rec) if rec is not None else None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM run_info WHERE experiment_id=?", (experiment_id,)
+            ).fetchone()
+        return self._run_row_to_dict(row) if row is not None else None
+
+    def get_all_run_info(self) -> Dict[int, Dict[str, Any]]:
+        """Return every lifecycle record keyed by experiment id."""
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active and not self._check_and_maybe_materialize():
+                    return {k: dict(v) for k, v in self._cache_run_info.items()}
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM run_info").fetchall()
+        return {int(r["experiment_id"]): self._run_row_to_dict(r) for r in rows}
+
+    def get_last_activity(self, experiment_id: int) -> Optional[Dict[str, Any]]:
+        """Return ``{"step", "wall_time"}`` of the newest scalar row, or ``None``."""
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active and not self._check_and_maybe_materialize():
+                    rows = [r for r in self._cache_scalars if r[0] == experiment_id]
+                    if not rows:
+                        return None
+                    steps = [
+                        r[2] for r in rows if not r[1].startswith(("system/", "gpu/"))
+                    ]
+                    return {
+                        "step": max(steps) if steps else None,
+                        "wall_time": max(r[4] for r in rows),
+                    }
+        with self._connect() as conn:
+            row = conn.execute(
+                # The step ignores system/GPU samples, which count their own.
+                "SELECT MAX(CASE WHEN tag NOT LIKE 'system/%' "
+                "AND tag NOT LIKE 'gpu/%' THEN step END) AS step, "
+                "MAX(wall_time) AS wall_time "
+                "FROM scalars WHERE experiment_id=?",
+                (experiment_id,),
+            ).fetchone()
+        if row is None or row["wall_time"] is None:
+            return None
+        return {"step": row["step"], "wall_time": row["wall_time"]}
+
+    def get_scalar_stats(
+        self,
+        experiment_id: int,
+        tags: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Per-tag scalar aggregates without loading whole series.
+
+        Returns ``{tag: {n, first_step, last_step, last, min, min_step, max,
+        max_step}}``, optionally limited to *tags*. Used by run listings and
+        comparisons, where only the last and extreme values matter.
+        """
+        wanted = set(tags) if tags is not None else None
+        if wanted is not None and not wanted:
+            return {}
+        if self._precache_active:
+            with self._lock:
+                if self._precache_active and not self._check_and_maybe_materialize():
+                    stats: Dict[str, Dict[str, Any]] = {}
+                    for r in self._cache_scalars:
+                        if r[0] != experiment_id:
+                            continue
+                        if wanted is not None and r[1] not in wanted:
+                            continue
+                        tag, step, value = r[1], r[2], r[3]
+                        st = stats.get(tag)
+                        if st is None:
+                            stats[tag] = {
+                                "n": 1,
+                                "first_step": step,
+                                "last_step": step,
+                                "last": value,
+                                "min": value,
+                                "min_step": step,
+                                "max": value,
+                                "max_step": step,
+                            }
+                            continue
+                        st["n"] += 1
+                        if step < st["first_step"]:
+                            st["first_step"] = step
+                        if step >= st["last_step"]:
+                            st["last_step"], st["last"] = step, value
+                        if value < st["min"]:
+                            st["min"], st["min_step"] = value, step
+                        if value > st["max"]:
+                            st["max"], st["max_step"] = value, step
+                    return stats
+        out: Dict[str, Dict[str, Any]] = {}
+        tag_sql = ""
+        tag_params: Tuple[Any, ...] = ()
+        if wanted is not None:
+            tag_sql = f" AND tag IN ({','.join('?' for _ in wanted)})"
+            tag_params = tuple(sorted(wanted))
+        with self._connect() as conn:
+            for r in conn.execute(
+                "SELECT tag, COUNT(*) AS n, MIN(step) AS first_step, "
+                "MAX(step) AS last_step FROM scalars WHERE experiment_id=?"
+                f"{tag_sql} GROUP BY tag",
+                (experiment_id, *tag_params),
+            ):
+                out[r["tag"]] = {
+                    "n": r["n"],
+                    "first_step": r["first_step"],
+                    "last_step": r["last_step"],
+                }
+            # SQLite returns the other ("bare") columns from the row that
+            # holds the MIN / MAX, which gives the step of each extreme.
+            for r in conn.execute(
+                "SELECT tag, MIN(value) AS v, step FROM scalars "
+                f"WHERE experiment_id=?{tag_sql} GROUP BY tag",
+                (experiment_id, *tag_params),
+            ):
+                if r["tag"] in out:
+                    out[r["tag"]].update(min=r["v"], min_step=r["step"])
+            for r in conn.execute(
+                "SELECT tag, MAX(value) AS v, step FROM scalars "
+                f"WHERE experiment_id=?{tag_sql} GROUP BY tag",
+                (experiment_id, *tag_params),
+            ):
+                if r["tag"] in out:
+                    out[r["tag"]].update(max=r["v"], max_step=r["step"])
+            for r in conn.execute(
+                "SELECT s.tag, s.value FROM scalars s JOIN ("
+                "  SELECT tag, MAX(step) AS ms FROM scalars"
+                f"  WHERE experiment_id=?{tag_sql} GROUP BY tag"
+                ") m ON s.tag = m.tag AND s.step = m.ms "
+                "WHERE s.experiment_id=? ORDER BY s.rowid",
+                (experiment_id, *tag_params, experiment_id),
+            ):
+                if r["tag"] in out:
+                    out[r["tag"]]["last"] = r["value"]
+        return out
+
     # ── Bulk operations ──────────────────────────────────────────
 
     def delete_experiments_by_project(self, project: str) -> int:
@@ -1544,6 +1793,7 @@ class Database:
                 "artifacts",
                 "histograms",
                 "hparams",
+                "run_info",
             ):
                 conn.execute(
                     f"DELETE FROM {table} WHERE experiment_id IN ({placeholders})",

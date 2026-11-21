@@ -283,6 +283,111 @@ def save_audio(
     return str(dest.relative_to(Path(log_dir).resolve()))
 
 
+def _ffmpeg_exe() -> Optional[str]:
+    """System ffmpeg, else the binary bundled with ``imageio-ffmpeg``."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg  # type: ignore[import-untyped]
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _rgb_frames(frames: List[Any]) -> List[Any]:
+    """HxWx3 uint8 frames of one size (gray → RGB, alpha dropped)."""
+    import numpy as np  # type: ignore[import-untyped]
+
+    out = []
+    for frame in frames:
+        arr = np.asarray(frame)
+        if arr.ndim == 2:
+            arr = np.stack([arr] * 3, axis=-1)
+        elif arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+        elif arr.shape[-1] == 4:
+            arr = arr[..., :3]
+        out.append(np.ascontiguousarray(arr, dtype=np.uint8))
+    if any(f.shape != out[0].shape for f in out):
+        raise ValueError("all video frames must have the same size")
+    return out
+
+
+def _encode_mp4_ffmpeg(frames: List[Any], dest: Path, fps: Union[int, float], exe: str) -> bool:
+    """Pipe raw RGB frames into ffmpeg → browser-playable H.264 MP4."""
+    import subprocess
+
+    h, w = frames[0].shape[:2]
+    cmd = [
+        exe, "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(fps),
+        "-i", "-", "-an",
+        # yuv420p needs even dimensions; pad by one pixel when odd.
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        str(dest),
+    ]  # fmt: skip
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+        assert proc.stdin is not None
+        try:
+            for frame in frames:
+                proc.stdin.write(frame.tobytes())
+        finally:
+            proc.stdin.close()
+        proc.wait(timeout=600)
+    except (OSError, subprocess.SubprocessError, BrokenPipeError):
+        return False
+    return proc.returncode == 0 and dest.exists() and dest.stat().st_size > 0
+
+
+def _encode_mp4_moviepy(frames: List[Any], dest: Path, fps: Union[int, float]) -> bool:
+    try:
+        try:
+            from moviepy import ImageSequenceClip  # type: ignore[import-untyped]
+        except ImportError:
+            from moviepy.editor import ImageSequenceClip  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+    clip = ImageSequenceClip(frames, fps=fps)
+    clip.write_videofile(str(dest), codec="libx264", audio=False, logger=None)
+    return dest.exists()
+
+
+def _encode_gif(frames: List[Any], dest: Path, fps: Union[int, float]) -> bool:
+    try:
+        from PIL import Image as PILImage  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+    images = [PILImage.fromarray(f) for f in frames]
+    images[0].save(
+        str(dest),
+        save_all=True,
+        append_images=images[1:],
+        duration=max(1, int(round(1000 / max(float(fps), 0.1)))),
+        loop=0,
+    )
+    return True
+
+
+def _video_array(data: Any) -> Optional[Any]:
+    """Array for tensor/ndarray input or a list of frames; ``None`` otherwise."""
+    arr = _to_numpy_array(data)
+    if arr is None and isinstance(data, (list, tuple)) and data:
+        frames = [_to_numpy_array(f) for f in data]
+        if all(f is not None for f in frames):
+            import numpy as np  # type: ignore[import-untyped]
+
+            arr = np.stack(frames)
+    if arr is not None and arr.ndim == 3:
+        arr = arr[..., None]  # T,H,W grayscale
+    return arr
+
+
 def save_video(
     data: Any,
     log_dir: str,
@@ -296,6 +401,10 @@ def save_video(
 
     * ``str`` / ``pathlib.Path`` — existing file, will be copied.
     * ``bytes`` — written as ``.mp4``.
+    * a ``T,H,W,C`` / ``T,C,H,W`` / ``N,T,C,H,W`` array or tensor, or a list
+      of ``H,W,C`` frames (e.g. ``env.render()`` output). Encoded as H.264
+      MP4 with ffmpeg (system binary or ``imageio-ffmpeg``), then moviepy,
+      falling back to an animated GIF via Pillow.
     """
     dest_dir = _ensure_dir(Path(log_dir) / "media" / _sanitize_tag(tag))
 
@@ -306,20 +415,24 @@ def save_video(
     elif isinstance(data, (bytes, bytearray)):
         dest = dest_dir / f"{step}.mp4"
         dest.write_bytes(data)
-    elif _to_numpy_array(data) is not None:
-        try:
-            try:
-                from moviepy import ImageSequenceClip  # type: ignore[import-untyped]
-            except ImportError:
-                from moviepy.editor import ImageSequenceClip  # type: ignore[import-untyped]
-        except ImportError:
-            raise ImportError(
-                "Saving tensor/array videos requires moviepy: pip install moviepy"
-            )
-        frames = _normalize_video_frames(_to_numpy_array(data))
+    elif _video_array(data) is not None:
+        frames = _rgb_frames(_normalize_video_frames(_video_array(data)))
+        if not frames:
+            raise ValueError("video has no frames")
         dest = dest_dir / f"{step}.mp4"
-        clip = ImageSequenceClip(frames, fps=fps)
-        clip.write_videofile(str(dest), codec="libx264", audio=False, logger=None)
+        exe = _ffmpeg_exe()
+        if not (
+            (exe is not None and _encode_mp4_ffmpeg(frames, dest, fps, exe))
+            or _encode_mp4_moviepy(frames, dest, fps)
+        ):
+            if dest.exists():
+                dest.unlink()
+            dest = dest_dir / f"{step}.gif"
+            if not _encode_gif(frames, dest, fps):
+                raise ImportError(
+                    "Saving array videos needs ffmpeg (install it, or "
+                    "pip install imageio-ffmpeg), moviepy, or Pillow for GIF"
+                )
     else:
         raise TypeError(f"Unsupported video type: {type(data)}")
 

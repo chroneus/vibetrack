@@ -413,6 +413,30 @@ class ExperimentReader:
             return json.loads(row["config"])
         return None
 
+    @property
+    def created_at(self) -> Optional[float]:
+        value = self._experiment_row().get("created_at")
+        return float(value) if value is not None else None
+
+    def run_info(self) -> Optional[Dict[str, Any]]:
+        """Stored lifecycle record: status, started/ended, heartbeat, info.
+
+        ``None`` for runs written by vibetrack < 0.2 or by remote ingest.
+        Use :func:`vibetrack.insights.run_status` for the *effective*
+        status, which also detects runs whose process died.
+        """
+        return self._db.get_run_info(self.experiment_id)
+
+    def scalar_stats(
+        self, tags: Optional[List[str]] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """Per-tag ``{n, first_step, last_step, last, min, min_step, max, max_step}``."""
+        return self._db.get_scalar_stats(self.experiment_id, tags=tags)
+
+    def last_activity(self) -> Optional[Dict[str, Any]]:
+        """``{"step", "wall_time"}`` of the newest scalar, or ``None``."""
+        return self._db.get_last_activity(self.experiment_id)
+
 
 class RunReader:
     """Read experiments from the central DB or an explicit local project DB."""

@@ -77,7 +77,7 @@ function setAutoRefresh(s) {
       const d = JSON.parse(txt);
       const sx = window.scrollX, sy = window.scrollY;
       DATA.length = 0; DATA.push(...d);
-      buildTabs(); buildPills(); buildCharts(); buildSystem();
+      buildTabs(); buildPills(); buildCharts(); buildSystem(); buildRuns();
       buildImages(); buildAudio(); buildVideo(); buildArtifacts(); buildGraphs(); buildText(); buildHistograms();
       buildHParams();
       window.scrollTo(sx, sy);

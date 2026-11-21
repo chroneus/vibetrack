@@ -57,3 +57,66 @@ vibetrack.config["lr"]  # 3e-5
 
 vibetrack.finish()
 ```
+
+## Run status, provenance and the end-of-run report
+
+Every run records its lifecycle in the database:
+
+| status | meaning |
+| --- | --- |
+| `running` | the writer is open; a heartbeat is written while it logs |
+| `finished` | closed normally |
+| `failed` | closed while an exception propagated, or the script died with an uncaught exception; the error and traceback tail are stored |
+| `interrupted` | `KeyboardInterrupt` |
+| `crashed` | still `running` but its process is gone (killed, OOM); detected when read |
+
+The command line (credential-looking arguments are masked), cwd, host, pid,
+Python version, and git commit / branch / dirty state are stored as well.
+Set `VIBETRACK_GIT=0` to skip git. Close runs in `finally:` or use the writer
+as a context manager so failures are recorded:
+
+```python
+with SummaryWriter("runs/exp1", project="cv", config=cfg) as writer:
+    train(writer)            # an exception here marks the run `failed`
+```
+
+Declare the metric you optimize, so rankings don't have to guess it from the
+tag name:
+
+```python
+writer.define_metric("val/acc", goal="max", primary=True)
+vibetrack.define_metric("eval/return", goal="max", primary=True)  # module API
+```
+
+On close, a compact report is printed to stderr: status, config, headline
+metrics, media paths, rank among the project's runs, the dashboard link and the
+next commands. Disable it with `report=False` or `VIBETRACK_REPORT=0`.
+
+## Reading runs programmatically
+
+`vibetrack.insights` returns the same JSON-ready payloads as the CLI:
+
+```python
+from vibetrack import RunReader, insights
+
+with RunReader("my_project") as reader:
+    exps = reader.experiments(project=None)
+    rows = insights.list_runs(exps)               # status + headline metrics
+    ov = insights.run_overview(exps[0])           # one run in detail
+    cmp = insights.compare_runs(exps, metric="val/acc", goal="max")
+    print(insights.format_compare(cmp))           # Markdown
+```
+
+## Video from frames
+
+`add_video` / `Video(...)` accept a file path, bytes, a `T,H,W,C` / `T,C,H,W` /
+`N,T,C,H,W` array or tensor, or a list of `H,W,C` frames (e.g. from
+`env.render()`):
+
+```python
+vibetrack.log({"eval/rollout": vibetrack.Video(frames, fps=30)}, step=step)
+```
+
+Frames are encoded to browser-playable H.264 MP4 with ffmpeg: the system
+binary, or the one from `pip install imageio-ffmpeg`. If neither is available,
+moviepy is used. Without any encoder, the frames are saved as an animated GIF.

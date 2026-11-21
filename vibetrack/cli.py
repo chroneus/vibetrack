@@ -16,7 +16,7 @@ _MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
 _ALLOWED_SUFFIXES = {
     "image": {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"},
     "audio": {".wav", ".mp3", ".ogg", ".flac", ".m4a"},
-    "video": {".mp4", ".webm", ".avi", ".mov", ".mkv"},
+    "video": {".mp4", ".webm", ".avi", ".mov", ".mkv", ".gif"},
 }
 _DANGEROUS_ARTIFACT_SUFFIXES = {
     ".html",
@@ -265,6 +265,8 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
                 project_folder=str(project_root),
                 system_metrics_interval=0,
                 resume=True,
+                report=False,
+                track_status=False,
             )
         return SummaryWriter(
             _central_ingest_log_dir(name, project_name),
@@ -272,6 +274,8 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
             project=project_name,
             system_metrics_interval=0,
             resume=True,
+            report=False,
+            track_status=False,
         )
 
     async def check_auth(request: Request):  # type: ignore[no-untyped-def]
@@ -593,6 +597,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vibetrack",
         description="Lightweight experiment tracking.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "run commands (see `vibetrack COMMAND -h`):\n"
+            "  vibetrack ls                 list runs: status, duration, headline metrics\n"
+            "  vibetrack show [RUN]         one run: config, metrics, media files, errors\n"
+            "  vibetrack compare [RUN ...]  rank runs, diff params, tabulate metrics\n"
+            "  vibetrack open [RUN]         open the dashboard on runs (starts it if needed)\n"
+            "  vibetrack guide              instructions for AI coding agents (--install)\n"
+            "\n"
+            "AI agents: run `vibetrack guide` before instrumenting code."
+        ),
     )
     parser.add_argument(
         "target_pos",
@@ -683,6 +698,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    from .commands import COMMANDS
+
+    if raw and raw[0] in COMMANDS:
+        from .commands import run
+
+        sys.exit(run(raw))
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 

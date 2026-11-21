@@ -5,6 +5,7 @@ Also supports dict-style log() calls via the module-level API.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import math
@@ -13,6 +14,7 @@ import re
 import sys
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -99,12 +101,54 @@ def _make_run_name() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+# Seconds between run heartbeats written from the scalar flush path.
+_HEARTBEAT_SECS = 30.0
+
+# Writers still open; closed at interpreter exit so a run that ends with an
+# uncaught exception is recorded as ``failed`` instead of staying ``running``.
+_OPEN_WRITERS: "weakref.WeakSet[SummaryWriter]" = weakref.WeakSet()
+_ATEXIT_REGISTERED = False
+
+
+def _close_open_writers() -> None:
+    from ._runmeta import uncaught_exception
+
+    exc = uncaught_exception()
+    for writer in list(_OPEN_WRITERS):
+        try:
+            writer._finalize(exc)
+        except Exception:
+            pass
+
+
+def _track_open_writer(writer: "SummaryWriter") -> None:
+    global _ATEXIT_REGISTERED
+    _OPEN_WRITERS.add(writer)
+    if not _ATEXIT_REGISTERED:
+        atexit.register(_close_open_writers)
+        _ATEXIT_REGISTERED = True
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _is_torch_tensor(obj: Any) -> bool:
     return type(obj).__module__ == "torch" and type(obj).__name__ == "Tensor"
 
 
 def _is_numpy_array(obj: Any) -> bool:
     return type(obj).__module__ == "numpy" and type(obj).__name__ == "ndarray"
+
+
+def _is_scalar_like(obj: Any) -> bool:
+    """Numbers plus numpy scalars and 0-d arrays/tensors (``loss`` not ``loss.item()``)."""
+    if isinstance(obj, (int, float)):
+        return True
+    return getattr(obj, "ndim", None) == 0 and hasattr(obj, "item")
 
 
 def _to_numpy_array(obj: Any) -> Optional[Any]:
@@ -539,6 +583,8 @@ class SummaryWriter:
         project_folder: Optional[str] = None,
         rank: Optional[Union[int, str]] = None,
         resume: bool = False,
+        report: Optional[bool] = None,
+        track_status: bool = True,
     ) -> None:
         """Open (or resume) an experiment row in the central / project DB.
 
@@ -573,6 +619,12 @@ class SummaryWriter:
                 of auto-suffixing when the first written step overlaps. Used
                 by remote ingest, where one logical step may arrive as several
                 HTTP requests.
+            report: Print a compact end-of-run report (status, config,
+                metrics, media, ranking against sibling runs, dashboard link)
+                to stderr on :meth:`close`. ``None`` follows the
+                ``VIBETRACK_REPORT`` environment variable (default on).
+            track_status: Record the run lifecycle (running / finished /
+                failed / interrupted), process, command line and git commit.
         """
         # Resolve log_dir — mimic TensorBoard's default behaviour
         if log_dir is None:
@@ -601,6 +653,13 @@ class SummaryWriter:
         self._scalar_buffer: List[Tuple[int, str, int, float, float]] = []
         self._step_counters: Dict[str, int] = {}
         self._sysmetrics: Any = None
+        self._report = report
+        self._track_status = track_status
+        self._owner_pid = os.getpid()
+        self._started = False
+        self._finalized = False
+        self._last_heartbeat = 0.0
+        self._metric_defs: Dict[str, Dict[str, Any]] = {}
 
         # Adapter dispatch state (populated by .to(...))
         self._dispatchers: List[_Dispatcher] = []
@@ -669,6 +728,9 @@ class SummaryWriter:
                     log_dir=self.log_dir,
                 )
 
+            if not self._pending:
+                self._mark_started()
+
             # Register remap callback for when precache materializes
             if precache_secs > 0:
                 self._db.register_remap_callback(self._on_precache_flush)
@@ -695,6 +757,8 @@ class SummaryWriter:
                 self._db.add_hparams(self._exp_id, config)
             except Exception as exc:
                 self._handle_runtime_error("store initial hparams", exc)
+
+        _track_open_writer(self)
 
         if system_metrics_interval > 0:
             try:
@@ -2048,7 +2112,7 @@ class SummaryWriter:
         handles: List[Any] = []
         try:
             for tag, value in data.items():
-                if isinstance(value, (int, float)):
+                if _is_scalar_like(value):
                     handles.append(self.add_scalar(tag, value, global_step=step))
                 elif isinstance(value, str):
                     handles.append(self.add_text(tag, value, global_step=step))
@@ -2064,7 +2128,11 @@ class SummaryWriter:
                         )
                     )
                 elif isinstance(value, Video):
-                    handles.append(self.add_video(tag, value.data, global_step=step))
+                    handles.append(
+                        self.add_video(
+                            tag, value.data, global_step=step, fps=value.fps
+                        )
+                    )
                 elif isinstance(value, Artifact):
                     handles.append(
                         self.add_artifact(
@@ -2105,6 +2173,7 @@ class SummaryWriter:
                 len(batch),
             )
             raise
+        self._maybe_heartbeat()
 
     def _start_flush_timer(self) -> None:
         if self._flush_secs <= 0 or self._closed or not self._enabled:
@@ -2147,10 +2216,20 @@ class SummaryWriter:
         return None
 
     def close(self) -> None:
+        """Flush, record how the run ended, print the run report and close.
+
+        The status is ``failed`` / ``interrupted`` when ``close()`` runs while
+        an exception propagates (e.g. from a ``finally:`` block), otherwise
+        ``finished``.
+        """
+        self._finalize(sys.exc_info()[1])
+
+    def _finalize(self, run_exc: Optional[BaseException] = None) -> None:
         if self._closed:
             return
         self._closed = True
         self._enabled = False
+        _OPEN_WRITERS.discard(self)
         if self._flush_timer is not None:
             self._flush_timer.cancel()
             self._flush_timer = None
@@ -2179,6 +2258,17 @@ class SummaryWriter:
             self._send_summaries()
         except Exception as exc:
             self._handle_runtime_error("dispatch summary", exc)
+        # Only the process that opened the run may end it: a forked worker
+        # tearing down its copy of the writer must not mark it finished.
+        if os.getpid() == self._owner_pid:
+            try:
+                self._mark_ended(run_exc)
+            except Exception as err:
+                self._handle_runtime_error("record run status", err)
+            try:
+                self._print_report()
+            except Exception as err:
+                self._handle_runtime_error("print run report", err)
         try:
             if self._db is not None:
                 self._db.close()
@@ -2189,8 +2279,13 @@ class SummaryWriter:
     def __enter__(self) -> "SummaryWriter":
         return self
 
-    def __exit__(self, *args: Any) -> None:
-        self.close()
+    def __exit__(
+        self,
+        exc_type: Optional[type] = None,
+        exc: Optional[BaseException] = None,
+        tb: Any = None,
+    ) -> None:
+        self._finalize(exc)
 
     def __del__(self) -> None:
         try:
@@ -2211,6 +2306,121 @@ class SummaryWriter:
     def get_logdir(self) -> str:
         """Return the resolved log directory, matching TensorBoard's helper."""
         return self.log_dir
+
+    # ── Run lifecycle ───────────────────────────────────────────
+
+    def _mark_started(self) -> None:
+        """Record ``running`` plus process / command / git provenance."""
+        if self._started or not self._track_status or self._db is None:
+            return
+        self._started = True
+        try:
+            from ._runmeta import process_info
+
+            now = time.time()
+            info = process_info()
+            if self._db.get_run_info(self._exp_id) is not None:
+                info["resumed_at"] = now
+            # Clear the outcome of an earlier segment of a resumed run.
+            info["error"] = None
+            info["traceback"] = None
+            if self._metric_defs:
+                info["metrics"] = dict(self._metric_defs)
+            self._db.update_run_info(
+                self._exp_id,
+                info=info,
+                status="running",
+                started_at=now,
+                ended_at=None,
+                heartbeat=now,
+            )
+            self._last_heartbeat = now
+        except Exception as exc:
+            self._handle_runtime_error("record run start", exc)
+
+    def define_metric(
+        self,
+        tag: str,
+        goal: Optional[str] = None,
+        primary: bool = False,
+    ) -> None:
+        """Declare how a metric is judged, for rankings and run reports.
+
+        Args:
+            tag: Scalar tag, e.g. ``"eval/return"``.
+            goal: ``"max"`` or ``"min"``. Without it vibetrack guesses from
+                the tag name (``loss`` → min, ``acc`` / ``return`` → max).
+            primary: Mark this as the metric runs are ranked by.
+
+        ::
+
+            writer.define_metric("val/acc", goal="max", primary=True)
+        """
+
+        def _op() -> None:
+            if goal is not None and goal not in ("min", "max"):
+                raise ValueError(f"goal must be 'min' or 'max', got {goal!r}")
+            entry: Dict[str, Any] = {}
+            if goal is not None:
+                entry["goal"] = goal
+            if primary:
+                for other in self._metric_defs.values():
+                    other.pop("primary", None)
+                entry["primary"] = True
+            self._metric_defs[tag] = entry
+            if self._started and self._db is not None:
+                self._db.update_run_info(
+                    self._exp_id, info={"metrics": dict(self._metric_defs)}
+                )
+
+        self._best_effort("define metric", _op)
+
+    def _maybe_heartbeat(self) -> None:
+        if not self._started or self._db is None:
+            return
+        now = time.time()
+        if now - self._last_heartbeat < _HEARTBEAT_SECS:
+            return
+        self._last_heartbeat = now
+        try:
+            self._db.update_run_info(self._exp_id, heartbeat=now)
+        except Exception as exc:
+            self._handle_runtime_error("record run heartbeat", exc)
+
+    def _mark_ended(self, exc: Optional[BaseException]) -> None:
+        if not self._started or self._db is None:
+            return
+        from ._runmeta import exit_status
+
+        status, error = exit_status(exc)
+        now = time.time()
+        self._db.update_run_info(
+            self._exp_id,
+            info=error,
+            status=status,
+            ended_at=now,
+            heartbeat=now,
+        )
+
+    def _print_report(self) -> None:
+        """Print the end-of-run digest that coding agents read from stderr."""
+        if self._db is None or self._pending:
+            return
+        wanted = self._report
+        if wanted is None:
+            wanted = _env_flag("VIBETRACK_REPORT")
+        if not wanted:
+            return
+        from .insights import end_of_run_report
+
+        folder = (
+            str(Path(self.project_folder).resolve())
+            if self.project_folder is not None
+            else None
+        )
+        text = end_of_run_report(self._db, self._exp_id, project_folder=folder)
+        if text:
+            print(text, file=sys.stderr, flush=True)
 
     # ── Internal ────────────────────────────────────────────────
 
@@ -2245,6 +2455,7 @@ class SummaryWriter:
             self._pending_existing_id = None
             self._pending_max_step = None
             self._pending_config = None
+            self._mark_started()
 
     def _on_precache_flush(self, id_remap: Dict[int, int]) -> None:
         """Called by Database after precache materializes to remap IDs.

@@ -896,6 +896,15 @@ function _vidBuildRunCard(grid, exp, tag, clips) {
     cur = { step, path };
     clip.querySelectorAll('video').forEach(v => { _vidUnobserve(v); _vidRelease(v); });
     clip.innerHTML = '';
+    if (/\.gif$/i.test(path)) {
+      // Array videos fall back to an animated GIF when no ffmpeg is available.
+      const gif = document.createElement('img'); gif.src = url; gif.alt = tag;
+      clip.appendChild(gif);
+      card.dataset.vidKey = _vidKey(exp, tag, step);
+      stepText.textContent = step;
+      _vidSyncCard(card);
+      return;
+    }
     const vidEl = document.createElement('video');
     vidEl.controls = true; vidEl.playsInline = true; vidEl.preload = 'none';
     vidEl.dataset.videoPath = path;

@@ -35,7 +35,7 @@ class _ASGIClient:
             transport = httpx.ASGITransport(app=self._app)
             async with httpx.AsyncClient(
                 transport=transport,
-                base_url="http://testserver",
+                base_url="http://127.0.0.1:6116",
             ) as client:
                 return await client.request(method, url, **kwargs)
 
@@ -865,6 +865,448 @@ class TestWebSerialization:
         serialized = _json_for_html(payload)
         assert "</script>" not in serialized
         assert "\\u003c/script>" in serialized
+
+
+class TestWebSecurity:
+    @pytest.fixture
+    def make_app(self, tmp_path, monkeypatch):
+        pytest.importorskip("fastapi")
+        from vibetrack.viewers import web
+        from vibetrack.viewers.web import WebOutput
+
+        cfg_dir = tmp_path / "cfg"
+        monkeypatch.setattr("vibetrack.config.config_dir", lambda: cfg_dir)
+        monkeypatch.setattr(
+            "vibetrack.config.config_path", lambda: cfg_dir / "config.json"
+        )
+        web._mutation_rate_state.clear()
+        project_folder = tmp_path / "project"
+        with SummaryWriter(
+            str(project_folder / "run_a"),
+            name="run_a",
+            project_folder=str(project_folder),
+        ) as w:
+            w.add_scalar("loss", 0.5, 0)
+        outputs = []
+
+        def _make(host="127.0.0.1", token=None):
+            out = WebOutput(str(project_folder))
+            outputs.append(out)
+            return out._build_app(None, host, token=token)
+
+        yield _make
+        for out in outputs:
+            out.close()
+
+    def test_render_never_resubstitutes_placeholders(self):
+        import re
+
+        from vibetrack.viewers.web import _render
+
+        data = [{"name": "__PROJECT_JSON__", "note": "__PROJECTS_JSON__ <!--<script>"}]
+        html = _render(data, "-alert(1)-", ["-alert(2)-"])
+        assert "<!--<script>" not in html
+        assigned = dict(re.findall(r"window\.(VT_\w+) = (.*);\n", html))
+        assert json.loads(assigned["VT_DATA"]) == data
+        assert json.loads(assigned["VT_PROJECT"]) == "-alert(1)-"
+        assert json.loads(assigned["VT_PROJECTS"]) == ["-alert(2)-"]
+
+    def test_ingest_rejects_cross_origin_requests(self, make_app):
+        client = _ASGIClient(make_app())
+        body = json.dumps({"experiment": "e", "scalars": {"loss": 1.0}})
+        forged = client.post(
+            "/project/listen/log",
+            content=body,
+            headers={"Origin": "http://evil.example", "Content-Type": "text/plain"},
+        )
+        assert forged.status_code == 403
+        forged_media = client.post(
+            "/project/listen/media",
+            headers={"Origin": "http://evil.example"},
+            data={"experiment": "e", "type": "artifact"},
+            files={"file": ("a.txt", b"x", "text/plain")},
+        )
+        assert forged_media.status_code == 403
+        # Remote loggers send no Origin and must keep working.
+        assert client.post("/project/listen/log", content=body).status_code == 200
+
+    def test_listen_app_rejects_browser_requests(self, tmp_path):
+        from vibetrack.cli import _create_listen_app
+
+        client = _ASGIClient(_create_listen_app(str(tmp_path), token=None))
+        payload = {"experiment": "e", "scalars": {"loss": 1.0}}
+        forged = client.post(
+            "/log", json=payload, headers={"Origin": "http://evil.example"}
+        )
+        assert forged.status_code == 403
+        assert client.post("/log", json=payload).status_code == 200
+
+    def test_non_ascii_authorization_is_401_not_500(self, make_app):
+        client = _ASGIClient(make_app(token="s3cret"))
+        resp = client.get(
+            "/api/projects", headers={"Authorization": "Bearer café".encode("latin-1")}
+        )
+        assert resp.status_code == 401
+
+    def test_mcp_mount_requires_token(self, make_app):
+        from fastapi.testclient import TestClient
+
+        app = make_app(token="s3cret")
+        if "/vibetrack_mcp" not in [getattr(r, "path", None) for r in app.routes]:
+            pytest.skip("MCP sub-app not available")
+        init = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            },
+        }
+        headers = {"Accept": "application/json, text/event-stream"}
+        with TestClient(app, base_url="http://127.0.0.1:6116") as client:
+            anon = client.post("/vibetrack_mcp/mcp", json=init, headers=headers)
+            assert anon.status_code == 401
+            authed = client.post(
+                "/vibetrack_mcp/mcp",
+                json=init,
+                headers={**headers, "Authorization": "Bearer s3cret"},
+            )
+            assert authed.status_code == 200
+
+    @pytest.mark.parametrize(
+        "route,scope",
+        [("/api/config", None), ("/api/config/project", "project")],
+    )
+    def test_config_api_hides_and_preserves_credentials(self, make_app, route, scope):
+        """Credentials stored in either scope survive a UI round-trip.
+
+        Both routes read/write the "project" scope here (the project folder's
+        name); ``scope`` is only where the credentials were stored.
+        """
+        from vibetrack.config import config_path, load_config
+
+        creds = {
+            "telegram": {"token": "123:SECRET", "chat_id": "42"},
+            "slack": {"bot_token": "xoxb-SECRET"},
+        }
+        save_config(creds, project=scope)
+        client = _ASGIClient(make_app())
+
+        loaded = client.get(route)
+        assert loaded.status_code == 200
+        assert "SECRET" not in loaded.text
+
+        # The UI posts the whole (blanked) config back; an attacker would
+        # try to redirect notifications. Neither may touch stored credentials.
+        body = loaded.json()
+        body["web"]["theme"] = "orange"
+        body["telegram"] = {"token": "evil", "chat_id": "attacker"}
+        saved = client.post(route, json=body)
+        assert saved.status_code == 200
+        assert "SECRET" not in saved.text
+
+        cfg = load_config(project="project")
+        assert cfg["web"]["theme"] == "orange"
+        assert cfg["telegram"] == creds["telegram"]
+        assert cfg["slack"] == creds["slack"]
+        assert "evil" not in config_path().read_text()
+
+        assert client.post(route, json=[1, 2]).status_code == 400
+
+    def test_loopback_bind_rejects_foreign_host_header(self, make_app):
+        client = _ASGIClient(make_app())
+        rebound = client.get("/api/projects", headers={"Host": "attacker.example:6116"})
+        assert rebound.status_code == 403
+        rebound_static = client.get(
+            "/static/js/core.js", headers={"Host": "attacker.example"}
+        )
+        assert rebound_static.status_code == 403
+        for good in ("localhost:6116", "127.0.0.1", "[::1]:6116"):
+            assert client.get("/api/projects", headers={"Host": good}).status_code == 200
+
+    def test_lan_bind_does_not_restrict_host_header(self, make_app):
+        client = _ASGIClient(make_app(host="192.168.1.10"))
+        resp = client.get("/api/projects", headers={"Host": "trainbox.lan:6116"})
+        assert resp.status_code == 200
+
+
+class TestWebHardening:
+    """Central-mode server behaviour: ingest layout, auth cookie, origins."""
+
+    @pytest.fixture
+    def central(self, tmp_path, monkeypatch):
+        pytest.importorskip("fastapi")
+        from vibetrack.viewers import web
+        from vibetrack.viewers.web import WebOutput
+
+        central_db = tmp_path / "home" / ".vibetrack" / "vibetrack.db"
+        monkeypatch.setattr("vibetrack.writer.central_db_path", lambda: central_db)
+        monkeypatch.setattr("vibetrack.reader.central_db_path", lambda: central_db)
+        cfg = tmp_path / "cfg"
+        monkeypatch.setattr("vibetrack.config.config_dir", lambda: cfg)
+        monkeypatch.setattr("vibetrack.config.config_path", lambda: cfg / "config.json")
+        work = tmp_path / "work"
+        work.mkdir()
+        monkeypatch.chdir(work)
+        web._mutation_rate_state.clear()
+        outputs = []
+
+        def _make(host="127.0.0.1", **kwargs):
+            out = WebOutput()
+            outputs.append(out)
+            return _ASGIClient(out._build_app(None, host, **kwargs))
+
+        yield _make, work
+        for out in outputs:
+            out.close()
+
+    @staticmethod
+    def _upload(client, project, experiment, payload, tag="img"):
+        return client.post(
+            f"/{project}/listen/media",
+            data={"experiment": experiment, "tag": tag, "step": "0", "type": "image"},
+            files={"file": ("x.png", b"\x89PNG\r\n\x1a\n" + payload, "image/png")},
+        )
+
+    def test_dashboard_picks_up_database_created_after_start(self, central):
+        make, work = central
+        client = make()
+        assert client.get("/api/projects").json() == []
+        with SummaryWriter(str(work / "late"), project="late", system_metrics_interval=0) as w:
+            w.add_scalar("loss", 1.0, 0)
+        assert client.get("/api/projects").json() == ["late"]
+        assert client.get("/late").status_code == 200
+
+    def test_same_run_name_in_two_projects_keeps_separate_media(self, central):
+        make, work = central
+        client = make()
+        assert self._upload(client, "projA", "run", b"A").status_code == 200
+        assert self._upload(client, "projB", "run", b"B").status_code == 200
+        path_a = client.get("/api/data/projA").json()[0]["images"]["img"][0]["path"]
+        path_b = client.get("/api/data/projB").json()[0]["images"]["img"][0]["path"]
+        assert path_a != path_b
+        assert client.get("/media", params={"path": path_a}).content.endswith(b"A")
+        client.request("DELETE", "/api/experiment", json={"name": "run", "project": "projA"})
+        assert Path(path_b).exists()
+
+    def test_existing_run_keeps_its_log_dir(self, central):
+        make, work = central
+        legacy = work / "run"  # pre-fix layout: cwd/<experiment>
+        with SummaryWriter(str(legacy), name="run", project="old", system_metrics_interval=0) as w:
+            w.add_scalar("loss", 1.0, 0)
+        client = make()
+        assert self._upload(client, "old", "run", b"C").status_code == 200
+        exp = client.get("/api/data/old").json()[0]
+        assert exp["log_dir"] == str(legacy.resolve())
+        assert exp["images"]["img"][0]["path"].startswith(str(legacy.resolve()))
+
+    def test_delete_keeps_media_shared_with_another_project(self, central):
+        make, work = central
+        shared = work / "shared"
+        for project, payload in (("a", b"A"), ("b", b"B")):
+            src = work / f"{project}.png"
+            src.write_bytes(b"\x89PNG\r\n\x1a\n" + payload)
+            with SummaryWriter(
+                str(shared), name="run", project=project, system_metrics_interval=0
+            ) as w:
+                w.add_image("img", str(src), 0)
+        client = make()
+        resp = client.request("DELETE", "/api/experiment", json={"name": "run", "project": "a"})
+        assert resp.status_code == 200
+        assert (shared / "media" / "img" / "0.png").exists()
+
+    def test_token_login_sets_cookie_and_strips_query(self, central):
+        make, _ = central
+        client = make(token="s3cret")
+        assert client.get("/").status_code == 401
+        assert client.get("/?token=nope").status_code == 401
+        resp = client.get("/somewhere?token=s3cret&tab=text")
+        assert resp.status_code == 303
+        assert resp.headers["location"] == "/somewhere?tab=text"
+        cookie = resp.headers["set-cookie"]
+        assert "httponly" in cookie.lower() and "samesite=lax" in cookie.lower()
+        assert "s3cret" not in cookie
+        pair = cookie.split(";", 1)[0]
+        assert client.get("/api/projects", headers={"Cookie": pair}).status_code == 200
+        name = pair.split("=", 1)[0]
+        assert client.get("/api/projects", headers={"Cookie": f"{name}=x"}).status_code == 401
+
+    def test_origin_must_match_host_including_port(self, central):
+        make, _ = central
+        body = {"old_name": "missing", "new_name": "x", "project": "p"}
+        lan = make(host="192.168.1.10")
+        lan.post("/p/listen/log", json={"experiment": "seed", "scalars": {"x": 1}})
+        same = lan.post("/api/rename", json=body,
+                        headers={"Origin": "http://localhost:6116", "Host": "localhost:6116"})
+        assert same.status_code == 404  # passed the CSRF gate
+        local = make()
+        other_port = local.post("/api/rename", json=body,
+                                headers={"Origin": "http://127.0.0.1:3000"})
+        assert other_port.status_code == 403
+
+    def test_allow_host_for_reverse_proxy(self, central):
+        make, _ = central
+        client = make(allowed_hosts=["vt.example.com"])
+        client.post("/p/listen/log", json={"experiment": "seed", "scalars": {"x": 1}})
+        assert client.get("/api/projects", headers={"Host": "vt.example.com"}).status_code == 200
+        assert client.get("/api/projects", headers={"Host": "other.example"}).status_code == 403
+        proxied = client.post(
+            "/api/rename",
+            json={"old_name": "missing", "new_name": "x", "project": "p"},
+            headers={"Origin": "https://vt.example.com"},
+        )
+        assert proxied.status_code == 404
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "not json",
+            "[1, 2]",
+            '{"scalars": [1]}',
+            '{"scalars": {"loss": "abc"}}',
+            '{"texts": {"note": 5}}',
+            '{"step": 1e400}',
+            '{"step": 1180591620717411303424}',
+            '{"experiment": "."}',
+        ],
+    )
+    def test_malformed_ingest_is_400(self, central, content):
+        make, _ = central
+        resp = make().post(
+            "/proj/listen/log", content=content, headers={"Content-Type": "application/json"}
+        )
+        assert resp.status_code == 400
+
+    def test_malformed_mutation_bodies_are_400(self, central):
+        make, _ = central
+        client = make()
+        assert client.post("/api/rename", json=[1]).status_code == 400
+        assert client.post("/api/rename", json={"old_name": 1, "new_name": "x"}).status_code == 400
+        assert client.post("/api/move-logdir", json={"old": None, "new": "/x"}).status_code == 400
+        huge = client.post(
+            "/proj/listen/media",
+            data={"experiment": "e", "step": str(2**70), "type": "artifact"},
+            files={"file": ("a.txt", b"x", "text/plain")},
+        )
+        assert huge.status_code == 400
+
+    def test_move_parent_folder_of_runs(self, central):
+        make, work = central
+        client = make()
+        for name in ("a", "b"):
+            client.post("/proj/listen/log", json={"experiment": name, "scalars": {"x": 1}})
+        target = work / "moved"
+        resp = client.post("/api/move-logdir", json={"old": str(work / "proj"), "new": str(target)})
+        assert resp.status_code == 200, resp.text
+        dirs = sorted(e["log_dir"] for e in client.get("/api/data/proj").json())
+        assert dirs == [str((target / "a").resolve()), str((target / "b").resolve())]
+
+    def test_move_refuses_unsafe_requests(self, central):
+        make, work = central
+        client = make()
+        with SummaryWriter(str(work / "home" / "run1"), project="h", system_metrics_interval=0) as w:
+            w.add_scalar("x", 1.0, 0)
+        (work / "home" / "notes.txt").write_text("not vibetrack's")
+        run = str(work / "home" / "run1")
+
+        def move(old, new):
+            return client.post("/api/move-logdir", json={"old": old, "new": new}).status_code
+
+        assert move(str(work / "home"), str(work / "elsewhere")) == 403
+        assert move(run, "relative/dest") == 400
+        assert move(run, str(work / "no" / "such" / "parent" / "run1")) == 400
+        assert move(run, run + "/inside") == 400
+        assert (work / "home" / "run1").is_dir()
+
+    def test_move_refuses_folder_with_open_database(self, populated_project):
+        from vibetrack.viewers import web
+        from vibetrack.viewers.web import WebOutput
+
+        web._mutation_rate_state.clear()
+        out = WebOutput(populated_project)
+        client = _ASGIClient(out._build_app(None, "127.0.0.1"))
+        resp = client.post(
+            "/api/move-logdir",
+            json={"old": populated_project, "new": populated_project + "_moved"},
+        )
+        out.close()
+        assert resp.status_code == 409
+        assert Path(populated_project, "vibetrack.db").exists()
+
+    def test_listen_app_validates_bodies_and_project(self, tmp_path):
+        from vibetrack.cli import _create_listen_app
+
+        client = _ASGIClient(_create_listen_app(str(tmp_path), token=None))
+        assert client.post("/log", json=[1]).status_code == 400
+        assert client.post("/log", json={"histograms": {"h": {"bin_edges": ["a"], "counts": [1]}}}).status_code == 400
+        assert client.post("/hparams", json={"project": "..", "hparams": {}}).status_code == 400
+
+    def test_rate_limiter_forgets_idle_clients(self, monkeypatch):
+        import types
+
+        from vibetrack.viewers import web
+
+        web._mutation_rate_state.clear()
+        now = [1000.0]
+        monkeypatch.setattr(web, "time", types.SimpleNamespace(monotonic=lambda: now[0]))
+        for i in range(web._MUTATION_RATE_MAX_TRACKED):
+            web._rate_limit_mutation(f"10.0.{i // 256}.{i % 256}")
+        now[0] += 5
+        assert web._rate_limit_mutation("192.0.2.1")
+        assert list(web._mutation_rate_state) == ["192.0.2.1"]
+
+
+class TestNotificationFormatting:
+    @staticmethod
+    def _event(**kwargs):
+        from vibetrack.viewers.event import LogEvent
+
+        base = dict(kind="text", tag="t", step=1, value="", walltime=0.0,
+                    run_name="resnet_50", project=None)
+        base.update(kwargs)
+        return LogEvent(**base)
+
+    def test_telegram_sends_escaped_html(self, monkeypatch):
+        from vibetrack.viewers import telegram
+
+        sent = []
+
+        class FakeBot:
+            def __init__(self, token):
+                pass
+
+            async def send_message(self, **kwargs):
+                sent.append(kwargs)
+
+        monkeypatch.setattr(telegram, "_import_telegram_bot", lambda: FakeBot)
+        telegram.TelegramOutput(token="t", chat_id="c").send([
+            self._event(tag="train_loss<x>", value="lr_decay *on* & <b>"),
+            self._event(kind="hparams", tag="hparams", value={"lr_sched": "cos_<1>"}),
+        ])
+        assert sent and sent[0]["parse_mode"] == "HTML"
+        text = sent[0]["text"]
+        assert "<b>resnet_50</b>" in text
+        assert "train_loss&lt;x&gt;" in text
+        assert "lr_decay *on* &amp; &lt;b&gt;" in text
+        assert "lr_sched=cos_&lt;1&gt;" in text
+
+    def test_telegram_clip_never_splits_entities(self):
+        from vibetrack.viewers.telegram import _html_clip, _join_within
+
+        assert _html_clip("ab&cd", 4) == "ab…"
+        assert _html_clip("a<b", 10) == "a&lt;b"
+        assert _join_within(["<b>x</b>", "y" * 10], limit=12) == "<b>x</b>\n…"
+
+    def test_slack_escapes_mentions_and_links(self):
+        from vibetrack.viewers.slack import SlackOutput
+
+        summary = SlackOutput()._build_summary([
+            self._event(value="<!channel> see <http://evil|docs> & more"),
+        ])
+        assert "<!channel>" not in summary and "<http" not in summary
+        assert "&lt;!channel&gt;" in summary and "&amp; more" in summary
 
 
 class TestWallTimesInPayload:

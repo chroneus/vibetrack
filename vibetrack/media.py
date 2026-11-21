@@ -11,9 +11,7 @@ the experiment's ``log_dir``.
 from __future__ import annotations
 
 import mimetypes
-import os
 import shutil
-import struct
 import wave
 from math import ceil, sqrt
 from pathlib import Path
@@ -23,10 +21,18 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 def _sanitize_tag(tag: str) -> str:
-    """Make *tag* filesystem-safe (replace ``/`` with ``_``)."""
-    return (
+    """Make *tag* a single filesystem-safe path component.
+
+    ``/`` and friends become ``_``; a tag of only dots (``""``, ``"."``,
+    ``".."``) would resolve to ``media/`` itself or its parent, so its dots
+    are replaced too.
+    """
+    safe = (
         tag.replace("\x00", "").replace("/", "_").replace("\\", "_").replace(":", "_")
     )
+    if not safe.strip("."):
+        safe = safe.replace(".", "_") or "_"
+    return safe
 
 
 def _ensure_dir(path: Path) -> Path:

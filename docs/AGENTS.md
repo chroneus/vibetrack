@@ -193,7 +193,7 @@ Stored at `~/.vibetrack/config.json`:
 ```json
 {
   "smoothing": "ema",
-  "smooth_weight": 0.6,
+  "smooth_weight": 0.0,
   "system_metrics_interval": 3600,
   "web": {
     "theme": "light",
@@ -202,7 +202,7 @@ Stored at `~/.vibetrack/config.json`:
     "raw_scalar_opacity": 0.17,
     "x_axis_mode": "step"
   },
-  "gradio": { "share": true, "refresh_interval": 2, "image_max_px": 1024 },
+  "gradio": { "share": false, "refresh_interval": 2, "image_max_px": 1024 },
   "console": {},
   "telegram": {},
   "mcp": {}

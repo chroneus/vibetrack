@@ -235,7 +235,7 @@ project-scoped settings through its Settings tab.
 ```json
 {
   "smoothing": "ema",
-  "smooth_weight": 0.6,
+  "smooth_weight": 0.0,
   "system_metrics_interval": 3600,
   "web": {
     "theme": "light",

@@ -17,7 +17,7 @@ function applyConfig(cfg) {
   if (theme === 'light' || theme === 'orange') document.body.classList.add(theme);
   document.getElementById('cfg-theme').value = w.theme || 'light';
   document.getElementById('cfg-smoothing').value = cfg.smoothing || 'ema';
-  const sw = cfg.smooth_weight ?? 0.6;
+  const sw = cfg.smooth_weight ?? 0;
   document.getElementById('cfg-smooth-weight').value = sw;
   document.getElementById('cfg-smooth-weight-val').textContent = Number(sw).toFixed(1);
   document.getElementById('cfg-refresh').value = w.auto_refresh ?? 5;

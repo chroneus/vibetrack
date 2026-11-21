@@ -85,6 +85,53 @@ def load_config(project: Optional[str] = None) -> Dict[str, Any]:
     return result
 
 
+# Sections holding notification credentials and destinations (bot tokens,
+# webhooks, chat/channel ids). The web API neither returns nor overwrites
+# them: anyone who can reach it could otherwise read the tokens, or point
+# notifications (with logged media) at their own chat.
+CREDENTIAL_SECTIONS = ("telegram", "slack")
+
+
+def _stored_scope(project: Optional[str]) -> Dict[str, Any]:
+    """Return the raw on-disk dict that ``save_config(..., project)`` replaces."""
+    data = _read_config_file()
+    if data is None:
+        return {}
+    if not _is_project_store(data):
+        # A flat file is the default scope; saving a project scope moves it
+        # under "default" untouched, so that project starts out empty.
+        return {} if project else data
+    if project:
+        projects = data.get("projects")
+        scope = projects.get(project) if isinstance(projects, dict) else None
+    else:
+        scope = data.get("default")
+    return scope if isinstance(scope, dict) else {}
+
+
+def load_public_config(project: Optional[str] = None) -> Dict[str, Any]:
+    """``load_config`` with credential sections blanked, for HTTP clients."""
+    cfg = load_config(project)
+    for key in CREDENTIAL_SECTIONS:
+        if key in cfg:
+            cfg[key] = {}
+    return cfg
+
+
+def save_public_config(data: Dict[str, Any], project: Optional[str] = None) -> None:
+    """``save_config`` for HTTP clients: credential sections keep stored values.
+
+    Whatever the client sends for those sections is ignored, so the web UI
+    (which posts back the blanked config it loaded) doesn't erase them.
+    """
+    stored = _stored_scope(project)
+    merged = {k: v for k, v in data.items() if k not in CREDENTIAL_SECTIONS}
+    for key in CREDENTIAL_SECTIONS:
+        if key in stored:
+            merged[key] = stored[key]
+    save_config(merged, project)
+
+
 def save_config(data: Dict[str, Any], project: Optional[str] = None) -> None:
     """Write config to disk, optionally scoped to a project."""
     path = config_path()

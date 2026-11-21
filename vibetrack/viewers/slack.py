@@ -38,6 +38,26 @@ from ..config import load_config
 from ..types import MEDIA_KINDS as _MEDIA_KINDS
 from .base import BaseOutput
 
+
+def _esc(value: Any) -> str:
+    """Escape a value for Slack mrkdwn.
+
+    Slack only treats ``&``, ``<`` and ``>`` specially, but unescaped they let
+    logged text inject ``<!channel>`` pings or ``<url|label>`` disguised links.
+    """
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _clip(text: str, limit: int) -> str:
+    """Cut escaped *text* to *limit* chars without splitting an ``&…;`` entity."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    amp = cut.rfind("&")
+    if amp != -1 and ";" not in cut[amp:]:
+        cut = cut[:amp]
+    return cut + "…"
+
 _log = logging.getLogger(__name__)
 
 _SLACK_API = "https://slack.com/api"
@@ -203,26 +223,24 @@ class SlackOutput(BaseOutput):
         if events[0].project:
             run_header = f"{events[0].project}/{run_header}"
 
-        lines: List[str] = [f"*{run_header}*"]
+        lines: List[str] = [f"*{_esc(run_header)}*"]
         for ev in events:
             step_s = f" _step={ev.step}_" if ev.step is not None else ""
+            tag = _esc(ev.tag)
             if ev.kind == "scalar":
-                lines.append(f"• `{ev.tag}` = {ev.value:.6g}{step_s}")
+                lines.append(f"• `{tag}` = {ev.value:.6g}{step_s}")
             elif ev.kind == "text":
-                body = str(ev.value)
-                if len(body) > 400:
-                    body = body[:400] + "…"
-                lines.append(f"• *{ev.tag}*{step_s}\n> {body}")
+                lines.append(f"• *{tag}*{step_s}\n> {_clip(_esc(ev.value), 400)}")
             elif ev.kind in _MEDIA_KINDS:
-                lines.append(f"• {ev.kind} `{ev.tag}`{step_s}")
+                lines.append(f"• {ev.kind} `{tag}`{step_s}")
             elif ev.kind == "histogram":
-                lines.append(f"• histogram `{ev.tag}`{step_s}")
+                lines.append(f"• histogram `{tag}`{step_s}")
             elif ev.kind == "hparams":
                 hp = ev.value if isinstance(ev.value, dict) else {}
-                pairs = ", ".join(f"{k}={v}" for k, v in list(hp.items())[:8])
+                pairs = ", ".join(f"{_esc(k)}={_esc(v)}" for k, v in list(hp.items())[:8])
                 lines.append(f"• hparams: {pairs}")
             else:
-                lines.append(f"• {ev.kind} `{ev.tag}`{step_s}")
+                lines.append(f"• {_esc(ev.kind)} `{tag}`{step_s}")
         return "\n".join(lines)
 
     # ── webhook path ────────────────────────────────────────────────
@@ -421,7 +439,7 @@ def _build_summary_text(exp: Any, project: Optional[str]) -> str:
     header = exp.name
     if project:
         header = f"{project}/{header}"
-    lines: List[str] = [f"*{header}*"]
+    lines: List[str] = [f"*{_esc(header)}*"]
 
     hp = {}
     try:
@@ -429,7 +447,7 @@ def _build_summary_text(exp: Any, project: Optional[str]) -> str:
     except Exception:
         hp = {}
     if hp:
-        flat = ", ".join(f"{k}={v}" for k, v in list(hp.items())[:12])
+        flat = ", ".join(f"{_esc(k)}={_esc(v)}" for k, v in list(hp.items())[:12])
         lines.append(f"*hparams* {flat}")
 
     user_scalars = [t for t in exp.scalar_tags() if not _is_system_tag(t)]
@@ -438,24 +456,18 @@ def _build_summary_text(exp: Any, project: Optional[str]) -> str:
         if not rows:
             continue
         last = max(rows, key=lambda r: r["step"])
-        lines.append(f"• `{tag}` final = {last['value']:.6g} _step={last['step']}_")
+        lines.append(f"• `{_esc(tag)}` final = {last['value']:.6g} _step={last['step']}_")
 
     for tag in exp.text_tags():
         rows = exp.texts(tag)
         if not rows:
             continue
         rows = sorted(rows, key=lambda r: r["step"])
-        lines.append(f"*{tag}*")
+        lines.append(f"*{_esc(tag)}*")
         for r in rows:
-            body = str(r["value"])
-            if len(body) > 400:
-                body = body[:400] + "…"
-            lines.append(f"_step={r['step']}_  {body}")
+            lines.append(f"_step={r['step']}_  {_clip(_esc(r['value']), 400)}")
 
-    text = "\n".join(lines)
-    if len(text) > _SUMMARY_TEXT_LIMIT:
-        text = text[:_SUMMARY_TEXT_LIMIT] + "…"
-    return text
+    return _clip("\n".join(lines), _SUMMARY_TEXT_LIMIT)
 
 
 def _collect_summary_attachments(exp: Any) -> List[Tuple[str, bytes, str]]:
@@ -567,7 +579,7 @@ def _multipart_encode(
     crlf = b"\r\n"
     parts: List[bytes] = []
     parts.append(f"--{boundary}".encode())
-    parts.append(f'Content-Disposition: form-data; name="filename"'.encode())
+    parts.append('Content-Disposition: form-data; name="filename"'.encode())
     parts.append(b"")
     parts.append(filename.encode())
     parts.append(f"--{boundary}".encode())

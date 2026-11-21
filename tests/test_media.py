@@ -40,6 +40,12 @@ class TestSanitizeTag:
         """Multiple special chars in one tag must all be sanitized."""
         assert _sanitize_tag("a/b\\c:d") == "a_b_c_d"
 
+    def test_dot_only_tags_stay_inside_media_dir(self):
+        assert _sanitize_tag("..") == "__"
+        assert _sanitize_tag(".") == "_"
+        assert _sanitize_tag("") == "_"
+        assert _sanitize_tag("..hidden") == "..hidden"
+
 
 class TestSaveImageFromPath:
     def test_copy_png(self, tmp_path):

@@ -13,7 +13,7 @@ const _delIconLg = `<svg width="15" height="17" viewBox="0 0 11 13" fill="none" 
 // `/api/projects`, `/media`) stay unscoped.
 function apiUrl(base) {
   if (base === '/api/projects') return base;
-  return window.VT_PROJECT ? `${base}/${window.VT_PROJECT}` : base;
+  return window.VT_PROJECT ? `${base}/${encodeURIComponent(window.VT_PROJECT)}` : base;
 }
 
 function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }

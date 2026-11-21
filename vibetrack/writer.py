@@ -25,7 +25,6 @@ from .viewers.event import (
     EventHandle,
     LogEvent,
     MultiEventHandle,
-    NullEventHandle,
     null_handle,
 )
 

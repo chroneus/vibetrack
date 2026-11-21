@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .db import Database
 
@@ -60,6 +60,23 @@ async def _write_upload_to_tempfile(
         raise
 
 
+def _secret_equals(given: str, expected: str) -> bool:
+    """Constant-time string comparison that never raises.
+
+    Compares bytes: ``hmac.compare_digest`` raises on non-ASCII ``str``
+    input, which would turn a junk header into a 500 instead of a 401.
+    """
+    return hmac.compare_digest(
+        given.encode("utf-8", "surrogateescape"),
+        expected.encode("utf-8", "surrogateescape"),
+    )
+
+
+def _bearer_matches(authorization: str, token: str) -> bool:
+    """Constant-time check of an ``Authorization`` header against *token*."""
+    return _secret_equals(authorization, f"Bearer {token}")
+
+
 def _parse_listen(s: str) -> Tuple[str, int]:
     """Parse ``host:port`` or bare ``port`` string."""
     if ":" in s:
@@ -82,17 +99,123 @@ def _validate_remote_experiment_name(experiment: object) -> str:
     if not isinstance(experiment, str):
         raise ValueError("Invalid experiment name")
     name = experiment.strip()
-    if not name or "/" in name or "\\" in name or ".." in name:
+    if (
+        not name.strip(".")  # "", ".", ".." would be the parent folder itself
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+        or ".." in name
+    ):
         raise ValueError("Invalid experiment name")
     return name
+
+
+def _validate_remote_project(project: object) -> Optional[str]:
+    """Return a project name that is safe to use as a directory, or ``None``."""
+    if project is None:
+        return None
+    try:
+        return _validate_remote_experiment_name(project)
+    except ValueError:
+        raise ValueError("Invalid project name") from None
+
+
+# SQLite INTEGER range; larger steps would be silently dropped by the writer.
+_STEP_MIN, _STEP_MAX = -(2**63), 2**63 - 1
 
 
 def _coerce_remote_step(step: object) -> int:
     """Return an integer step for remote logging endpoints."""
     try:
-        return int(step)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+        value = int(step)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Invalid step") from None
+    if not _STEP_MIN <= value <= _STEP_MAX:
         raise ValueError("Invalid step")
+    return value
+
+
+async def _read_json_object(request: Any) -> Dict[str, Any]:
+    """Parse a request body that must be a JSON object; 400 otherwise."""
+    from fastapi import HTTPException
+
+    try:
+        data = await request.json()
+    except ValueError:  # JSONDecodeError / UnicodeDecodeError
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from None
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    return data
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _parse_log_payload(
+    data: Dict[str, Any],
+) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, Tuple[List[float], List[float]]]]:
+    """Validate the ``scalars`` / ``texts`` / ``histograms`` of a log body.
+
+    Raises ``ValueError`` (→ 400) instead of letting bad types surface as a
+    500 or be dropped silently by the best-effort writer.
+    """
+
+    def section(key: str) -> Dict[str, Any]:
+        value = data.get(key)
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError(f"'{key}' must be an object")
+        return value
+
+    scalars = section("scalars")
+    for tag, value in scalars.items():
+        if not _is_number(value):
+            raise ValueError(f"scalar {tag!r} must be a number")
+    texts = section("texts")
+    for tag, value in texts.items():
+        if not isinstance(value, str):
+            raise ValueError(f"text {tag!r} must be a string")
+    histograms: Dict[str, Tuple[List[float], List[float]]] = {}
+    for tag, hist in section("histograms").items():
+        if not isinstance(hist, dict):
+            continue
+        edges, counts = hist.get("bin_edges"), hist.get("counts")
+        if not edges or not counts:
+            continue
+        if not (
+            isinstance(edges, list)
+            and isinstance(counts, list)
+            and all(_is_number(v) for v in edges + counts)
+        ):
+            raise ValueError(f"histogram {tag!r} needs numeric bin_edges and counts")
+        histograms[tag] = (edges, counts)
+    return scalars, texts, histograms
+
+
+def _central_ingest_log_dir(name: str, project: Optional[str]) -> str:
+    """Run directory for a remote run logged into the central database.
+
+    Same-named runs in different projects get separate folders: sharing one
+    let a project's media overwrite another's, and deleting it wipe both. A
+    run that already exists keeps the folder it was created with, because
+    its media paths are stored relative to it.
+    """
+    if project is None:
+        return str(Path.cwd() / name)
+    from . import writer as _writer  # same lookup (and test patching) as SummaryWriter
+
+    db_path = _writer.central_db_path()
+    if db_path.exists():
+        db = Database(db_path)
+        try:
+            row = db.get_experiment_by_name(name, project=project)
+        finally:
+            db.close()
+        if row is not None and row["log_dir"]:
+            return str(row["log_dir"])
+    return str(Path.cwd() / project / name)
 
 
 def _looks_like_project_folder(value: str) -> bool:
@@ -143,9 +266,8 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
                 system_metrics_interval=0,
                 resume=True,
             )
-        log_dir = Path.cwd() / name
         return SummaryWriter(
-            str(log_dir),
+            _central_ingest_log_dir(name, project_name),
             name=name,
             project=project_name,
             system_metrics_interval=0,
@@ -153,38 +275,39 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
         )
 
     async def check_auth(request: Request):  # type: ignore[no-untyped-def]
-        if token:
-            auth = request.headers.get("Authorization", "")
-            if not hmac.compare_digest(auth, f"Bearer {token}"):
-                raise HTTPException(status_code=401, detail="unauthorized")
+        if token and not _bearer_matches(request.headers.get("Authorization", ""), token):
+            raise HTTPException(status_code=401, detail="unauthorized")
+        # This app has no browser UI, so any request carrying an Origin was
+        # sent by a web page (CSRF). Remote loggers (urllib/requests) send none.
+        if request.headers.get("origin"):
+            raise HTTPException(status_code=403, detail="browser requests not accepted")
 
-    @app.post("/log")
-    async def log_data(request: Request, _=Depends(check_auth)) -> dict:
-        data = await request.json()
+    def _common_fields(data: Dict[str, Any]) -> Tuple[str, Optional[str]]:
         try:
             experiment = _validate_remote_experiment_name(
                 data.get("experiment", "default")
             )
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid experiment name")
+            project_name = _validate_remote_project(data.get("project"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return experiment, project_name
+
+    @app.post("/log")
+    async def log_data(request: Request, _=Depends(check_auth)) -> dict:
+        data = await _read_json_object(request)
+        experiment, project_name = _common_fields(data)
         try:
             step = _coerce_remote_step(data.get("step", 0))
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid step")
-        project_name = data.get("project")
+            scalars, texts, histograms = _parse_log_payload(data)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         writer = _new_writer(experiment, project_name)
         try:
-            for tag, value in data.get("scalars", {}).items():
+            for tag, value in scalars.items():
                 writer.add_scalar(tag, value, step)
-            for tag, value in data.get("texts", {}).items():
+            for tag, value in texts.items():
                 writer.add_text(tag, value, step)
-            for tag, hist in data.get("histograms", {}).items():
-                if not isinstance(hist, dict):
-                    continue
-                bin_edges = hist.get("bin_edges")
-                counts = hist.get("counts")
-                if not bin_edges or not counts:
-                    continue
+            for tag, (bin_edges, counts) in histograms.items():
                 writer.add_histogram_raw(
                     tag,
                     min=float(bin_edges[0]),
@@ -202,20 +325,14 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
 
     @app.post("/hparams")
     async def log_hparams(request: Request, _=Depends(check_auth)) -> dict:
-        data = await request.json()
-        try:
-            experiment = _validate_remote_experiment_name(
-                data.get("experiment", "default")
-            )
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid experiment name")
+        data = await _read_json_object(request)
+        experiment, project_name = _common_fields(data)
         hparams = data.get("hparams") or {}
         metrics = data.get("metrics") or {}
         if not isinstance(hparams, dict) or not isinstance(metrics, dict):
             raise HTTPException(
                 status_code=400, detail="hparams/metrics must be objects"
             )
-        project_name = data.get("project")
         writer = _new_writer(experiment, project_name)
         try:
             writer.add_hparams(hparams, metrics)
@@ -235,8 +352,10 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
     ) -> dict:
         try:
             experiment = _validate_remote_experiment_name(experiment)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid experiment name")
+            project = _validate_remote_project(project)
+            step = _coerce_remote_step(step)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         writer: Optional[SummaryWriter] = None
         tmp_path: Optional[str] = None
         try:
@@ -523,6 +642,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Viewer host (default: 127.0.0.1)",
     )
     parser.add_argument(
+        "--allow-host",
+        dest="allowed_hosts",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Extra hostname the web UI is reached under, e.g. behind a reverse "
+            "proxy (repeatable; also VIBETRACK_ALLOWED_HOSTS=a,b). Other Host "
+            "headers are rejected to block DNS rebinding."
+        ),
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=6116,
@@ -604,6 +735,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     }
     if args.share is not None:
         show_kwargs["share"] = args.share
+    allowed_hosts = args.allowed_hosts or [
+        h for h in os.environ.get("VIBETRACK_ALLOWED_HOSTS", "").split(",") if h.strip()
+    ]
+    if allowed_hosts:
+        show_kwargs["allowed_hosts"] = allowed_hosts
     try:
         viewer.show(**show_kwargs)
     except ImportError:

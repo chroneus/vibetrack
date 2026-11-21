@@ -67,7 +67,6 @@ class TestScalars:
     def test_ordering_by_step_not_insertion(self, db):
         """Scalars inserted out of step order must be returned sorted by step."""
         exp_id = db.create_experiment("run")
-        t = time.time()
         # Insert in reverse step order
         for step in [9, 3, 6, 0]:
             db.add_scalar(exp_id, "metric", float(step), step)

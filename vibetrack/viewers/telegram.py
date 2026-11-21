@@ -11,6 +11,7 @@ Usage::
 
 from __future__ import annotations
 
+import html
 import io
 import logging
 import os
@@ -19,9 +20,48 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from ..compare import compare_scalars, find_all_tags, summary_table
 from ..config import load_config
+from ..default_config import SMOOTH_WEIGHT
 from ._summary import format_metric as _format_metric
 from ._summary import render_scalar_chart_png as _render_chart_png
 from .base import BaseOutput
+
+
+_TEXT_LIMIT = 4000  # Telegram caps messages at 4096 characters
+
+
+def _h(value: Any) -> str:
+    """Escape a value for Telegram's HTML parse mode.
+
+    Logged tags, run names and text routinely contain ``_`` or ``*``; the
+    legacy Markdown mode rejects the whole message on unbalanced markers.
+    """
+    return html.escape(str(value), quote=False)
+
+
+def _html_clip(text: str, limit: int) -> str:
+    """Escape *text*, cut so the result fits *limit* without splitting ``&…;``."""
+    escaped = _h(text)
+    if len(escaped) <= limit:
+        return escaped
+    cut = escaped[:limit]
+    amp = cut.rfind("&")
+    if amp != -1 and ";" not in cut[amp:]:
+        cut = cut[:amp]
+    return cut + "…"
+
+
+def _join_within(lines: Sequence[str], sep: str = "\n", limit: int = _TEXT_LIMIT) -> str:
+    """Join whole lines up to *limit* chars, so no HTML tag is cut in half."""
+    out: List[str] = []
+    size = 0
+    for line in lines:
+        extra = len(line) + (len(sep) if out else 0)
+        if size + extra > limit:
+            out.append("…")
+            break
+        out.append(line)
+        size += extra
+    return sep.join(out)
 
 
 def _import_telegram_bot() -> Any:
@@ -95,22 +135,21 @@ class TelegramOutput(BaseOutput):
             kind = ev.kind
             step_s = f" step={ev.step}" if ev.step is not None else ""
             if kind == "scalar":
-                text_lines.append(f"`{ev.tag}`={ev.value:.6g}{step_s}")
+                text_lines.append(f"<code>{_h(ev.tag)}</code>={ev.value:.6g}{step_s}")
             elif kind == "text":
-                body = str(ev.value)
-                if len(body) > 500:
-                    body = body[:500] + "…"
-                text_lines.append(f"*{ev.tag}*{step_s}\n{body}")
+                text_lines.append(
+                    f"<b>{_h(ev.tag)}</b>{step_s}\n{_html_clip(str(ev.value), 500)}"
+                )
             elif kind in ("image", "audio", "video", "artifact"):
                 media_events.append(ev)
             elif kind == "histogram":
-                text_lines.append(f"`{ev.tag}` histogram{step_s}")
+                text_lines.append(f"<code>{_h(ev.tag)}</code> histogram{step_s}")
             elif kind == "hparams":
                 hp = ev.value if isinstance(ev.value, dict) else {}
-                pairs = ", ".join(f"{k}={v}" for k, v in list(hp.items())[:8])
-                text_lines.append(f"*hparams* {pairs}")
+                pairs = ", ".join(f"{_h(k)}={_h(v)}" for k, v in list(hp.items())[:8])
+                text_lines.append(f"<b>hparams</b> {pairs}")
             else:
-                text_lines.append(f"`{ev.tag}` ({kind}){step_s}")
+                text_lines.append(f"<code>{_h(ev.tag)}</code> ({_h(kind)}){step_s}")
 
         run_header = events[0].run_name
         if events[0].project:
@@ -152,13 +191,10 @@ class TelegramOutput(BaseOutput):
 
         async def _run() -> None:
             if text_lines:
-                msg = f"*{run_header}*\n" + "\n".join(text_lines)
-                # Telegram messages max 4096 chars
-                if len(msg) > 4000:
-                    msg = msg[:4000] + "…"
+                msg = _join_within([f"<b>{_h(run_header)}</b>", *text_lines])
                 try:
                     await bot.send_message(
-                        chat_id=self.chat_id, text=msg, parse_mode="Markdown"
+                        chat_id=self.chat_id, text=msg, parse_mode="HTML"
                     )
                 except Exception as exc:
                     _log.warning("Telegram text send failed: %s", exc)
@@ -182,7 +218,7 @@ class TelegramOutput(BaseOutput):
         cfg = load_config(self.config_project())
         smoothing: str = kwargs.get("smoothing", cfg.get("smoothing", "ema"))
         smooth_weight: float = kwargs.get(
-            "smooth_weight", cfg.get("smooth_weight", 0.6)
+            "smooth_weight", cfg.get("smooth_weight", SMOOTH_WEIGHT)
         )
         import asyncio
 
@@ -198,9 +234,9 @@ class TelegramOutput(BaseOutput):
         # system/gpu metrics so the message stays scannable. System metrics
         # use unit-aware formatting (24 Gb, 4.0 %, 58 °C, …).
         table = summary_table(exps)
-        lines = ["*vibetrack summary*\n"]
+        lines = ["<b>vibetrack summary</b>"]
         for row in table:
-            parts = [f"`{row['name']}`"]
+            parts = [f"<code>{_h(row['name'])}</code>"]
             user_items: list[tuple[str, str]] = []
             sys_items: list[tuple[str, str]] = []
             for k, v in row.items():
@@ -212,13 +248,13 @@ class TelegramOutput(BaseOutput):
                 else:
                     user_items.append((disp_tag, disp_val))
             for tag, val in user_items:
-                parts.append(f"  `{tag}`: {val}")
+                parts.append(f"  <code>{_h(tag)}</code>: {_h(val)}")
             if sys_items:
-                parts.append("  _system_:")
+                parts.append("  <i>system</i>:")
                 for tag, val in sys_items:
-                    parts.append(f"    `{tag}`: {val}")
+                    parts.append(f"    <code>{_h(tag)}</code>: {_h(val)}")
             lines.append("\n".join(parts))
-        text = "\n\n".join(lines)
+        text = _join_within(lines, sep="\n\n")
 
         TELEGRAM_MEDIA_LIMIT = 50 * 1024 * 1024
 
@@ -257,7 +293,7 @@ class TelegramOutput(BaseOutput):
             await bot.send_message(
                 chat_id=self.chat_id,
                 text=text,
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
             for tag in tags:  # type: ignore[union-attr]
                 comparison = compare_scalars(
@@ -305,14 +341,15 @@ class TelegramOutput(BaseOutput):
                     if not entries:
                         continue
                     latest = max(entries, key=lambda e: e["step"])
-                    body = str(latest["value"])
-                    if len(body) > 3500:
-                        body = body[:3500] + "…"
+                    body = _html_clip(str(latest["value"]), 3500)
                     try:
                         await bot.send_message(
                             chat_id=self.chat_id,
-                            text=f"*{exp.name} / {txt_tag}* — step {latest['step']}\n\n{body}",
-                            parse_mode="Markdown",
+                            text=(
+                                f"<b>{_h(exp.name)} / {_h(txt_tag)}</b>"
+                                f" — step {latest['step']}\n\n{body}"
+                            ),
+                            parse_mode="HTML",
                         )
                     except Exception as exc:
                         _log.warning(

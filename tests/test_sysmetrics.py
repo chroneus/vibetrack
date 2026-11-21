@@ -3,13 +3,12 @@
 import os
 import sys
 import time
-import threading
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from vibetrack.sysmetrics import SystemMetricsCollector, _try_import_psutil
+from vibetrack.sysmetrics import SystemMetricsCollector
 from vibetrack.writer import SummaryWriter
 from vibetrack.db import Database
 

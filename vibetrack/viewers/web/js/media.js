@@ -476,7 +476,7 @@ function _imgBuildAnimate(container, entries, tag) {
     img.addEventListener('click', () => {
       const step = steps[parseInt(slider.value)];
       const path = byExp[exp][step];
-      if (path) openImageFullscreen(`${exp} / ${escapeHtml(tag)} — step ${step}`, mediaUrl(path));
+      if (path) openImageFullscreen(`${exp} / ${tag} — step ${step}`, mediaUrl(path));
     });
   });
   wrap.appendChild(viewport);
@@ -616,13 +616,37 @@ function buildAudio() {
 }
 
 // ── Video ────────────────────────────────────────────────────
-const _vidCompareSelection = []; // { exp, tag, step, path, cardEl }
+// One section per tag (log name) with one card per experiment; each card has
+// its own step slider over that experiment's clips. Compare picks are keyed
+// by exp/tag/step, so they survive moving a slider (pick A@100, then A@500).
+const _vidCompareSelection = []; // { exp, tag, step, path }
+const _vidStepChoice = {}; // JSON [exp, tag] -> { step, followLatest } chosen by the user
+
+function _vidKey(exp, tag, step) { return JSON.stringify([exp, tag, step]); }
+
+function _vidSelIndex(key) {
+  return _vidCompareSelection.findIndex(s => _vidKey(s.exp, s.tag, s.step) === key);
+}
+
+function _vidSyncCard(cardEl) {
+  const on = _vidSelIndex(cardEl.dataset.vidKey) !== -1;
+  cardEl.classList.toggle('vid-selected', on);
+  const cb = cardEl.querySelector('.vid-select-cb');
+  if (cb) cb.checked = on;
+  const txt = cardEl.querySelector('.vid-select-text');
+  if (txt) txt.textContent = on ? 'Selected' : 'Compare';
+}
+
+function _vidSyncCards() {
+  document.querySelectorAll('#video-grid .media-card[data-vid-key]').forEach(_vidSyncCard);
+}
 
 function _vidUpdateCompareToolbar() {
+  // An image selection owns the shared toolbar.
+  if (_imgCompareSelection.length) return;
   let bar = document.getElementById('compare-toolbar');
-  // If image selection is active, let it own the toolbar
-  if (_imgCompareSelection.length >= 2) return;
-  if (_vidCompareSelection.length < 2) {
+  const n = _vidCompareSelection.length;
+  if (!n) {
     if (bar) bar.style.display = 'none';
     return;
   }
@@ -635,50 +659,32 @@ function _vidUpdateCompareToolbar() {
   bar.style.display = '';
   bar.innerHTML = '';
   const lbl = document.createElement('span');
-  lbl.textContent = _vidCompareSelection.length + ' videos selected';
+  lbl.textContent = n + (n === 1 ? ' video' : ' videos') + ' selected';
   const clearBtn = document.createElement('button');
   clearBtn.textContent = 'Clear';
   clearBtn.addEventListener('click', _vidClearSelection);
   const cmpBtn = document.createElement('button');
   cmpBtn.textContent = 'Compare';
   cmpBtn.className = 'cmp-btn-primary';
+  cmpBtn.disabled = n < 2;
   cmpBtn.addEventListener('click', _vidOpenCompare);
   bar.append(lbl, clearBtn, cmpBtn);
 }
 
 function _vidClearSelection() {
-  _vidCompareSelection.forEach(s => {
-    if (s.cardEl) s.cardEl.classList.remove('vid-selected');
-    const cb = s.cardEl && s.cardEl.querySelector('.vid-select-cb');
-    if (cb) cb.checked = false;
-    const txt = s.cardEl && s.cardEl.querySelector('.vid-select-text');
-    if (txt) txt.textContent = 'Compare';
-  });
   _vidCompareSelection.length = 0;
+  _vidSyncCards();
   _vidUpdateCompareToolbar();
 }
 
 function _vidToggleSelect(exp, tag, step, path, cardEl, checked) {
-  const idx = _vidCompareSelection.findIndex(s => s.cardEl === cardEl);
-  if (checked) {
-    if (idx === -1 && _vidCompareSelection.length < 6) {
-      _vidCompareSelection.push({ exp, tag, step, path, cardEl });
-      cardEl.classList.add('vid-selected');
-      const txt = cardEl.querySelector('.vid-select-text');
-      if (txt) txt.textContent = 'Selected';
-    } else if (idx === -1) {
-      const cb = cardEl.querySelector('.vid-select-cb');
-      if (cb) cb.checked = false;
-      const txt = cardEl.querySelector('.vid-select-text');
-      if (txt) txt.textContent = 'Compare';
-      return;
-    }
-  } else if (idx !== -1) {
+  const idx = _vidSelIndex(_vidKey(exp, tag, step));
+  if (checked && idx === -1 && _vidCompareSelection.length < 6) {
+    _vidCompareSelection.push({ exp, tag, step, path });
+  } else if (!checked && idx !== -1) {
     _vidCompareSelection.splice(idx, 1);
-    cardEl.classList.remove('vid-selected');
-    const txt = cardEl.querySelector('.vid-select-text');
-    if (txt) txt.textContent = 'Compare';
   }
+  _vidSyncCard(cardEl);
   _vidUpdateCompareToolbar();
 }
 
@@ -763,6 +769,10 @@ function _vidObserve(video, url) {
   _vidViewportObserver.observe(video);
 }
 
+function _vidUnobserve(video) {
+  if (_vidViewportObserver && _vidViewportObserver.unobserve) _vidViewportObserver.unobserve(video);
+}
+
 // ── Video preview sizing ─────────────────────────────────────
 // Clips are frequently wide strips (side-by-side comparisons), which the
 // default 240px media tile squashes to a ~55px-tall sliver. Tile width is
@@ -815,45 +825,149 @@ function _vidAutoSize(videoEl) {
   if (videoEl.readyState >= 1) apply();
 }
 
+// { tag: { exps: [names in DATA order], byExp: { exp: { step: path } } } }
+function _vidCollectByTag() {
+  const byTag = {};
+  DATA.forEach(exp => (exp.video_tags || []).forEach(tag => {
+    const clips = (exp.video_data || {})[tag] || [];
+    if (!clips.length) return;
+    const info = byTag[tag] || (byTag[tag] = { exps: [], byExp: {} });
+    if (!info.byExp[exp.name]) { info.byExp[exp.name] = {}; info.exps.push(exp.name); }
+    clips.forEach(v => { info.byExp[exp.name][v.step] = v.path; });
+  }));
+  return byTag;
+}
+
+// Keep the step the user chose. While they sit on the latest step (or have
+// not chosen one), follow the newest step so live runs show new clips.
+function _vidPickStep(steps, prev) {
+  const last = steps[steps.length - 1];
+  if (!prev || prev.followLatest || !steps.includes(prev.step)) return last;
+  return prev.step;
+}
+
+// One card per (tag, experiment) with its own step slider over that
+// experiment's clips; the player is swapped when the step changes.
+function _vidBuildRunCard(grid, exp, tag, clips) {
+  const steps = Object.keys(clips).map(Number).sort((a, b) => a - b);
+  const last = steps.length - 1;
+  const choiceKey = JSON.stringify([exp, tag]);
+  const card = document.createElement('div'); card.className = 'media-card vid-run-card';
+  const clip = document.createElement('div'); clip.className = 'vid-clip';
+
+  const ctrl = document.createElement('div'); ctrl.className = 'img-animate-controls vid-step-controls';
+  const prevBtn = document.createElement('button'); prevBtn.innerHTML = '&#9664;'; prevBtn.title = 'Previous step';
+  const nextBtn = document.createElement('button'); nextBtn.innerHTML = '&#9654;'; nextBtn.title = 'Next step';
+  const sliderWrap = document.createElement('div'); sliderWrap.className = 'timeline-slider-wrap';
+  const slider = document.createElement('input'); slider.type = 'range';
+  slider.min = 0; slider.max = Math.max(0, last); slider.value = last;
+  slider.setAttribute('aria-label', exp + ' ' + tag + ' step');
+  sliderWrap.appendChild(slider);
+  const stepLabel = document.createElement('span'); stepLabel.className = 'step-label';
+  ctrl.append(prevBtn, sliderWrap, nextBtn, stepLabel);
+
+  const label = document.createElement('div'); label.className = 'label video-label';
+  label.innerHTML = `<span><span class="exp" style="color:${expColors[exp] || 'var(--muted)'}">${escapeHtml(exp)}</span>`
+    + ' — step <span class="vid-step"></span></span>'
+    + '<label class="vid-select-label"><input type="checkbox" class="vid-select-cb"><span class="vid-select-text">Compare</span></label>';
+  const stepText = label.querySelector('.vid-step');
+  const cb = label.querySelector('.vid-select-cb');
+  let cur = null;
+  cb.addEventListener('click', e => e.stopPropagation());
+  cb.addEventListener('change', () => _vidToggleSelect(exp, tag, cur.step, cur.path, card, cb.checked));
+
+  card.append(clip);
+  if (steps.length > 1) card.append(ctrl);
+  card.append(label);
+  grid.appendChild(card);
+
+  let shown = -1, pending = null;
+  function showControls(idx) {
+    slider.value = idx;
+    stepLabel.textContent = steps[idx] + ' / ' + steps[last];
+    prevBtn.disabled = idx === 0;
+    nextBtn.disabled = idx === last;
+  }
+  function renderClip(idx) {
+    clearTimeout(pending); pending = null;
+    if (idx === shown) return;
+    shown = idx;
+    const step = steps[idx], path = clips[step], url = mediaUrl(path);
+    cur = { step, path };
+    clip.querySelectorAll('video').forEach(v => { _vidUnobserve(v); _vidRelease(v); });
+    clip.innerHTML = '';
+    const vidEl = document.createElement('video');
+    vidEl.controls = true; vidEl.playsInline = true; vidEl.preload = 'none';
+    vidEl.dataset.videoPath = path;
+    _vidEnsurePoster(vidEl);
+    _vidAutoSize(vidEl);
+    clip.appendChild(vidEl);
+    card.dataset.vidKey = _vidKey(exp, tag, step);
+    stepText.textContent = step;
+    card.querySelectorAll('.expand-btn').forEach(b => b.remove());
+    addExpandBtn(card, `${exp} / ${tag} — step ${step}`, body => {
+      document.querySelectorAll('#video-grid video').forEach(v => v.pause());
+      const full = document.createElement('video');
+      full.controls = true; full.autoplay = true; full.playsInline = true; full.src = url;
+      body.appendChild(full);
+    });
+    _vidSyncCard(card);
+    _vidObserve(vidEl, url);
+  }
+  // Called on user input: remembers the choice and, while dragging, waits for
+  // the slider to settle so passing steps don't each fetch a poster.
+  function choose(idx, debounce) {
+    idx = Math.max(0, Math.min(last, idx));
+    _vidStepChoice[choiceKey] = { step: steps[idx], followLatest: idx === last };
+    showControls(idx);
+    clearTimeout(pending);
+    if (debounce) pending = setTimeout(() => renderClip(idx), 150);
+    else renderClip(idx);
+  }
+  slider.addEventListener('input', () => choose(parseInt(slider.value), true));
+  slider.addEventListener('change', () => choose(parseInt(slider.value), false));
+  prevBtn.addEventListener('click', () => choose(parseInt(slider.value) - 1, false));
+  nextBtn.addEventListener('click', () => choose(parseInt(slider.value) + 1, false));
+
+  const start = steps.indexOf(_vidPickStep(steps, _vidStepChoice[choiceKey]));
+  showControls(start);
+  renderClip(start);
+}
+
+function _vidBuildTagSection(root, tag, info) {
+  const section = document.createElement('div'); section.className = 'img-tag-section vid-tag-section';
+  const header = document.createElement('div'); header.className = 'img-tag-header';
+  const h3 = document.createElement('h3'); h3.textContent = tag;
+  header.appendChild(h3);
+  const body = document.createElement('div'); body.className = 'img-tag-body';
+  const grid = document.createElement('div'); grid.className = 'media-grid video-grid';
+  body.appendChild(grid);
+  section.append(header, body);
+  root.appendChild(section);
+  info.exps.forEach(exp => _vidBuildRunCard(grid, exp, tag, info.byExp[exp]));
+}
+
 function buildVideo() {
   const signature = JSON.stringify(DATA.map(exp => [exp.name, exp.video_tags, exp.video_data, expColors[exp.name]]));
   if (signature === _vidGridSignature) return;
   _vidGridSignature = signature;
   if (_vidViewportObserver) _vidViewportObserver.disconnect();
   document.querySelectorAll('#video-grid video').forEach(_vidRelease);
-  _vidClearSelection();
   _vidInitSizeControl();
   _vidAutoAspect = 0;
-  const g = document.getElementById('video-grid'); g.innerHTML = ''; let n = 0;
+  const root = document.getElementById('video-grid'); root.innerHTML = '';
   _vidApplyTile(_vidStoredTile() || VID_TILE_MIN, false);
-  DATA.forEach(exp => (exp.video_tags || []).forEach(tag => (exp.video_data[tag] || []).forEach(v => {
-    n++;
-    const d = document.createElement('div'); d.className = 'media-card';
-    d.dataset.dragId = exp.name + '/' + tag + '/' + v.step;
-    const url = mediaUrl(v.path);
-    const title = `${exp.name} / ${tag} — step ${v.step}`;
-    d.innerHTML = '<video controls playsinline preload="none"></video>'
-      + `<div class="label video-label"><span><span class="exp" style="color:${expColors[exp.name] || 'var(--muted)'}">${escapeHtml(exp.name)}</span>`
-      + ` / <span class="tag">${escapeHtml(tag)}</span> — step ${v.step}</span>`
-      + '<label class="vid-select-label"><input type="checkbox" class="vid-select-cb"><span class="vid-select-text">Compare</span></label></div>';
-    const cb = d.querySelector('.vid-select-cb');
-    cb.addEventListener('click', e => e.stopPropagation());
-    cb.addEventListener('change', () => _vidToggleSelect(exp.name, tag, v.step, v.path, d, cb.checked));
-    const vidEl = d.querySelector('video');
-    vidEl.dataset.videoPath = v.path;
-    _vidEnsurePoster(vidEl);
-    _vidAutoSize(vidEl);
-    addExpandBtn(d, title, body => {
-      document.querySelectorAll('#video-grid video').forEach(v => v.pause());
-      const full = document.createElement('video');
-      full.controls = true; full.autoplay = true; full.playsInline = true; full.src = url;
-      body.appendChild(full);
-    });
-    g.appendChild(d);
-    _vidObserve(vidEl, url);
-  })));
-  if (!n) g.innerHTML = '<div class="empty-msg">No video logged.</div>';
-  else enableDragSort(g, 'video');
+  const byTag = _vidCollectByTag();
+  // Keep compare picks whose clip is still logged.
+  const kept = _vidCompareSelection.filter(s => {
+    const clips = byTag[s.tag] && byTag[s.tag].byExp[s.exp];
+    return !!clips && clips[s.step] === s.path;
+  });
+  _vidCompareSelection.splice(0, _vidCompareSelection.length, ...kept);
+  _vidUpdateCompareToolbar();
+  const tags = Object.keys(byTag).sort();
+  if (!tags.length) { root.innerHTML = '<div class="empty-msg">No video logged.</div>'; return; }
+  tags.forEach(tag => _vidBuildTagSection(root, tag, byTag[tag]));
 }
 
 function _vidFrameIndex(times, time) {

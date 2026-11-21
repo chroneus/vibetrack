@@ -538,7 +538,7 @@ def check_resources() -> str:
             )
             if r.returncode == 0:
                 lines.append("--- Memory ---")
-                lines.extend("  " + l for l in r.stdout.strip().splitlines())
+                lines.extend("  " + line for line in r.stdout.strip().splitlines())
         except Exception:
             pass
     if sys.platform == "linux":

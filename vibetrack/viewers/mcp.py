@@ -901,7 +901,6 @@ class MCPOutput(BaseOutput):
         transport: str = "streamable-http",
     ) -> "Any":
         """Start the MCP server in a daemon thread and return immediately."""
-        import threading
 
         self._mcp_kwargs.update(host=host, port=port)
         self._build_mcp()

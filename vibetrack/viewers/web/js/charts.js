@@ -251,7 +251,7 @@ function buildHistDatasets(tag) {
 }
 
 // ── Scalars ──────────────────────────────────────────────────
-function getConfigSmooth() { return currentConfig.smooth_weight ?? 0.6; }
+function getConfigSmooth() { return currentConfig.smooth_weight ?? 0; }
 
 function addMinimizeBtn(card, tag) {
   const btn = document.createElement('button');
@@ -281,13 +281,71 @@ function buildHiddenChartsTray(hiddenTags) {
   });
 }
 
+// A tag whose every selected experiment logged one unchanging finite value
+// (e.g. lr, num_params) gets a compact chip instead of a flat-line chart.
+// Returns [{exp, value, n, step}] or null when the tag varies anywhere.
+function constantScalar(tag) {
+  const out = [];
+  for (const exp of DATA) {
+    if (!activePills.has(exp.name)) continue;
+    const s = exp.scalars[tag];
+    if (!s || !s.values.length) continue;
+    const v = s.values[0];
+    if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+    if (s.values.some(x => x !== v)) return null;
+    out.push({ exp: exp.name, value: v, n: s.values.length, step: s.steps[0] });
+  }
+  return out.length ? out : null;
+}
+
+function buildConstScalars(entries) {
+  const strip = document.getElementById('const-scalars');
+  if (!strip) return;
+  strip.innerHTML = '';
+  strip.style.display = entries.length ? '' : 'none';
+  entries.forEach(({ tag, rows }) => {
+    const chip = document.createElement('span');
+    chip.className = 'const-chip';
+    const name = document.createElement('span');
+    name.className = 'const-tag';
+    name.textContent = tag;
+    chip.appendChild(name);
+    const same = rows.every(r => r.value === rows[0].value);
+    (same ? [rows[0]] : rows).forEach(r => {
+      const val = document.createElement('span');
+      val.className = 'const-val';
+      if (!same) {
+        const dot = document.createElement('span');
+        dot.className = 'const-dot';
+        dot.style.background = expColors[r.exp];
+        val.appendChild(dot);
+      }
+      const exact = Number.isInteger(r.value) && Math.abs(r.value) < 1e15;
+      val.appendChild(document.createTextNode(exact ? r.value.toLocaleString('en-US') : formatVal(r.value)));
+      chip.appendChild(val);
+    });
+    chip.title = rows.map(r => {
+      const where = r.n === 1 ? `logged once at step ${r.step}` : `constant over ${r.n} points`;
+      return `${r.exp}: ${r.value} (${where})`;
+    }).join('\n');
+    strip.appendChild(chip);
+  });
+}
+
 function buildCharts() {
   const sw = getConfigSmooth();
   const c = document.getElementById('charts'); c.innerHTML = '';
   if (window._charts) window._charts.forEach(x => x.destroy()); window._charts = [];
   const allTags = [...new Set(DATA.flatMap(d => d.tags || []))].sort();
   const hiddenTags = allTags.filter(t => _hiddenCharts.has(t));
-  const tags = allTags.filter(t => !_hiddenCharts.has(t));
+  const constEntries = [];
+  const tags = allTags.filter(t => {
+    if (_hiddenCharts.has(t)) return false;
+    const rows = constantScalar(t);
+    if (rows) { constEntries.push({ tag: t, rows }); return false; }
+    return true;
+  });
+  buildConstScalars(constEntries);
   tags.forEach(tag => {
     const card = document.createElement('div'); card.className = 'card';
     card.dataset.dragId = tag;

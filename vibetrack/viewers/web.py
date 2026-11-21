@@ -17,7 +17,6 @@ replaced at render time.
 import collections
 import functools
 import hashlib
-import hmac
 import json
 import logging
 import math
@@ -29,11 +28,12 @@ import threading
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from typing import Any, Collection, Deque, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import urlencode, urlparse
 
+from ..cli import _bearer_matches, _secret_equals
 from ..compare import find_all_tags  # noqa: F401  (re-exported for tests)
-from ..config import VIBETRACK_CONFIG_DIR, load_config, save_config
+from ..config import VIBETRACK_CONFIG_DIR, load_public_config, save_public_config
 from ..reader import ExperimentReader, RunReader
 from .base import BaseOutput
 
@@ -47,6 +47,9 @@ _SYSTEM_PREFIXES = ("system/", "gpu/")
 # stops a script from wiping a project in a tight loop.
 _MUTATION_RATE_WINDOW_SEC = 1.0
 _MUTATION_RATE_LIMIT = 10
+# Past this many tracked IPs, idle ones are swept so the table can't grow
+# without bound (e.g. one entry per IPv6 address).
+_MUTATION_RATE_MAX_TRACKED = 1024
 _mutation_rate_lock = threading.Lock()
 _mutation_rate_state: Dict[str, Deque[float]] = collections.defaultdict(
     collections.deque
@@ -62,6 +65,10 @@ def _rate_limit_mutation(client_ip: str) -> bool:
     now = time.monotonic()
     cutoff = now - _MUTATION_RATE_WINDOW_SEC
     with _mutation_rate_lock:
+        if len(_mutation_rate_state) >= _MUTATION_RATE_MAX_TRACKED:
+            idle = [ip for ip, b in _mutation_rate_state.items() if not b or b[-1] < cutoff]
+            for ip in idle:
+                del _mutation_rate_state[ip]
         bucket = _mutation_rate_state[client_ip]
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
@@ -79,40 +86,130 @@ def _client_ip(request: Any) -> str:
     return "unknown"
 
 
-def _is_same_origin(request: Any, allowed_host: str) -> bool:
-    """Check that Origin/Referer (if present) match the bound host.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
-    Browsers send ``Origin`` on cross-origin POST/DELETE; a missing
-    header is treated as same-origin (curl, server-side scripts). When
-    present, the host portion must match the server's bound host —
-    that's enough to block CSRF from another page in the same browser.
+
+def _is_same_origin(request: Any, trusted_hosts: Collection[str] = ()) -> bool:
+    """False if Origin/Referer names a different site than this server.
+
+    The browser's own address for this server is the ``Host`` header, so
+    the Origin's ``host[:port]`` must equal it — ports included, since a
+    page on another localhost port is a different site. A missing header is
+    treated as same-origin (curl, server-side scripts); browsers always send
+    Origin on cross-origin POST/DELETE. ``trusted_hosts`` adds names a
+    reverse proxy serves this app under (``--allow-host``).
     """
     origin = request.headers.get("origin") or request.headers.get("referer")
     if not origin:
         return True
     try:
-        parsed_host = urlparse(origin).hostname or ""
+        parsed = urlparse(origin)
+        hostname = parsed.hostname
     except ValueError:
         return False
-    if not parsed_host:
+    if not parsed.netloc or not hostname:  # includes "Origin: null"
         return False
-    # Treat any loopback variant as equivalent — uvicorn binds 127.0.0.1
-    # but the browser may navigate via "localhost".
-    loopbacks = {"localhost", "127.0.0.1", "::1"}
-    if parsed_host in loopbacks and allowed_host in loopbacks:
+    if parsed.netloc.lower() == request.headers.get("host", "").lower():
         return True
-    return parsed_host == allowed_host
+    return hostname in trusted_hosts
 
 
-@functools.lru_cache(maxsize=1)
-def _load_template() -> str:
-    return _INDEX_PATH.read_text(encoding="utf-8")
+def _scope_header(scope: Dict[str, Any], name: bytes) -> Optional[str]:
+    for key, value in scope.get("headers", ()):
+        if key == name:
+            return value.decode("latin-1")
+    return None
+
+
+async def _send_json(send: Any, status: int, payload: Dict[str, Any]) -> None:
+    body = json.dumps(payload).encode()
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+def _host_header_name(value: str) -> Optional[str]:
+    try:
+        return urlparse("//" + value).hostname
+    except ValueError:
+        return None
+
+
+class _HostGuard:
+    """ASGI middleware rejecting requests whose ``Host`` isn't an allowed name.
+
+    Blocks DNS rebinding: a page on attacker.example can re-point its DNS at
+    127.0.0.1 and then read the dashboard as "same-origin", but the browser
+    still sends ``Host: attacker.example``. Installed for loopback binds (or
+    when ``--allow-host`` names are given); on a plain LAN bind the valid
+    names are unknown and ``--token`` is the defense.
+    """
+
+    def __init__(self, app: Any, allowed: Collection[str] = _LOOPBACK_HOSTS) -> None:
+        self.app = app
+        self.allowed = frozenset(allowed)
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            host_header = _scope_header(scope, b"host")
+            if host_header is not None and _host_header_name(host_header) not in self.allowed:
+                await _send_json(send, 403, {
+                    "error": "invalid host header; serving behind a proxy or "
+                             "under another name? start with --allow-host NAME",
+                })
+                return
+        await self.app(scope, receive, send)
+
+
+# Browsers can't send an Authorization header for page loads or <img>/<video>
+# requests, so ``/?token=…`` trades the token for an HttpOnly cookie. The
+# cookie is named after a hash of the token so two servers on one host
+# (different ports share cookies) don't clobber each other.
+def _auth_cookie(token: str) -> Tuple[str, str]:
+    digest = hashlib.sha256(f"vibetrack-web\0{token}".encode()).hexdigest()
+    return f"vibetrack_auth_{digest[:12]}", digest
+
+
+def _require_bearer(app: Any, token: str) -> Any:
+    """Wrap a mounted ASGI sub-app so it enforces the server's bearer token.
+
+    Mounts bypass FastAPI route dependencies, so without this the MCP
+    endpoint would stay open when ``--token`` protects everything else.
+    """
+
+    async def guarded(scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and not _bearer_matches(
+            _scope_header(scope, b"authorization") or "", token
+        ):
+            await _send_json(send, 401, {"detail": "unauthorized"})
+            return
+        await app(scope, receive, send)
+
+    return guarded
 
 
 # Per-process cache-busting stamp. Static asset URLs in index.html get
 # rewritten to include `?v=<stamp>` so a server restart forces browsers to
 # refetch JS/CSS even if their HTTP cache holds the previous version.
 _STATIC_VERSION = str(int(time.time()))
+
+_TEMPLATE_PLACEHOLDER = re.compile(r"__(DATA|PROJECT|PROJECTS)_JSON__")
+
+
+@functools.lru_cache(maxsize=1)
+def _load_template() -> str:
+    # Cache-bust local static URLs: src="/static/foo.js" → src="/static/foo.js?v=…"
+    return re.sub(
+        r'(src|href)="(/static/[^"?#]+)"',
+        rf'\1="\2?v={_STATIC_VERSION}"',
+        _INDEX_PATH.read_text(encoding="utf-8"),
+    )
 
 
 @functools.lru_cache(maxsize=32)
@@ -225,8 +322,13 @@ def _image_thumbnail(path: str, width: int, cache_dir: Path, key: str) -> Option
 
 
 def _json_for_html(obj: Any) -> str:
-    """Serialize *obj* to JSON safe for embedding inside ``<script>``."""
-    return json.dumps(obj).replace("</", r"\u003c/")
+    """Serialize *obj* to JSON safe for embedding inside ``<script>``.
+
+    Escaping every ``<`` (it only occurs inside JSON strings) rules out both
+    ``</script>`` and ``<!--`` / ``<script``, which would otherwise flip the
+    HTML parser into a state that swallows the rest of the page.
+    """
+    return json.dumps(obj).replace("<", r"\u003c")
 
 
 def _render(
@@ -234,20 +336,19 @@ def _render(
     project: Optional[str],
     projects: Sequence[str],
 ) -> str:
-    """Render the index template with JSON-safe replacements."""
-    html = (
-        _load_template()
-        .replace("__DATA_JSON__", _json_for_html(data))
-        .replace("__PROJECT_JSON__", _json_for_html(project))
-        .replace("__PROJECTS_JSON__", _json_for_html(list(projects)))
-    )
-    # Cache-bust local static URLs: src="/static/foo.js" → src="/static/foo.js?v=…"
-    html = re.sub(
-        r'(src|href)="(/static/[^"?#]+)"',
-        rf'\1="\2?v={_STATIC_VERSION}"',
-        html,
-    )
-    return html
+    """Render the index template with JSON-safe replacements.
+
+    All placeholders are substituted in one pass: chained ``str.replace``
+    calls would re-scan already-inserted JSON, so a logged value containing
+    ``__PROJECT_JSON__`` could splice an unquoted project name into the
+    script and execute it.
+    """
+    values = {
+        "DATA": _json_for_html(data),
+        "PROJECT": _json_for_html(project),
+        "PROJECTS": _json_for_html(list(projects)),
+    }
+    return _TEMPLATE_PLACEHOLDER.sub(lambda m: values[m.group(1)], _load_template())
 
 
 def _resolve_host(host: str) -> str:
@@ -606,7 +707,7 @@ def _experiments_for_project(
 def _get_media_roots(reader: RunReader, project: Optional[str] = None) -> List[str]:
     """Return normalized media root dirs from experiment log_dirs."""
     roots: set[str] = set()
-    db = reader._db
+    db = reader.db
     if db is None:
         return []
     for row in db.list_experiments(project=project):
@@ -628,9 +729,29 @@ def _path_is_under(candidate: str, roots: Sequence[str]) -> bool:
     return False
 
 
-def _cleanup_experiment_files(log_dir: str) -> None:
-    """Remove media and the run directory if they are now empty."""
+def _log_dir_in_use(db: Any, log_dir: str) -> bool:
+    """True if any experiment still in *db* (any project) uses *log_dir*."""
+    target = os.path.realpath(log_dir)
+    return any(
+        row["log_dir"] and os.path.realpath(row["log_dir"]) == target
+        for row in db.list_experiments()
+    )
+
+
+def _cleanup_experiment_files(log_dir: str, db: Any = None) -> None:
+    """Remove media and the run directory if they are now empty.
+
+    Call after the experiment's rows are deleted. Skipped while another
+    experiment still uses the same directory: older remote-ingest servers
+    gave same-named runs in different projects one shared ``log_dir``, so
+    its media belongs to both.
+    """
     if not log_dir:
+        return
+    if db is not None and _log_dir_in_use(db, log_dir):
+        logging.getLogger(__name__).info(
+            "keeping %s: still used by another experiment", log_dir
+        )
         return
     shutil.rmtree(os.path.join(log_dir, "media"), ignore_errors=True)
     with suppress(OSError):
@@ -673,13 +794,38 @@ def _handle_delete_experiment(
     if row is None:
         return {"error": "experiment not found"}, 404
     log_dir = db.delete_experiment(int(row["id"]))
-    _cleanup_experiment_files(log_dir or "")
+    _cleanup_experiment_files(log_dir or "", db)
     return {"ok": True}, 200
 
 
-def _handle_move_logdir(db: Any, old_dir: str, new_dir: str) -> Tuple[dict, int]:
+# Files vibetrack itself (or the OS) leaves next to run directories.
+_MANAGED_SIBLING_FILES = frozenset({
+    "vibetrack.db", "vibetrack.db-wal", "vibetrack.db-shm", "vibetrack.db-journal",
+    ".DS_Store", "Thumbs.db", "desktop.ini",
+})
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _handle_move_logdir(
+    db: Any,
+    old_dir: str,
+    new_dir: str,
+    db_path: Optional[str] = None,
+) -> Tuple[dict, int]:
+    """Move a run directory, or a folder holding only run directories.
+
+    The UI offers each run's *parent* folder, so that is accepted too — but
+    only when vibetrack owns everything in it, so a request can never move,
+    say, a home directory that happens to contain a run. The destination
+    must be a new absolute path inside an existing folder.
+    """
     if not old_dir or not new_dir:
         return {"error": "old and new required"}, 400
+    if not Path(new_dir).expanduser().is_absolute():
+        return {"error": "destination must be an absolute path"}, 400
     old_path = Path(old_dir).expanduser().resolve()
     new_path = Path(new_dir).expanduser().resolve()
     if old_path == new_path:
@@ -687,21 +833,34 @@ def _handle_move_logdir(db: Any, old_dir: str, new_dir: str) -> Tuple[dict, int]
     if db is None:
         return {"error": "no database"}, 500
 
-    # Source must be EXACTLY a known experiment log_dir.
-    known = [
+    known = {
         Path(r["log_dir"]).expanduser().resolve()
         for r in db.list_experiments()
         if r["log_dir"]
-    ]
+    }
     if old_path not in known:
-        return {"error": "not a known log directory"}, 403
+        if not old_path.is_dir():
+            return {"error": "not a known log directory"}, 403
+        children = list(old_path.iterdir())
+        runs = [c for c in children if c.resolve() in known]
+        unmanaged = [
+            c for c in children
+            if c.resolve() not in known and c.name not in _MANAGED_SIBLING_FILES
+        ]
+        if not runs or unmanaged:
+            return {"error": "not a known log directory"}, 403
     if not old_path.is_dir():
         return {"error": "source directory not found"}, 404
+    if db_path and _is_within(Path(db_path).resolve(), old_path):
+        return {"error": "directory holds the open database"}, 409
     if new_path.exists():
         return {"error": "destination already exists"}, 409
+    if _is_within(new_path, old_path):
+        return {"error": "cannot move a directory into itself"}, 400
+    if not new_path.parent.is_dir():
+        return {"error": "destination folder does not exist"}, 400
 
     try:
-        new_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(old_path), str(new_path))
     except OSError:
         return {"error": "move failed"}, 500
@@ -775,6 +934,11 @@ def _handle_rename_project(
     return {"ok": True, "target_project": target_project, "moved": moved}, 200
 
 
+def _ui_url(host: str, port: int, token: Optional[str]) -> str:
+    url = f"http://{host}:{port}"
+    return f"{url}/?{urlencode({'token': token})}" if token else url
+
+
 class WebOutput(BaseOutput):
     """Serve an interactive web dashboard."""
 
@@ -784,7 +948,10 @@ class WebOutput(BaseOutput):
         port: int = kwargs.get("port", 6116)
         token: Optional[str] = kwargs.get("token")
         experiments: Optional[Sequence[str]] = kwargs.get("experiments")
-        return self._serve_uvicorn(experiments, host, port, token=token)
+        allowed_hosts: Sequence[str] = kwargs.get("allowed_hosts") or ()
+        return self._serve_uvicorn(
+            experiments, host, port, token=token, allowed_hosts=allowed_hosts
+        )
 
     def _serve_uvicorn(
         self,
@@ -792,11 +959,12 @@ class WebOutput(BaseOutput):
         host: str,
         port: int,
         token: Optional[str] = None,
+        allowed_hosts: Sequence[str] = (),
     ) -> None:
         import uvicorn
 
-        app = self._build_app(experiments, host, token=token)
-        print(f"vibetrack web UI: http://{host}:{port}")
+        app = self._build_app(experiments, host, token=token, allowed_hosts=allowed_hosts)
+        print(f"vibetrack web UI: {_ui_url(host, port, token)}")
         uvicorn.run(app, host=host, port=port, log_level="warning")
 
     def start_in_thread(
@@ -805,13 +973,14 @@ class WebOutput(BaseOutput):
         host: str = "127.0.0.1",
         port: int = 6116,
         token: Optional[str] = None,
+        allowed_hosts: Sequence[str] = (),
     ) -> "threading.Thread":
         """Start the web UI in a daemon thread and return immediately."""
         import threading
         import uvicorn
 
-        app = self._build_app(experiments, host, token=token)
-        print(f"vibetrack web UI: http://{_resolve_host(host)}:{port}")
+        app = self._build_app(experiments, host, token=token, allowed_hosts=allowed_hosts)
+        print(f"vibetrack web UI: {_ui_url(_resolve_host(host), port, token)}")
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         server = uvicorn.Server(config)
         thread = threading.Thread(target=server.run, daemon=True)
@@ -823,6 +992,7 @@ class WebOutput(BaseOutput):
         experiments: Optional[Sequence[str]],
         host: str,
         token: Optional[str] = None,
+        allowed_hosts: Sequence[str] = (),
     ) -> Any:
         """Build and return the FastAPI app (without running it)."""
         from contextlib import asynccontextmanager
@@ -836,14 +1006,23 @@ class WebOutput(BaseOutput):
             Request,
             UploadFile,
         )
-        from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+        from fastapi.responses import (
+            FileResponse,
+            HTMLResponse,
+            JSONResponse,
+            RedirectResponse,
+        )
         from fastapi.staticfiles import StaticFiles
 
         from ..cli import (
             _ALLOWED_SUFFIXES,
             _DANGEROUS_ARTIFACT_SUFFIXES,
+            _central_ingest_log_dir,
             _coerce_remote_step,
+            _parse_log_payload,
+            _read_json_object,
             _validate_remote_experiment_name,
+            _validate_remote_project,
             _write_upload_to_tempfile,
         )
         from ..writer import SummaryWriter
@@ -883,14 +1062,17 @@ class WebOutput(BaseOutput):
             else:
                 yield
 
+        trusted_hosts = frozenset(h.strip().lower() for h in allowed_hosts if h.strip())
         app = FastAPI(title="vibetrack", lifespan=_lifespan)
+        if host in _LOOPBACK_HOSTS or trusted_hosts:
+            app.add_middleware(_HostGuard, allowed=_LOOPBACK_HOSTS | trusted_hosts | {host})
         app.mount("/static", StaticFiles(directory=str(_WEB_DIR)), name="static")
 
         config_project = self.config_project()
         is_central = self.project_folder is None
 
         def _all_projects() -> List[str]:
-            db = self._reader._db
+            db = self._reader.db
             return [p for p in (db.list_projects() if db else []) if p]
 
         # ── Auth / CSRF / rate-limit dependencies ─────────────
@@ -905,17 +1087,55 @@ class WebOutput(BaseOutput):
             — preserving the localhost-only convenience for dev use. When
             ``token`` is supplied (typically with a non-loopback host),
             *all* routes require it, not just ingest. Constant-time
-            comparison prevents a timing oracle.
+            comparison prevents a timing oracle. Browsers authenticate via
+            the cookie that ``/?token=…`` sets (see ``_auth_cookie``).
             """
             if not token:
                 return
-            auth = request.headers.get("Authorization", "")
-            if not hmac.compare_digest(auth, f"Bearer {token}"):
-                raise HTTPException(status_code=401, detail="unauthorized")
+            if (
+                _bearer_matches(request.headers.get("Authorization", ""), token)
+                or _secret_equals(request.cookies.get(cookie_name, ""), cookie_value)
+                or _secret_equals(request.query_params.get("token", ""), token)
+            ):
+                return
+            raise HTTPException(
+                status_code=401,
+                detail="unauthorized: send 'Authorization: Bearer <token>', "
+                "or open /?token=<token> once in the browser",
+            )
 
-        # Back-compat alias for ingest routes that previously used a
-        # separate dependency name.
-        _check_listen_auth = _check_token
+        def _login_redirect(request: Optional[Request]) -> Optional[RedirectResponse]:
+            """Swap a valid ``?token=`` for the auth cookie and drop it from the URL."""
+            if request is None:
+                return None
+            given = request.query_params.get("token")
+            if not token or given is None or not _secret_equals(given, token):
+                return None
+            rest = [(k, v) for k, v in request.query_params.multi_items() if k != "token"]
+            target = request.url.path + ("?" + urlencode(rest) if rest else "")
+            response = RedirectResponse(target, status_code=303)
+            response.set_cookie(
+                cookie_name,
+                cookie_value,
+                httponly=True,
+                samesite="lax",
+                secure=request.url.scheme == "https",
+                path="/",
+            )
+            return response
+
+        cookie_name, cookie_value = _auth_cookie(token) if token else ("", "")
+
+        async def _check_ingest(request: Request) -> None:
+            """Auth + CSRF gate for the remote-logging routes.
+
+            Remote loggers (urllib/requests) send no Origin and pass; a
+            browser always sends one cross-origin, so a web page can't forge
+            log entries. No rate limit: training loops post in bursts.
+            """
+            await _check_token(request)
+            if not _is_same_origin(request, trusted_hosts):
+                raise HTTPException(status_code=403, detail="cross-origin denied")
 
         async def _check_mutation(request: Request) -> None:
             """Auth + CSRF + rate-limit gate for state-mutating endpoints.
@@ -928,15 +1148,26 @@ class WebOutput(BaseOutput):
                  runaway loop or buggy client.
             """
             await _check_token(request)
-            if not _is_same_origin(request, host):
+            if not _is_same_origin(request, trusted_hosts):
                 raise HTTPException(status_code=403, detail="cross-origin denied")
             if not _rate_limit_mutation(_client_ip(request)):
                 raise HTTPException(status_code=429, detail="rate limit exceeded")
 
         # ── Index / data ──────────────────────────────────────
 
+        def _body_str(body: Dict[str, Any], key: str, required: bool = True) -> Any:
+            value = body.get(key)
+            if value is None and not required:
+                return None
+            if not isinstance(value, str):
+                raise HTTPException(status_code=400, detail=f"'{key}' must be a string")
+            return value
+
         @app.get("/", dependencies=[Depends(_check_token)])
-        def index() -> HTMLResponse:
+        def index(request: Request = None) -> Any:  # type: ignore[assignment]
+            login = _login_redirect(request)
+            if login is not None:
+                return login
             if is_central and self.project is None:
                 projects = _all_projects()
                 if not projects:
@@ -976,7 +1207,7 @@ class WebOutput(BaseOutput):
 
         @app.get("/api/data/{project}", dependencies=[Depends(_check_token)])
         def api_data_project(project: str) -> Any:
-            db = self._reader._db
+            db = self._reader.db
             if db is None or not db.list_experiments(project=project):
                 return JSONResponse({"error": "not found"}, status_code=404)
             return _build_data(_experiments_for_project(db, project))
@@ -987,65 +1218,66 @@ class WebOutput(BaseOutput):
 
         # ── Config ────────────────────────────────────────────
 
+        # Config over HTTP never includes notification credentials: they are
+        # neither returned nor overwritten (see ``load_public_config``).
+
         @app.get("/api/config", dependencies=[Depends(_check_token)])
         def get_config() -> dict:
-            return load_config(project=config_project)
+            return load_public_config(project=config_project)
 
         @app.get("/api/config/{project}", dependencies=[Depends(_check_token)])
         def get_config_project(project: str) -> dict:
-            return load_config(project=project)
+            return load_public_config(project=project)
 
         @app.post("/api/config", dependencies=[Depends(_check_mutation)])
         async def set_config(request: Request) -> dict:
-            data = await request.json()
-            save_config(data, project=config_project)
-            return load_config(project=config_project)
+            save_public_config(await _read_json_object(request), project=config_project)
+            return load_public_config(project=config_project)
 
         @app.post("/api/config/{project}", dependencies=[Depends(_check_mutation)])
         async def set_config_project(request: Request, project: str) -> dict:
-            data = await request.json()
-            save_config(data, project=project)
-            return load_config(project=project)
+            save_public_config(await _read_json_object(request), project=project)
+            return load_public_config(project=project)
 
         # ── Rename / delete / move ────────────────────────────
 
         @app.post("/api/rename", dependencies=[Depends(_check_mutation)])
         async def rename_exp(request: Request) -> JSONResponse:
-            body = await request.json()
-            project = body.get("project") or self._reader.project
+            body = await _read_json_object(request)
+            project = _body_str(body, "project", required=False) or self._reader.project
             data, status = _handle_rename(
-                self._reader._db,
-                body.get("old_name", ""),
-                body.get("new_name", ""),
+                self._reader.db,
+                _body_str(body, "old_name"),
+                _body_str(body, "new_name"),
                 project,
             )
             return JSONResponse(data, status_code=status)
 
         @app.post("/api/rename/{project}", dependencies=[Depends(_check_mutation)])
         async def rename_exp_project(request: Request, project: str) -> JSONResponse:
-            body = await request.json()
+            body = await _read_json_object(request)
             data, status = _handle_rename(
-                self._reader._db,
-                body.get("old_name", ""),
-                body.get("new_name", ""),
-                body.get("project") or project,
+                self._reader.db,
+                _body_str(body, "old_name"),
+                _body_str(body, "new_name"),
+                _body_str(body, "project", required=False) or project,
             )
             return JSONResponse(data, status_code=status)
 
         @app.delete("/api/experiment", dependencies=[Depends(_check_mutation)])
         async def delete_exp(request: Request) -> JSONResponse:
-            body = await request.json()
-            project = body.get("project") or self._reader.project
+            body = await _read_json_object(request)
+            project = _body_str(body, "project", required=False) or self._reader.project
             data, status = _handle_delete_experiment(
-                self._reader._db,
-                body.get("name", ""),
+                self._reader.db,
+                _body_str(body, "name"),
                 project,
             )
             return JSONResponse(data, status_code=status)
 
         @app.delete("/api/project/{project}", dependencies=[Depends(_check_mutation)])
         def delete_project(project: str) -> JSONResponse:
-            db = self._reader._db
+            db = self._reader.db
             if db is None:
                 return JSONResponse({"error": "no database"}, status_code=500)
             rows = db.list_experiments(project=project)
@@ -1055,16 +1287,17 @@ class WebOutput(BaseOutput):
             for row in rows:
                 log_dir = row["log_dir"] if hasattr(row, "__getitem__") else ""
                 if log_dir:
-                    _cleanup_experiment_files(str(log_dir))
+                    _cleanup_experiment_files(str(log_dir), db)
             return JSONResponse({"ok": True})
 
         @app.post("/api/move-logdir", dependencies=[Depends(_check_mutation)])
         async def move_logdir(request: Request) -> JSONResponse:
-            body = await request.json()
+            body = await _read_json_object(request)
             data, status = _handle_move_logdir(
-                self._reader._db,
-                body.get("old", ""),
-                body.get("new", ""),
+                self._reader.db,
+                _body_str(body, "old"),
+                _body_str(body, "new"),
+                db_path=str(self._reader.db_path),
             )
             return JSONResponse(data, status_code=status)
 
@@ -1073,11 +1306,11 @@ class WebOutput(BaseOutput):
             dependencies=[Depends(_check_mutation)],
         )
         async def rename_project_route(request: Request, project: str) -> JSONResponse:
-            body = await request.json()
+            body = await _read_json_object(request)
             data, status = _handle_rename_project(
-                self._reader._db,
+                self._reader.db,
                 project,
-                body.get("new_name", ""),
+                _body_str(body, "new_name"),
             )
             return JSONResponse(data, status_code=status)
 
@@ -1143,18 +1376,28 @@ class WebOutput(BaseOutput):
                     resume=True,
                 )
             return SummaryWriter(
-                str(Path.cwd() / name),
+                _central_ingest_log_dir(name, project_name),
                 name=name,
                 project=project_name,
                 system_metrics_interval=0,
                 resume=True,
             )
 
+        def _ingest_project(project: str) -> str:
+            # Central mode turns the project into a directory name.
+            if normalized_pf is not None:
+                return project
+            try:
+                return _validate_remote_project(project) or project
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid project name")
+
         @app.post("/{project}/listen/log")
         async def listen_log(
-            project: str, request: Request, _=Depends(_check_listen_auth)
+            project: str, request: Request, _=Depends(_check_ingest)
         ) -> dict:
-            data = await request.json()
+            data = await _read_json_object(request)
+            project = _ingest_project(project)
             try:
                 experiment = _validate_remote_experiment_name(
                     data.get("experiment", "default")
@@ -1163,13 +1406,14 @@ class WebOutput(BaseOutput):
                 raise HTTPException(status_code=400, detail="Invalid experiment name")
             try:
                 step = _coerce_remote_step(data.get("step", 0))
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid step")
+                scalars, texts, _ = _parse_log_payload(data)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
             writer = _new_writer(experiment, project)
             try:
-                for tag, value in data.get("scalars", {}).items():
+                for tag, value in scalars.items():
                     writer.add_scalar(tag, value, step)
-                for tag, value in data.get("texts", {}).items():
+                for tag, value in texts.items():
                     writer.add_text(tag, value, step)
             finally:
                 writer.close()
@@ -1178,7 +1422,7 @@ class WebOutput(BaseOutput):
         @app.post("/{project}/listen/media")
         async def listen_media(
             project: str,
-            _=Depends(_check_listen_auth),
+            _=Depends(_check_ingest),
             experiment: str = Form("default"),
             tag: str = Form("upload"),
             step: int = Form(0),
@@ -1188,12 +1432,12 @@ class WebOutput(BaseOutput):
             writer: Optional[SummaryWriter] = None
             tmp_path: Optional[str] = None
             try:
+                project = _ingest_project(project)
                 try:
                     experiment = _validate_remote_experiment_name(experiment)
-                except ValueError:
-                    raise HTTPException(
-                        status_code=400, detail="Invalid experiment name"
-                    )
+                    step = _coerce_remote_step(step)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
                 raw_suffix = os.path.splitext(file.filename or "")[1].lower()
                 if type not in {"image", "audio", "video", "artifact"}:
                     raise HTTPException(
@@ -1241,14 +1485,20 @@ class WebOutput(BaseOutput):
         # ── MCP sub-app mount ─────────────────────────────────
 
         if _mcp_asgi is not None:
-            app.mount("/vibetrack_mcp", _mcp_asgi)
+            app.mount(
+                "/vibetrack_mcp",
+                _require_bearer(_mcp_asgi, token) if token else _mcp_asgi,
+            )
 
         # ── Project-scoped index (must be registered last so fixed
         #     paths above take precedence over ``/{project}``) ──
 
         @app.get("/{project}", dependencies=[Depends(_check_token)])
-        def project_index(project: str) -> HTMLResponse:
-            db = self._reader._db
+        def project_index(project: str, request: Request = None) -> Any:  # type: ignore[assignment]
+            login = _login_redirect(request)
+            if login is not None:
+                return login
+            db = self._reader.db
             if db is None:
                 return HTMLResponse("no database", status_code=500)
             data = _build_data(_experiments_for_project(db, project))

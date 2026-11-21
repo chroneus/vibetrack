@@ -10,7 +10,7 @@ from typing import Any, Dict
 
 # ── Smoothing ────────────────────────────────────────────────────
 SMOOTHING_METHOD = "ema"
-SMOOTH_WEIGHT = 0.6
+SMOOTH_WEIGHT = 0.0
 
 # ── System metrics ───────────────────────────────────────────────
 SYSTEM_METRICS_INTERVAL = 3600  # seconds (1 hour)
@@ -34,7 +34,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "x_axis_mode": "step",
     },
     "gradio": {
-        "share": True,
+        # A share link is a public gradio.live URL with no auth; opt in
+        # with --share or this setting.
+        "share": False,
         "refresh_interval": 2,
         "image_max_px": 1024,
     },

@@ -8,8 +8,6 @@ from typing import Any, List, Optional, Sequence
 
 import pytest
 
-from vibetrack.viewers import base as viewers_base
-from vibetrack.viewers import event as _event_mod
 from vibetrack.viewers.base import BaseOutput
 from vibetrack.viewers.event import LogEvent
 from vibetrack.writer import SummaryWriter

@@ -23,7 +23,7 @@ function _renderProjectMenu(projects) {
   projName.classList.add('has-menu');
   window.VT_PROJECTS.forEach(p => {
     const a = document.createElement('a');
-    a.href = '/' + p; a.textContent = p;
+    a.href = '/' + encodeURIComponent(p); a.textContent = p;
     if (p === window.VT_PROJECT) a.classList.add('active');
     menu.appendChild(a);
   });
@@ -64,7 +64,7 @@ function _setupProjectSwitcher() {
   document.getElementById('danger-zone-card').style.display = '';
   delBtn.addEventListener('click', () => {
     if (!confirm('Delete project "' + window.VT_PROJECT + '" and all its data? This cannot be undone.')) return;
-    fetch('/api/project/' + window.VT_PROJECT, { method: 'DELETE' })
+    fetch('/api/project/' + encodeURIComponent(window.VT_PROJECT), { method: 'DELETE' })
       .then(r => r.json())
       .then(res => { if (res.ok) { localStorage.removeItem('vt_last_project'); window.location = '/'; } else alert('Delete failed: ' + (res.error || 'unknown')); })
       .catch(() => alert('Delete failed'));

@@ -18,6 +18,32 @@ vibetrack --viewer gradio
 vibetrack --viewer mcp
 ```
 
+### Exposing the dashboard
+
+Without `--token` the dashboard has no auth, so keep it on `127.0.0.1` or pass a
+token whenever it listens on a network address:
+
+```bash
+vibetrack --host 0.0.0.0 --token mysecret
+# -> vibetrack web UI: http://192.168.1.10:6116/?token=mysecret
+```
+
+Open the printed URL once: the token is swapped for an HttpOnly cookie and
+dropped from the address bar. Scripts and MCP clients send
+`Authorization: Bearer mysecret` instead.
+
+On a loopback bind, requests whose `Host` isn't `localhost`/`127.0.0.1`/`[::1]`
+are refused, which blocks DNS-rebinding attacks. Behind a reverse proxy that
+forwards its own hostname, allow it explicitly:
+
+```bash
+vibetrack --allow-host vt.example.com      # or VIBETRACK_ALLOWED_HOSTS=vt.example.com
+```
+
+Notification credentials (`telegram`, `slack` in `config.json`) are never
+returned or changed by the web API; edit the file directly. Gradio's public
+share link is off by default; `vibetrack gradio --share` opts in.
+
 ## Event Dispatch
 
 Each `add_*` and `log()` call returns an event handle, so you can forward a

@@ -5,8 +5,9 @@ from __future__ import annotations
 import sys
 from typing import Any, List, Optional, Sequence
 
-from ..compare import compare_scalars, find_all_tags, summary_table
+from ..compare import find_all_tags, summary_table
 from ..config import load_config
+from ..default_config import SMOOTH_WEIGHT
 from ..smoother import smooth
 from .base import BaseOutput
 
@@ -69,7 +70,7 @@ class ConsoleOutput(BaseOutput):
         cfg = load_config(self.config_project())
         smoothing: str = kwargs.get("smoothing", cfg.get("smoothing", "ema"))
         smooth_weight: float = kwargs.get(
-            "smooth_weight", cfg.get("smooth_weight", 0.6)
+            "smooth_weight", cfg.get("smooth_weight", SMOOTH_WEIGHT)
         )
         exps = self._resolve_experiments(experiments)
         if not exps:

@@ -472,6 +472,17 @@ class RunReader:
             self._db.close()
             self._db = None
 
+    @property
+    def db(self) -> Optional[Database]:
+        """The open database, picked up once its file appears.
+
+        Long-running viewers must use this instead of ``_db``: a server
+        started before the first run has no database yet, and would
+        otherwise stay empty until restarted.
+        """
+        self._discover()
+        return self._db
+
     _UNSET_PROJECT: Any = object()
 
     def experiments(self, project: Any = _UNSET_PROJECT) -> List[ExperimentReader]:

@@ -5,11 +5,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>vibetrack</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/viz.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/full.render.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/img-comparison-slider@8/dist/index.js"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/img-comparison-slider@8/dist/styles.css">
+  <!-- CDN assets are pinned to exact versions with Subresource Integrity, so
+       a changed or compromised file is refused instead of run with full access
+       to the dashboard. Bump version and hash together. -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.6.1/dist/chart.umd.min.js" integrity="sha256-hzZMwrKnamaEkp59a4Cxiol3lNs4QAyv8fzxeRxpJdI=" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/viz.js" integrity="sha256-8RHyK+AFzq9iXwbFo2unqidwPbwHU5FFWe3RwkcVtuU=" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/viz.js@2.1.2/full.render.js" integrity="sha256-Ogqs510LFnekr9o7OLdpelaaAmNss9egQRTyzCqV2NQ=" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/img-comparison-slider@8.0.7/dist/index.js" integrity="sha256-bgEzUAC7r90FP4UdtOACXcPg+t1nfeylFUjW/pW0IWI=" crossorigin="anonymous"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/img-comparison-slider@8.0.7/dist/styles.css" integrity="sha256-Lgj7ma3YMJ0mEFahPp6sGHgy3ddqd38v+ylUySwbmgA=" crossorigin="anonymous">
   <link rel="stylesheet" href="/static/css/style.css">
   <!-- 3D mesh viewer (vendored locally, works offline) -->
   <script defer src="/static/vendor/three.min.js"></script>
@@ -48,6 +51,7 @@
         <div class="exp-pills" id="exp-pills"></div>
       </div>
     </div>
+    <div class="const-scalars" id="const-scalars" style="display:none;"></div>
     <div class="grid" id="charts"></div>
     <div class="hidden-tray collapsed" id="hidden-charts-tray" style="display:none;">
       <div class="hidden-tray-header" id="hidden-charts-toggle">
@@ -75,7 +79,7 @@
       <input type="range" id="vid-size" min="240" max="1400" step="20">
       <span id="vid-size-val" class="vid-size-val"></span>
     </div>
-    <div class="media-grid video-grid" id="video-grid"></div>
+    <div id="video-grid"></div>
   </div>
 
   <!-- Artifacts -->

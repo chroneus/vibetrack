@@ -23,6 +23,7 @@ const context = vm.createContext({
   IntersectionObserver: class {
     constructor(cb) { callback = cb; }
     observe() {}
+    unobserve() {}
     disconnect() {}
   },
 });
@@ -107,3 +108,26 @@ for (let i = 0; i < times.length; i++) {
   assert.equal(context._vidFrameIndex(times, context._vidFrameTime(times, i, .18)), i);
 }
 console.log('PASS: variable-rate frame lookup and seek targets');
+
+// The video tab groups clips by tag; each tag+experiment card picks its own step.
+const plain = x => JSON.parse(JSON.stringify(x));
+context.DATA = [
+  {name: 'b', video_tags: ['eval', 'once'], video_data: {
+    eval: [{step: 200, path: 'b/200'}, {step: 0, path: 'b/0'}],
+    once: [{step: 7, path: 'b/once'}],
+  }},
+  {name: 'a', video_tags: ['eval', 'empty'], video_data: {
+    eval: [{step: 0, path: 'a/0'}, {step: 100, path: 'a/100'}], empty: [],
+  }},
+];
+assert.deepEqual(plain(context._vidCollectByTag()), {
+  eval: {exps: ['b', 'a'], byExp: {b: {0: 'b/0', 200: 'b/200'}, a: {0: 'a/0', 100: 'a/100'}}},
+  once: {exps: ['b'], byExp: {b: {7: 'b/once'}}},
+});
+const steps = [0, 100, 200];
+assert.equal(context._vidPickStep(steps, undefined), 200, 'defaults to the latest step');
+assert.equal(context._vidPickStep(steps, {step: 100, followLatest: false}), 100, 'keeps a chosen step');
+assert.equal(context._vidPickStep([0, 100, 200, 300], {step: 200, followLatest: true}), 300,
+  'follows new clips while on the latest step');
+assert.equal(context._vidPickStep(steps, {step: 50, followLatest: false}), 200, 'falls back when the step is gone');
+console.log('PASS: video clips grouped per tag with a step choice');

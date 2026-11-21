@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from .reader import ExperimentReader, RunReader
+from .reader import ExperimentReader
 from .smoother import smooth
 
 

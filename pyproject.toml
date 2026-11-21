@@ -27,11 +27,13 @@ dependencies = [
 
 [project.optional-dependencies]
 telegram = ["python-telegram-bot>=20.0"]
+# mcp 2.x renamed FastMCP to MCPServer; the MCP viewer targets the 1.x API.
+mcp = ["mcp>=1.0,<2; python_version >= '3.10'"]
 all = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.20.0",
     "python-multipart>=0.0.5",
-    "mcp>=1.0; python_version >= '3.10'",
+    "mcp>=1.0,<2; python_version >= '3.10'",
     "psutil>=5.9",
     "numpy",
     "Pillow",
@@ -54,6 +56,7 @@ include = ["vibetrack*"]
 
 [tool.setuptools.package-data]
 vibetrack = [
+  "py.typed",
   "viewers/web/index.html",
   "viewers/web/css/*.css",
   "viewers/web/js/*.js",
@@ -63,3 +66,10 @@ vibetrack = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Pin the rule set so CI doesn't change with each ruff release's defaults.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"*.ipynb" = ["E402"]

@@ -150,8 +150,7 @@ class GradioOutput(BaseOutput):
         return [e for e in exps if e.name in name_set]
 
     def _list_projects(self) -> List[str]:
-        self._reader._discover()
-        db = self._reader._db
+        db = self._reader.db
         if db is None:
             return []
         try:
@@ -1005,7 +1004,7 @@ class GradioOutput(BaseOutput):
 
         cfg = load_config(self.config_project())
         gradio_cfg = cfg.get("gradio", {})
-        share = bool(launch_kwargs.pop("share", gradio_cfg.get("share", True)))
+        share = bool(launch_kwargs.pop("share", gradio_cfg.get("share", False)))
         host = launch_kwargs.pop(
             "host",
             launch_kwargs.pop("server_name", gradio_cfg.get("host", "127.0.0.1")),
@@ -1039,6 +1038,7 @@ class GradioOutput(BaseOutput):
         )
         launch_kwargs.pop("token", None)
         launch_kwargs.pop("mcp_transport", None)
+        launch_kwargs.pop("allowed_hosts", None)
 
         import gradio as gr
 

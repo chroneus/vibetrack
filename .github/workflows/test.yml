@@ -43,8 +43,21 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install package and test dependencies
+        if: matrix.python-version != '3.8'
         run: |
           pip install -e ".[mcp]" pytest pytest-cov httpx numpy Pillow
+
+      # The build backend needs setuptools>=77 (PEP 639 license field), which
+      # has no Python 3.8 release, so the package cannot be built here. Test
+      # the source tree with the runtime dependencies read from pyproject.toml;
+      # the pure-Python wheel published from a newer Python installs on 3.8.
+      - name: Install dependencies without building (Python 3.8)
+        if: matrix.python-version == '3.8'
+        run: |
+          pip install tomli
+          python -c "import tomli; print('\n'.join(tomli.load(open('pyproject.toml', 'rb'))['project']['dependencies']))" > "$RUNNER_TEMP/requirements.txt"
+          pip install -r "$RUNNER_TEMP/requirements.txt" pytest pytest-cov httpx numpy Pillow
+          echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
 
       - name: Run tests
         run: pytest

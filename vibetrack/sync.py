@@ -6,7 +6,7 @@ Bucket layout under the storage prefix (see ``docs/STORAGE.md``)::
     _runs/<uid>/d/<gen>-<seq>.json.gz   rows added after snapshot <gen>
     _runs/<uid>/edit.json               rename/move made in a dashboard
     _runs/<uid>/deleted                 delete marker
-    <project>/<run>-<uid8>/media/...    media files
+    <project>/<run>-<uid>/media/...    media files
 
 Only the run's own writer (or ``vibetrack push``) writes ``snap`` and ``d/``;
 only dashboards write ``edit.json`` and ``deleted``. No object is ever
@@ -31,11 +31,12 @@ import tempfile
 import threading
 import time
 import weakref
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .db import Database, remove_experiment_files
-from .storage import Storage, StorageError, display_uri, is_remote_uri, open_storage
+from .storage import ObjectInfo, Storage, StorageError, display_uri, is_remote_uri, open_storage
 
 _log = logging.getLogger(__name__)
 
@@ -90,7 +91,29 @@ def run_uid(db_path: str, experiment_id: int, created_at: float, host: str) -> s
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
 
 
+_UID = re.compile(r"[0-9a-f]{16}")
+
+
+def _check_uid(uid: str) -> None:
+    if not _UID.fullmatch(uid):
+        raise ValueError(f"invalid run id: {uid!r}")
+
+
+def _media_prefix(uid: str, prefix: str) -> str:
+    _check_uid(uid)
+    # Older snapshots use the first eight UID digits. They remain readable,
+    # but a short suffix cannot establish exclusive ownership for deletion.
+    parts = prefix.split("/")
+    if (len(parts) != 2 or parts[0] == RUNS
+            or any(not re.fullmatch(r"[A-Za-z0-9._-]+", part) or part in (".", "..")
+                   for part in parts)
+            or not parts[1].endswith(("-" + uid, "-" + uid[:8]))):
+        raise ValueError(f"invalid media prefix for run {uid}")
+    return prefix
+
+
 def _run_key(uid: str, name: str) -> str:
+    _check_uid(uid)
     return f"{RUNS}/{uid}/{name}"
 
 
@@ -104,11 +127,19 @@ def _gunzip_bytes_to(data: bytes, dest: str) -> None:
         fh.write(gzip.decompress(data))
 
 
+def _safe_key_parts(parts: Sequence[str]) -> bool:
+    return all(p not in ("", ".", "..") and "\\" not in p and ":" not in p for p in parts)
+
+
 def _purge_run(storage: Storage, uid: str, media_prefix: Optional[str]) -> None:
     """Delete a run's objects, keeping its delete marker (written first)."""
-    keys = [o.key for o in storage.list(f"{RUNS}/{uid}/") if not o.key.endswith("/" + DELETED)]
-    if media_prefix:
-        keys += [o.key for o in storage.list(f"{media_prefix}/")]
+    root = _run_key(uid, "")
+    keys = [o.key for o in storage.list(root) if o.key.startswith(root)
+            and o.key != root + DELETED and _safe_key_parts(o.key[len(root):].split("/"))]
+    if media_prefix and _media_prefix(uid, media_prefix).endswith("-" + uid):
+        media = media_prefix + "/media/"
+        keys += [o.key for o in storage.list(media) if o.key.startswith(media)
+                 and _safe_key_parts(o.key[len(media):].split("/"))]
     storage.delete_many(keys)
 
 
@@ -172,7 +203,7 @@ class RunUploader:
         )
         self.media_prefix = (
             f"{_safe_segment(row['project'], '_')}/"
-            f"{_safe_segment(row['name'], 'run')}-{self.uid[:8]}"
+            f"{_safe_segment(row['name'], 'run')}-{self.uid}"
         )
 
     def is_deleted(self) -> bool:
@@ -232,10 +263,10 @@ class RunUploader:
             counts[t][1] < self.expected.get(t, 0) for t in counts if t != "hparams"
         )
 
-    def _snapshot_meta(self) -> Dict[str, str]:
+    def _snapshot_meta(self, gen: int) -> Dict[str, str]:
         return {
             "sync_uid": str(self.uid),
-            "sync_gen": str(self.gen),
+            "sync_gen": str(gen),
             "sync_media_prefix": str(self.media_prefix),
             "sync_host": self.host,
         }
@@ -255,17 +286,17 @@ class RunUploader:
             gen = int(time.time() * 1000)
             if self.gen is not None and gen <= self.gen:
                 gen = self.gen + 1
-            self.gen = gen
             with tempfile.TemporaryDirectory(prefix="vibetrack-sync-") as tmp:
                 raw = os.path.join(tmp, "snap.db")
                 packed = os.path.join(tmp, SNAPSHOT)
                 marks = self.db.export_experiment(
-                    self.experiment_id, raw, meta=self._snapshot_meta()
+                    self.experiment_id, raw, meta=self._snapshot_meta(gen)
                 )
                 _gzip_file(raw, packed)
                 self.storage.put_file(
                     _run_key(self.uid, SNAPSHOT), packed, "application/gzip"
                 )
+            self.gen = gen
             self.marks = marks
             self.expected = {t: counts[t][1] for t in counts}
             self.seq = 0
@@ -324,6 +355,29 @@ class RunUploader:
                 self.storage.put_file(f"{self.media_prefix}/{rel}", full, ctype)
                 self._media_sent[rel] = sig
 
+    def archive(self) -> bool:
+        """Upload, then delete locally only if the source stayed unchanged."""
+        # Observe from a separate connection so commits from every writer,
+        # including this thread, advance the observed main-DB version.
+        with closing(sqlite3.connect(str(self.db.path))) as observer:
+            version = observer.execute("PRAGMA main.data_version").fetchone()[0]
+            if not self.sync(final=True):
+                return False
+            if not self.verify_uploaded():
+                raise StorageError("upload verification failed; local copy kept")
+            with self.db.transaction() as conn:
+                if observer.execute("PRAGMA main.data_version").fetchone()[0] != version:
+                    raise StorageError("database changed during upload; local copy kept")
+                row = conn.execute(
+                    "SELECT e.log_dir, r.status FROM experiments e LEFT JOIN run_info r "
+                    "ON r.experiment_id=e.id WHERE e.id=?", (self.experiment_id,),
+                ).fetchone()
+                if row is None or row["status"] == "running":
+                    raise StorageError("run is missing or still running; local copy kept")
+                self.db.delete_rows_in(conn, self.experiment_id)
+            remove_experiment_files(row["log_dir"] or "", self.db)
+        return True
+
     def verify_uploaded(self) -> bool:
         """True when the snapshot and every local media file are in storage."""
         if self.uid is None or self.gen is None:
@@ -345,7 +399,9 @@ class RunUploader:
                     continue
                 full = os.path.join(dirpath, name)
                 rel = os.path.relpath(full, log_dir).replace(os.sep, "/")
-                if remote.get(f"{self.media_prefix}/{rel}") != os.path.getsize(full):
+                st = os.stat(full)
+                if (self._media_sent.get(rel) != (st.st_size, st.st_mtime_ns)
+                        or remote.get(f"{self.media_prefix}/{rel}") != st.st_size):
                     return False
         return True
 
@@ -575,7 +631,10 @@ class RemoteProject:
         if cache_dir is not None:
             self.cache_dir = Path(cache_dir).expanduser().resolve()
         else:
-            self.cache_dir = (default_cache_root() / self.source).resolve()
+            root = default_cache_root().resolve()
+            self.cache_dir = (root / self.source).resolve()
+            if root not in self.cache_dir.parents:
+                raise ValueError("storage cache path escapes cache root")
         self.db_path = self.cache_dir / "vibetrack.db"
         self.runs_dir = self.cache_dir / "runs"
         self.refresh_secs = (
@@ -590,6 +649,7 @@ class RemoteProject:
         self._db: Optional[Database] = None
         self._warn = _Warner()
         self.last_error: Optional[str] = None
+        self.run_errors: List[str] = []
 
     # ── mirror bookkeeping ──────────────────────────────────────
 
@@ -600,11 +660,18 @@ class RemoteProject:
                 db = Database(self.db_path)
                 with db.transaction() as conn:
                     conn.execute(_MIRROR_SQL)
+                    conn.execute("CREATE TABLE IF NOT EXISTS sync_media ("
+                                 "source TEXT, uid TEXT, key TEXT, etag TEXT, "
+                                 "PRIMARY KEY(source, uid, key))")
                 self._db = db
             return self._db
 
     def _run_dir(self, uid: str) -> str:
-        return str(self.runs_dir / uid)
+        _check_uid(uid)
+        path = self.runs_dir / uid
+        if path.resolve() != path:
+            raise ValueError("mirror run directory contains a symbolic link")
+        return str(path)
 
     def _row(self, conn: Any, uid: str) -> Optional[Any]:
         """The mirror row of *uid*, if its experiment is still in the mirror."""
@@ -626,7 +693,10 @@ class RemoteProject:
             "WHERE m.source = ?",
             (self.source,),
         ).fetchall()
-        return {r["uid"]: dict(r) for r in rows if r["log_dir"] == self._run_dir(r["uid"])}
+        return {
+            r["uid"]: dict(r) for r in rows
+            if _UID.fullmatch(r["uid"]) and r["log_dir"] == str(self.runs_dir / r["uid"])
+        }
 
     def _remove_in(self, conn: Any, uid: str) -> None:
         """Delete every experiment mirroring *uid* and its bookkeeping."""
@@ -635,6 +705,7 @@ class RemoteProject:
         ).fetchall()
         for (exp_id,) in ids:
             Database.delete_rows_in(conn, int(exp_id))
+        conn.execute("DELETE FROM sync_media WHERE source=? AND uid=?", (self.source, uid))
         conn.execute(
             "DELETE FROM sync_mirror WHERE source = ? AND uid = ?", (self.source, uid)
         )
@@ -661,6 +732,7 @@ class RemoteProject:
     def refresh(self) -> bool:
         """Bring the mirror up to date. Returns whether anything changed."""
         with self._lock:
+            self.run_errors.clear()
             self._last_refresh = time.time()
             try:
                 changed = self._refresh_locked()
@@ -678,6 +750,9 @@ class RemoteProject:
             if len(parts) < 3:
                 continue
             uid, rest = parts[1], parts[2]
+            if not _UID.fullmatch(uid):
+                self.run_errors.append(f"invalid run id {uid!r}")
+                continue
             entry = listing.setdefault(uid, {"chunks": []})
             if rest == SNAPSHOT:
                 entry["snap"] = obj
@@ -698,6 +773,17 @@ class RemoteProject:
             ).fetchall()
         ]
         for uid in known:
+            if not _UID.fullmatch(uid):
+                with db.transaction() as conn:
+                    row = conn.execute("SELECT exp_id FROM sync_mirror WHERE source=? AND uid=?",
+                                       (self.source, uid)).fetchone()
+                    if row is not None:
+                        exp = conn.execute("SELECT log_dir FROM experiments WHERE id=?", (row[0],)).fetchone()
+                        if exp is not None and exp[0] == str(self.runs_dir / uid):
+                            db.delete_rows_in(conn, int(row[0]))
+                        conn.execute("DELETE FROM sync_mirror WHERE source=? AND uid=?", (self.source, uid))
+                changed = True
+                continue
             entry = listing.get(uid)
             if entry is None or entry.get("deleted") or "snap" not in entry:
                 self._drop_local(uid)
@@ -709,7 +795,10 @@ class RemoteProject:
         for uid in order:
             try:
                 changed |= self._refresh_run(db, uid, listing[uid])
-            except (StorageError, OSError, ValueError, KeyError, sqlite3.Error) as exc:
+            except Exception as exc:
+                # Isolate malformed or unreadable runs so a pull can still
+                # finish the healthy ones and report the complete error list.
+                self.run_errors.append(f"{uid}: {exc}")
                 self._warn(f"skipping run {uid} from {display_uri(self.uri)}: {exc}")
         return changed
 
@@ -756,7 +845,7 @@ class RemoteProject:
         edit = self._read_edit(uid) if edit_obj is not None else None
         data = self.storage.get_bytes(_run_key(uid, SNAPSHOT))
         if data is None:
-            return False
+            raise StorageError(f"snapshot disappeared for {uid}")
         fd, tmp = tempfile.mkstemp(prefix="vt-snap-", suffix=".db", dir=str(self.cache_dir))
         os.close(fd)
         try:
@@ -782,7 +871,7 @@ class RemoteProject:
                         self.source, uid, new_id, snap.etag,
                         int(meta.get("sync_gen") or 0),
                         edit_obj.etag if edit_obj is not None else None,
-                        meta.get("sync_media_prefix", ""),
+                        _media_prefix(uid, meta.get("sync_media_prefix", "")),
                     ),
                 )
             return True
@@ -804,11 +893,13 @@ class RemoteProject:
             if seq <= applied:
                 continue
             if seq != applied + 1:
-                break  # a chunk is still on its way; continue next refresh
+                raise StorageError(f"missing delta {applied + 1} for {uid}")
             raw = self.storage.get_bytes(obj.key)
             if raw is None:
-                break
+                raise StorageError(f"delta {seq} disappeared for {uid}")
             chunk = json.loads(gzip.decompress(raw).decode("utf-8"))
+            if not isinstance(chunk, dict) or not isinstance(chunk.get("rows"), dict):
+                raise ValueError(f"invalid delta {seq}")
             with db.transaction() as conn:
                 cur = self._row(conn, uid)
                 if cur is None or int(cur["gen"]) != gen:
@@ -836,7 +927,7 @@ class RemoteProject:
     def _drop_local(self, uid: str) -> None:
         with self._database().transaction() as conn:
             self._remove_in(conn, uid)
-        shutil.rmtree(self.runs_dir / uid, ignore_errors=True)
+        shutil.rmtree(self._run_dir(uid), ignore_errors=True)
 
     # ── media ───────────────────────────────────────────────────
 
@@ -847,12 +938,13 @@ class RemoteProject:
         except ValueError:
             return None
         parts = rel.parts
-        if len(parts) < 3 or parts[1] != "media":
+        if len(parts) < 3 or not _UID.fullmatch(parts[0]) or parts[1] != "media":
             return None
         row = self._row(self._conn(), parts[0])
         if row is None or not row["media_prefix"]:
             return None
-        return parts[0], f"{row['media_prefix']}/{'/'.join(parts[1:])}"
+        prefix = _media_prefix(parts[0], row["media_prefix"])
+        return parts[0], f"{prefix}/{'/'.join(parts[1:])}"
 
     def ensure_local(self, path: str) -> bool:
         """Download a mirrored media file on first use; True if it is local."""
@@ -901,21 +993,57 @@ class RemoteProject:
         except Exception:
             return None
 
+    def _download_media(self, uid: str, prefix: str, obj: ObjectInfo) -> bool:
+        parts = obj.key[len(prefix):].split("/")
+        if not obj.key.startswith(prefix) or not _safe_key_parts(parts):
+            raise ValueError("invalid media key")
+        media = Path(self._run_dir(uid)) / "media"
+        dest = media.joinpath(*parts)
+        if dest.resolve() != dest or media not in dest.parents:
+            raise ValueError("unsafe media destination")
+        identity = (self.source, uid, obj.key)
+        conn = self._conn()
+        version = conn.execute(
+            "SELECT etag FROM sync_media WHERE source=? AND uid=? AND key=?", identity,
+        ).fetchone()
+        if (obj.etag and version and version[0] == obj.etag
+                and dest.is_file() and dest.stat().st_size == obj.size):
+            return False
+        # Download outside the SQLite write transaction so a slow object store
+        # doesn't block concurrent mirror readers that need to refresh.
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".vt-", suffix=".part")
+        os.close(fd)
+        try:
+            if not self.storage.get_file(obj.key, tmp):
+                raise StorageError("object disappeared during pull")
+            current = self.storage.head(obj.key)
+            if current is None or current.etag != obj.etag or os.path.getsize(tmp) != obj.size:
+                raise StorageError("object changed during pull; retry")
+            with self._database().transaction() as conn:
+                os.replace(tmp, dest)
+                conn.execute("INSERT OR REPLACE INTO sync_media VALUES (?, ?, ?, ?)",
+                             (*identity, obj.etag))
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        return True
+
     def download_all_media(self, progress: Optional[Callable[[str], None]] = None) -> int:
         count = 0
         for uid, st in self.mirrored().items():
-            prefix = st.get("media_prefix")
-            if not prefix:
-                continue
-            for obj in self.storage.list(f"{prefix}/"):
-                rel = obj.key[len(prefix) + 1:]
-                dest = self.runs_dir / uid / rel
-                if dest.is_file() and dest.stat().st_size == obj.size:
-                    continue
-                self.storage.get_file(obj.key, str(dest))
-                count += 1
-                if progress is not None:
-                    progress(obj.key)
+            try:
+                prefix = _media_prefix(uid, st["media_prefix"]) + "/media/"
+                for obj in self.storage.list(prefix):
+                    try:
+                        if self._download_media(uid, prefix, obj):
+                            count += 1
+                            if progress is not None:
+                                progress(obj.key)
+                    except (StorageError, OSError, ValueError) as exc:
+                        self.run_errors.append(f"{obj.key}: {exc}")
+            except (StorageError, OSError, ValueError) as exc:
+                self.run_errors.append(f"{uid}: {exc}")
         return count
 
     # ── write-back from dashboards ──────────────────────────────
@@ -956,11 +1084,13 @@ class RemoteProject:
                 if row is None:
                     continue
                 uid, prefix = str(row["uid"]), str(row["media_prefix"] or "")
+                self._run_dir(uid)
+                _media_prefix(uid, prefix)
                 self.storage.put_bytes(_run_key(uid, DELETED), b"", "text/plain")
-                # The dashboard usually deleted the experiment already.
+                # Remove only the validated mirror directory.
                 with self._database().transaction() as conn:
                     self._remove_in(conn, uid)
-                shutil.rmtree(self.runs_dir / uid, ignore_errors=True)
+                shutil.rmtree(self._run_dir(uid), ignore_errors=True)
                 removed.append((uid, prefix))
 
         def purge() -> None:
@@ -1012,7 +1142,7 @@ def push_runs(
         problems: List[str] = []
         up = RunUploader(storage, db, int(row["id"]), warn=problems.append)
         try:
-            ok = up.sync(final=True)
+            ok = up.archive() if remove_local else up.sync(final=True)
         except Exception as exc:
             out(f"  failed  {label}: {exc}")
             failed += 1
@@ -1020,15 +1150,8 @@ def push_runs(
         if not ok:
             out(f"  skipped {label}: deleted from {display_uri(uri)}")
             continue
-        if remove_local:
-            if up.verify_uploaded():
-                remove_experiment_files(db.delete_experiment(int(row["id"])) or "", db)
-                out(f"  moved   {label}")
-                continue
-            out(f"  kept    {label}: upload could not be verified, local copy kept")
-            failed += 1
-            continue
-        out(f"  pushed  {label}")
+        action = "moved " if remove_local else "pushed"
+        out(f"  {action}  {label}")
     out(f"Runs are at {display_uri(uri)} — open with: vibetrack {shlex.quote(uri)}")
     return 1 if failed else 0
 
@@ -1043,6 +1166,11 @@ def pull(uri: str, dest: str, out: Callable[[str], None] = print) -> int:
             return 1
         n = remote.download_all_media()
         runs = len(remote.mirrored())
+        if remote.run_errors:
+            for error in remote.run_errors:
+                out(f"Error: {error}")
+            out(f"Incomplete pull into {dest}")
+            return 1
     finally:
         remote.close()
     out(f"Pulled {runs} run(s) and {n} media file(s) into {dest} — open with: vibetrack {shlex.quote(dest)}")

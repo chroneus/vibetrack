@@ -125,10 +125,9 @@ def save_public_config(data: Dict[str, Any], project: Optional[str] = None) -> N
     (which posts back the blanked config it loaded) doesn't erase them.
     """
     stored = _stored_scope(project)
-    merged = {k: v for k, v in data.items() if k not in CREDENTIAL_SECTIONS}
-    for key in CREDENTIAL_SECTIONS:
-        if key in stored:
-            merged[key] = stored[key]
+    editable = DEFAULT_CONFIG.keys() - set(CREDENTIAL_SECTIONS)
+    merged = {k: v for k, v in stored.items() if k not in editable}
+    merged.update({k: v for k, v in data.items() if k in editable})
     save_config(merged, project)
 
 

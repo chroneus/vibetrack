@@ -1313,15 +1313,18 @@ class WebOutput(BaseOutput):
             project = _body_str(body, "project", required=False) or self._reader.project
             name = _body_str(body, "name")
             db = self._reader.db
-            row = db.get_experiment_by_name(name, project=project) if (remote and db and name) else None
-            data, status = _handle_delete_experiment(db, name, project)
-            if remote is not None and status == 200 and row is not None:
+            if remote is not None and db is not None and name:
+                row = db.get_experiment_by_name(name, project=project)
+                if row is None:
+                    return JSONResponse({"error": "experiment not found"}, status_code=404)
                 try:
-                    remote.delete_runs([int(row["id"])])
+                    removed = remote.delete_runs([int(row["id"])])
                 except Exception as exc:
-                    return JSONResponse(
-                        {"error": f"deleted locally, but not from storage: {exc}"}, status_code=502
-                    )
+                    return JSONResponse({"error": f"storage deletion failed: {exc}"}, status_code=502)
+                if not removed:
+                    return JSONResponse({"error": "experiment changed; refresh and retry"}, status_code=409)
+                return JSONResponse({"ok": True})
+            data, status = _handle_delete_experiment(db, name, project)
             return JSONResponse(data, status_code=status)
 
         @app.delete("/api/project/{project}", dependencies=[Depends(_check_mutation)])
@@ -1332,14 +1335,17 @@ class WebOutput(BaseOutput):
             rows = db.list_experiments(project=project)
             if not rows:
                 return JSONResponse({"error": "not found"}, status_code=404)
-            db.delete_experiments_by_project(project)
             if remote is not None:
                 try:
-                    remote.delete_runs([int(r["id"]) for r in rows])
+                    removed = remote.delete_runs([int(r["id"]) for r in rows])
                 except Exception as exc:
                     return JSONResponse(
-                        {"error": f"deleted locally, but not from storage: {exc}"}, status_code=502
+                        {"error": f"storage deletion failed: {exc}"}, status_code=502
                     )
+                if len(removed) != len(rows):
+                    return JSONResponse({"error": "project changed; refresh and retry"}, status_code=409)
+                return JSONResponse({"ok": True})
+            db.delete_experiments_by_project(project)
             for row in rows:
                 log_dir = row["log_dir"] if hasattr(row, "__getitem__") else ""
                 if log_dir:
@@ -1382,6 +1388,16 @@ class WebOutput(BaseOutput):
 
         # ── Media ─────────────────────────────────────────────
 
+        inline_suffixes = set().union(*_ALLOWED_SUFFIXES.values(), _VIDEO_SUFFIXES,
+                                      {".bmp", ".flac", ".m4a", ".ogv"})
+
+        def media_response(path: str) -> FileResponse:
+            headers = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"}
+            if Path(path).suffix.lower() in inline_suffixes:
+                return FileResponse(path, headers=headers)
+            return FileResponse(path, filename=Path(path).name,
+                                media_type="application/octet-stream", headers=headers)
+
         @app.get("/media", dependencies=[Depends(_check_token)])
         def serve_media(path: str = "", proxy: int = 0):  # type: ignore[no-untyped-def]
             """Serve media files by absolute path.
@@ -1399,13 +1415,13 @@ class WebOutput(BaseOutput):
             if not _path_is_under(candidate, allowed_dirs):
                 return JSONResponse({"error": "not found"}, status_code=404)
             if os.path.isfile(candidate):
-                return FileResponse(candidate)
-            if remote is not None and not proxy:
+                return media_response(candidate)
+            if remote is not None and not proxy and Path(candidate).suffix.lower() in inline_suffixes:
                 url = remote.direct_url(candidate)
                 if url:
                     return RedirectResponse(url, status_code=307)
             if _local_media(candidate):
-                return FileResponse(candidate)
+                return media_response(candidate)
             return JSONResponse({"error": "not found"}, status_code=404)
 
         @app.get("/media/thumb", dependencies=[Depends(_check_token)])
@@ -1438,7 +1454,7 @@ class WebOutput(BaseOutput):
             if _is_video_path(candidate):
                 # The client falls back to decoding the first frame itself.
                 return JSONResponse({"error": "preview unavailable"}, status_code=422)
-            return FileResponse(candidate)
+            return media_response(candidate)
 
         @app.get("/api/video-timeline", dependencies=[Depends(_check_token)])
         def video_timeline(path: str = ""):

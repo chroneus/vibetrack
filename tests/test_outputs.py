@@ -1428,6 +1428,16 @@ class TestMediaThumbnails:
             assert thumb.format == "JPEG"
             assert thumb.size == (640, 160)
 
+    @pytest.mark.parametrize("route", ["/media", "/media/thumb"])
+    def test_generic_artifact_is_a_download(self, thumb_app, route):
+        app, media, _ = thumb_app
+        artifact = media / "report.html"
+        artifact.write_text("training report")
+        response = _call_app_route(app, route, path=str(artifact))
+        assert response.headers["content-disposition"].startswith("attachment;")
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.media_type == "application/octet-stream"
+
     def test_small_image_served_as_original(self, thumb_app):
         app, media, _Image = thumb_app
         original = media / "small" / "0.png"

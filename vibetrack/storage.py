@@ -225,7 +225,9 @@ class FileStorage(Storage):
                 yield ObjectInfo(key, st.st_size, f"{st.st_size}-{st.st_mtime_ns}", st.st_mtime)
 
     def delete(self, key: str) -> None:
-        path = self._path(key)
+        path = self.root / key
+        if path.parent.resolve() != path.parent or self.root not in path.parents:
+            raise ValueError(f"invalid storage deletion path: {key!r}")
         try:
             path.unlink()
         except FileNotFoundError:

@@ -136,3 +136,17 @@ class TestDeepMerge:
         result = _deep_merge(base, override)
         assert result["a"]["b"]["c"] == 99
         assert result["a"]["b"]["d"] == 2
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_public_save_accepts_settings_only(existing):
+    from vibetrack.config import save_public_config
+
+    if existing:
+        save_config({"slack": {"channel": "original"}})
+    save_public_config({"default": {}, "projects": {}, "slack": {},
+                        "web": {"theme": "dark"}})
+    stored = json.loads(config_path().read_text())
+    assert "default" not in stored and "projects" not in stored
+    assert stored.get("slack") == ({"channel": "original"} if existing else None)
+    assert load_config()["web"]["theme"] == "dark"

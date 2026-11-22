@@ -846,3 +846,93 @@ def test_s3_dashboard_streams_video_from_presigned_url(tmp_path, s3_endpoint, da
     # Small images still go through the local cache.
     img = exp["images"]["img"][0]["path"]
     assert client.get("/media", params={"path": img}).status_code == 200
+
+
+def test_snapshot_retry_publishes_a_base_before_deltas(tmp_path, monkeypatch):
+    db = _local_runs(tmp_path, names=("a",))
+    store = open_storage(_uri(tmp_path))
+    up = RunUploader(store, db, db.list_experiments()[0]["id"])
+    put = store.put_file
+
+    def fail_snapshot(key, *args):
+        if key.endswith("snap.db.gz"):
+            raise OSError("interrupted")
+        put(key, *args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "put_file", fail_snapshot)
+        with pytest.raises(OSError):
+            up.sync()
+    assert up.gen is None
+    assert up.sync()
+    assert pull(store.uri, str(tmp_path / "offline")) == 0
+    with RunReader(str(tmp_path / "offline")) as reader:
+        assert reader.experiments(project=None)[0].scalars("loss")[0]["value"] == 1
+    db.close()
+
+
+def test_archive_keeps_run_changed_after_snapshot(tmp_path, monkeypatch):
+    db = _local_runs(tmp_path, names=("a",))
+    eid = db.list_experiments()[0]["id"]
+    verify = RunUploader.verify_uploaded
+
+    def changed(up):
+        assert verify(up)
+        db.add_scalar(eid, "loss", 2, 1)
+        return True
+
+    monkeypatch.setattr(RunUploader, "verify_uploaded", changed)
+    assert push_runs(db, _uri(tmp_path), remove_local=True) == 1
+    assert db.get_experiment(eid) is not None
+    assert len(db.get_scalars(eid, "loss")) == 2
+    db.close()
+
+
+def test_pull_refreshes_media_and_reports_incomplete_backup(tmp_path):
+    db = _local_runs(tmp_path, names=("a",))
+    uri = _uri(tmp_path)
+    assert push_runs(db, uri) == 0
+    db.close()
+    source = next((tmp_path / "bucket").rglob("*.png"))
+    source.write_bytes(b"first")
+    dest = tmp_path / "offline"
+    assert pull(uri, str(dest)) == 0
+    source.write_bytes(b"other")
+    stat = source.stat()
+    os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    store = open_storage(uri)
+    store.put_bytes("_runs/0123456789abcdef/snap.db.gz", b"incomplete")
+    assert pull(uri, str(dest)) == 1
+    assert next(dest.rglob("*.png")).read_bytes() == b"other"
+
+
+def test_mirror_requires_canonical_run_ids_and_media_destinations(tmp_path):
+    from vibetrack.storage import ObjectInfo
+
+    remote = RemoteProject(_uri(tmp_path), cache_dir=str(tmp_path / "cache"))
+    with pytest.raises(ValueError):
+        remote._run_dir("old-format-id")
+    uid = "0123456789abcdef"
+    media = Path(remote._run_dir(uid)) / "media"
+    media.parent.mkdir(parents=True)
+    media.symlink_to(tmp_path, target_is_directory=True)
+    prefix = f"cv/a-{uid}/media/"
+    obj = ObjectInfo(prefix + "image.png", 0, "version", 0)
+    with pytest.raises(ValueError, match="destination"):
+        remote._download_media(uid, prefix, obj)
+
+
+def test_purge_requires_full_uid_ownership(tmp_path):
+    from vibetrack.sync import _media_prefix, _purge_run
+
+    store = open_storage(_uri(tmp_path))
+    uid = "0123456789abcdef"
+    legacy = "cv/a-" + uid[:8]
+    other = "cv/a-fedcba9876543210"
+    for prefix in (legacy, other):
+        store.put_bytes(prefix + "/media/sample", b"sample")
+    assert _media_prefix(uid, legacy) == legacy
+    _purge_run(store, uid, legacy)
+    with pytest.raises(ValueError):
+        _purge_run(store, uid, other)
+    assert all(store.exists(p + "/media/sample") for p in (legacy, other))

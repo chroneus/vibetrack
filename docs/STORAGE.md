@@ -62,11 +62,15 @@ with backoff.
 <prefix>/_runs/<uid>/d/<gen>-<seq>.json.gz  rows added after the snapshot
 <prefix>/_runs/<uid>/edit.json           rename/move made in a dashboard
 <prefix>/_runs/<uid>/deleted             delete marker
-<prefix>/<project>/<run>-<uid8>/media/<tag>/<step>.<ext>
+<prefix>/<project>/<run>-<uid>/media/<tag>/<step>.<ext>
 ```
 
 Each run writes only its own objects, so any number of machines can share one
 bucket. `uid` stays the same when a run is resumed on the same machine.
+New media directories use the full run ID. Earlier eight-digit directories
+remain readable. Deleting a legacy run leaves its media files in storage
+because the shortened ID cannot establish exclusive ownership.
+
 A snapshot is a normal vibetrack database: gunzip it to
 `some_dir/vibetrack.db` and run `vibetrack some_dir`.
 
@@ -116,7 +120,9 @@ vibetrack ./offline-copy
 
 Pushing again updates the same objects. Runs deleted from the bucket are
 skipped. `--remove-local` deletes a run locally only after its snapshot and
-every media file are confirmed in the bucket (sizes compared).
+every media file are confirmed in the bucket. It keeps runs marked as running
+and keeps the local copy if the source database changed during the upload.
+A partial pull copies the healthy runs and media and exits with an error.
 
 ## Settings
 

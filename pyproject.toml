@@ -42,6 +42,8 @@ all = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "httpx>=0.24.0",
+    # Test-only: a local S3 API server for the storage sync tests.
+    "moto[server]>=5.0",
 ]
 
 [project.scripts]

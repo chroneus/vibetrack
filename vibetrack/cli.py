@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .db import Database
+from .storage import is_remote_uri
 
 _MAX_UPLOAD_BYTES = 1024 * 1024 * 1024  # 1 GB
 _ALLOWED_SUFFIXES = {
@@ -88,6 +89,8 @@ def _parse_listen(s: str) -> Tuple[str, int]:
 def _normalize_project_folder(project_folder: Optional[str]) -> Optional[str]:
     if project_folder is None:
         return None
+    if is_remote_uri(project_folder):
+        return project_folder
     path = Path(project_folder).expanduser().resolve()
     if path.name == "vibetrack.db":
         return str(path.parent)
@@ -219,6 +222,8 @@ def _central_ingest_log_dir(name: str, project: Optional[str]) -> str:
 
 
 def _looks_like_project_folder(value: str) -> bool:
+    if is_remote_uri(value):
+        return True
     path = Path(value).expanduser()
     if path.exists():
         return True
@@ -267,6 +272,7 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
                 resume=True,
                 report=False,
                 track_status=False,
+                sync="",
             )
         return SummaryWriter(
             _central_ingest_log_dir(name, project_name),
@@ -276,6 +282,8 @@ def _create_listen_app(project_folder: Optional[str], token: Optional[str] = Non
             resume=True,
             report=False,
             track_status=False,
+            # One writer per request: syncing would re-upload every time.
+            sync="",
         )
 
     async def check_auth(request: Request):  # type: ignore[no-untyped-def]
@@ -605,6 +613,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "  vibetrack compare [RUN ...]  rank runs, diff params, tabulate metrics\n"
             "  vibetrack open [RUN]         open the dashboard on runs (starts it if needed)\n"
             "  vibetrack guide              instructions for AI coding agents (--install)\n"
+            "  vibetrack push [DIR] s3://…  upload runs to S3-compatible storage\n"
+            "  vibetrack pull s3://… DIR    copy runs (with media) from storage\n"
+            "\n"
+            "Synced storage: `vibetrack s3://bucket/prefix` opens the dashboard on runs\n"
+            "uploaded with VIBETRACK_SYNC=s3://bucket/prefix (see docs/STORAGE.md).\n"
             "\n"
             "AI agents: run `vibetrack guide` before instrumenting code."
         ),
@@ -614,7 +627,7 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PROJECT_FOLDER",
-        help="Project folder, or a subcommand: 'migrate', 'gradio'.",
+        help="Project folder, s3://bucket/prefix, or a subcommand: 'migrate', 'gradio'.",
     )
     parser.add_argument(
         "project_folder_pos",

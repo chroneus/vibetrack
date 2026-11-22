@@ -44,4 +44,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "telegram": {},
     "slack": {},
     "mcp": {},
+    # S3-compatible storage for synced runs (see docs/STORAGE.md):
+    # endpoint_url, region, addressing_style, verify, links, profile,
+    # access_key_id, secret_access_key. Never sent over the web API.
+    "s3": {},
 }

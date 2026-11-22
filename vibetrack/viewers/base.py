@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
 from ..reader import ExperimentReader, RunReader
+from ..storage import display_uri, is_remote_uri
 from .event import LogEvent
 
 
@@ -26,6 +27,10 @@ class BaseOutput(ABC):
     ) -> None:
         if project_folder is None:
             self.project_folder = None
+        elif is_remote_uri(project_folder):
+            # Synced storage (s3:// or file://) stays a URI; the reader
+            # mirrors it into a local cache.
+            self.project_folder = project_folder
         else:
             resolved = Path(project_folder).expanduser().resolve()
             if resolved.name == "vibetrack.db":
@@ -34,9 +39,16 @@ class BaseOutput(ABC):
         self.project = project
         self._reader = RunReader(project_folder, project=project)
 
+    @property
+    def is_remote(self) -> bool:
+        """True when this viewer shows runs from synced object storage."""
+        return self._reader.remote is not None
+
     def config_project(self) -> Optional[str]:
         if self.project is not None:
             return self.project
+        if self.project_folder is not None and is_remote_uri(self.project_folder):
+            return display_uri(self.project_folder).rstrip("/").rsplit("/", 1)[-1] or None
         if self.project_folder is not None:
             return Path(self.project_folder).name
         return Path.cwd().resolve().name

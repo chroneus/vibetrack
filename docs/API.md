@@ -92,6 +92,25 @@ On close, a compact report is printed to stderr: status, config, headline
 metrics, media paths, rank among the project's runs, the dashboard link and the
 next commands. Disable it with `report=False` or `VIBETRACK_REPORT=0`.
 
+A run that fails, is interrupted or logs nothing within its first 60 seconds
+(a bug at start-up, a wrong argument, Ctrl-C) is not kept: on close its rows,
+media files and any synced copy are deleted, and a one-line notice replaces
+the report. Runs that log data and finish, and resumed runs, are always kept. Change the limit with
+`discard_failed_secs=` or `VIBETRACK_DISCARD_FAILED_SECS`; `0` keeps every
+run.
+
+## Syncing to S3-compatible storage
+
+```python
+writer = SummaryWriter("runs/exp1", sync="s3://ml-runs/team?endpoint=https://minio.lab:9000")
+vibetrack.init(project="cv", name="r1", sync="file:///mnt/shared/runs")  # same for the module API
+```
+
+`sync=None` (the default) follows `VIBETRACK_SYNC`, and `sync=""` turns it off.
+New rows are uploaded every `VIBETRACK_SYNC_INTERVAL` seconds (default 60),
+and a final snapshot on close, failure or SIGTERM. Read synced runs with
+`RunReader("s3://…")` or `vibetrack s3://…`. See [STORAGE.md](STORAGE.md).
+
 ## Reading runs programmatically
 
 `vibetrack.insights` returns the same JSON-ready payloads as the CLI:

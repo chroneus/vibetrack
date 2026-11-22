@@ -6,23 +6,29 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .db import Database, central_db_path
+from .storage import is_remote_uri
 
 _log = logging.getLogger(__name__)
 
 
-def _load_artifact_json(abs_path: str) -> Dict[str, Any]:
+def _load_artifact_json(
+    abs_path: str, fetch: Optional[Callable[[str], bool]] = None
+) -> Dict[str, Any]:
     """Load a JSON artifact, logging (rather than swallowing) read errors.
 
     Returns the parsed payload, or ``{}`` if the file is missing or
     malformed. A ``WARNING`` is emitted with the failing path and
     exception so corrupted artifacts are visible in logs instead of
-    presenting as silently-empty data.
+    presenting as silently-empty data. *fetch* (a synced project's
+    ``Database.fetch_media``) downloads the file first when needed.
     """
     if not abs_path:
         return {}
+    if fetch is not None:
+        fetch(abs_path)
     try:
         with open(abs_path, "rb") as fh:
             return json.loads(fh.read())
@@ -59,6 +65,15 @@ class ExperimentReader:
     @property
     def log_dir(self) -> str:
         return str(self._experiment_row().get("log_dir", ""))
+
+    def ensure_local(self, abs_path: str) -> bool:
+        """True if *abs_path* is on disk; synced projects download it first."""
+        if not abs_path:
+            return False
+        fetch = self._db.fetch_media
+        if fetch is not None:
+            return fetch(abs_path)
+        return os.path.isfile(abs_path)
 
     def resolve_media_path(self, rel_path: str) -> str:
         """Resolve a stored media path to an absolute file path."""
@@ -237,7 +252,7 @@ class ExperimentReader:
         """Per-step PR-curve payloads with parsed precision/recall points."""
         out: List[Dict[str, Any]] = []
         for r in self.artifacts(tag):
-            payload = _load_artifact_json(r["abs_path"])
+            payload = _load_artifact_json(r["abs_path"], self._db.fetch_media)
             out.append(
                 {
                     "step": r["step"],
@@ -284,7 +299,7 @@ class ExperimentReader:
         """Per-step mesh payloads with parsed vertices / colors / faces."""
         out: List[Dict[str, Any]] = []
         for r in self.artifacts(tag):
-            payload = _load_artifact_json(r["abs_path"])
+            payload = _load_artifact_json(r["abs_path"], self._db.fetch_media)
             out.append(
                 {
                     "step": r["step"],
@@ -315,7 +330,7 @@ class ExperimentReader:
         """
         out: List[Dict[str, Any]] = []
         for r in self.artifacts(tag):
-            payload = _load_artifact_json(r["abs_path"])
+            payload = _load_artifact_json(r["abs_path"], self._db.fetch_media)
             meta = r.get("metadata") or {}
             sprite_rel = meta.get("sprite_path")
             sprite_abs = self.resolve_media_path(sprite_rel) if sprite_rel else None
@@ -439,13 +454,29 @@ class ExperimentReader:
 
 
 class RunReader:
-    """Read experiments from the central DB or an explicit local project DB."""
+    """Read experiments from the central DB, a local project DB, or synced storage.
+
+    *project_folder* may be an ``s3://`` / ``file://`` location: runs are then
+    read from a local mirror of that storage, kept up to date in the
+    background, with media fetched on first use (see :mod:`vibetrack.sync`).
+    """
 
     def __init__(
         self,
         project_folder: Optional[str] = None,
         project: Optional[str] = None,
     ) -> None:
+        self.remote: Any = None
+        if project_folder is not None and is_remote_uri(project_folder):
+            from .sync import RemoteProject
+
+            self.remote = RemoteProject(project_folder)
+            self.project_folder: Optional[Path] = self.remote.cache_dir
+            self.project = project
+            self.db_path = self.remote.db_path
+            self._db: Optional[Database] = None
+            self._discover()
+            return
         self.project_folder = (
             self._resolve_project_folder(project_folder)
             if project_folder is not None
@@ -488,9 +519,13 @@ class RunReader:
 
     def _discover(self) -> None:
         """Open or close the project DB as it appears or disappears."""
+        if self.remote is not None:
+            self.remote.maybe_refresh()
         if self.db_path.exists():
             if self._db is None:
                 self._db = Database(self.db_path)
+                if self.remote is not None:
+                    self._db.fetch_media = self.remote.ensure_local
             return
         if self._db is not None:
             self._db.close()
@@ -547,6 +582,8 @@ class RunReader:
         if self._db is not None:
             self._db.close()
             self._db = None
+        if self.remote is not None:
+            self.remote.close()
 
     def __enter__(self) -> "RunReader":
         return self

@@ -34,8 +34,10 @@ from urllib.parse import urlencode, urlparse
 from ..cli import _bearer_matches, _secret_equals
 from ..compare import find_all_tags  # noqa: F401  (re-exported for tests)
 from ..config import VIBETRACK_CONFIG_DIR, load_public_config, save_public_config
+from ..db import log_dir_in_use, remove_experiment_files
 from ..insights import run_card
 from ..reader import ExperimentReader, RunReader
+from ..storage import display_uri
 from .base import BaseOutput
 
 _WEB_DIR = Path(__file__).parent / "web"
@@ -288,6 +290,21 @@ def _video_poster(path: str, width: int, out: Path) -> Path:
         with suppress(OSError):
             tmp.unlink()
     return out
+
+
+def _remote_video_poster(remote: Any, path: str, width: int) -> Optional[Path]:
+    """Poster frame of a not-yet-downloaded synced video, read via a presigned URL."""
+    url = remote.direct_url(path, force=True)
+    if not url:
+        return None
+    key = hashlib.sha256(f"{path}\0remote\0{width}".encode()).hexdigest()
+    cache_dir = _THUMB_DIR / key[:2]
+    out = cache_dir / f"{key}.jpg"
+    if out.is_file():
+        return out
+    with _thumb_slots:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return _video_poster(url, width, out)
 
 
 def _image_thumbnail(path: str, width: int, cache_dir: Path, key: str) -> Optional[Path]:
@@ -742,33 +759,9 @@ def _path_is_under(candidate: str, roots: Sequence[str]) -> bool:
     return False
 
 
-def _log_dir_in_use(db: Any, log_dir: str) -> bool:
-    """True if any experiment still in *db* (any project) uses *log_dir*."""
-    target = os.path.realpath(log_dir)
-    return any(
-        row["log_dir"] and os.path.realpath(row["log_dir"]) == target
-        for row in db.list_experiments()
-    )
-
-
-def _cleanup_experiment_files(log_dir: str, db: Any = None) -> None:
-    """Remove media and the run directory if they are now empty.
-
-    Call after the experiment's rows are deleted. Skipped while another
-    experiment still uses the same directory: older remote-ingest servers
-    gave same-named runs in different projects one shared ``log_dir``, so
-    its media belongs to both.
-    """
-    if not log_dir:
-        return
-    if db is not None and _log_dir_in_use(db, log_dir):
-        logging.getLogger(__name__).info(
-            "keeping %s: still used by another experiment", log_dir
-        )
-        return
-    shutil.rmtree(os.path.join(log_dir, "media"), ignore_errors=True)
-    with suppress(OSError):
-        os.rmdir(log_dir)
+# Shared with the writer (discarded runs) and `vibetrack push --remove-local`.
+_log_dir_in_use = log_dir_in_use
+_cleanup_experiment_files = remove_experiment_files
 
 
 # ── Route handlers (extracted from closures) ────────────────────────────
@@ -1082,7 +1075,9 @@ class WebOutput(BaseOutput):
         app.mount("/static", StaticFiles(directory=str(_WEB_DIR)), name="static")
 
         config_project = self.config_project()
-        is_central = self.project_folder is None
+        # Synced storage may hold many projects, like the central DB.
+        is_central = self.project_folder is None or self.is_remote
+        remote = self._reader.remote
 
         def _all_projects() -> List[str]:
             db = self._reader.db
@@ -1176,6 +1171,25 @@ class WebOutput(BaseOutput):
                 raise HTTPException(status_code=400, detail=f"'{key}' must be a string")
             return value
 
+        def _write_back_edit(data: Dict[str, Any], status: int, project: Optional[str]) -> None:
+            """After a dashboard rename of a synced run, record it in storage."""
+            if remote is None or status != 200:
+                return
+            db = self._reader.db
+            row = db.get_experiment_by_name(data.get("new_name", ""), project=project) if db else None
+            if row is None:
+                return
+            try:
+                remote.push_edits(db, [int(row["id"])])
+            except Exception as exc:
+                data.update(ok=False, error=f"renamed locally, but not in storage: {exc}")
+
+        def _local_media(candidate: str) -> bool:
+            """The file is on disk, fetching it from synced storage if needed."""
+            if os.path.isfile(candidate):
+                return True
+            return remote is not None and remote.ensure_local(candidate)
+
         @app.get("/", dependencies=[Depends(_check_token)])
         def index(request: Request = None) -> Any:  # type: ignore[assignment]
             login = _login_redirect(request)
@@ -1239,6 +1253,7 @@ class WebOutput(BaseOutput):
                 "version": __version__,
                 "db_path": str(self._reader.db_path),
                 "project_folder": self.project_folder,
+                "storage": display_uri(self.project_folder) if self.is_remote else None,
             }
 
         # ── Config ────────────────────────────────────────────
@@ -1276,28 +1291,37 @@ class WebOutput(BaseOutput):
                 _body_str(body, "new_name"),
                 project,
             )
+            _write_back_edit(data, status, project)
             return JSONResponse(data, status_code=status)
 
         @app.post("/api/rename/{project}", dependencies=[Depends(_check_mutation)])
         async def rename_exp_project(request: Request, project: str) -> JSONResponse:
             body = await _read_json_object(request)
+            project = _body_str(body, "project", required=False) or project
             data, status = _handle_rename(
                 self._reader.db,
                 _body_str(body, "old_name"),
                 _body_str(body, "new_name"),
-                _body_str(body, "project", required=False) or project,
+                project,
             )
+            _write_back_edit(data, status, project)
             return JSONResponse(data, status_code=status)
 
         @app.delete("/api/experiment", dependencies=[Depends(_check_mutation)])
         async def delete_exp(request: Request) -> JSONResponse:
             body = await _read_json_object(request)
             project = _body_str(body, "project", required=False) or self._reader.project
-            data, status = _handle_delete_experiment(
-                self._reader.db,
-                _body_str(body, "name"),
-                project,
-            )
+            name = _body_str(body, "name")
+            db = self._reader.db
+            row = db.get_experiment_by_name(name, project=project) if (remote and db and name) else None
+            data, status = _handle_delete_experiment(db, name, project)
+            if remote is not None and status == 200 and row is not None:
+                try:
+                    remote.delete_runs([int(row["id"])])
+                except Exception as exc:
+                    return JSONResponse(
+                        {"error": f"deleted locally, but not from storage: {exc}"}, status_code=502
+                    )
             return JSONResponse(data, status_code=status)
 
         @app.delete("/api/project/{project}", dependencies=[Depends(_check_mutation)])
@@ -1309,6 +1333,13 @@ class WebOutput(BaseOutput):
             if not rows:
                 return JSONResponse({"error": "not found"}, status_code=404)
             db.delete_experiments_by_project(project)
+            if remote is not None:
+                try:
+                    remote.delete_runs([int(r["id"]) for r in rows])
+                except Exception as exc:
+                    return JSONResponse(
+                        {"error": f"deleted locally, but not from storage: {exc}"}, status_code=502
+                    )
             for row in rows:
                 log_dir = row["log_dir"] if hasattr(row, "__getitem__") else ""
                 if log_dir:
@@ -1318,6 +1349,11 @@ class WebOutput(BaseOutput):
         @app.post("/api/move-logdir", dependencies=[Depends(_check_mutation)])
         async def move_logdir(request: Request) -> JSONResponse:
             body = await _read_json_object(request)
+            if remote is not None:
+                return JSONResponse(
+                    {"error": "log directories of synced storage cannot be moved"},
+                    status_code=400,
+                )
             data, status = _handle_move_logdir(
                 self._reader.db,
                 _body_str(body, "old"),
@@ -1332,18 +1368,30 @@ class WebOutput(BaseOutput):
         )
         async def rename_project_route(request: Request, project: str) -> JSONResponse:
             body = await _read_json_object(request)
-            data, status = _handle_rename_project(
-                self._reader.db,
-                project,
-                _body_str(body, "new_name"),
-            )
+            db = self._reader.db
+            ids = [int(r["id"]) for r in db.list_experiments(project=project)] if (remote and db) else []
+            data, status = _handle_rename_project(db, project, _body_str(body, "new_name"))
+            if remote is not None and status == 200 and ids:
+                try:
+                    remote.push_edits(db, ids)
+                except Exception as exc:
+                    return JSONResponse(
+                        {"error": f"renamed locally, but not in storage: {exc}"}, status_code=502
+                    )
             return JSONResponse(data, status_code=status)
 
         # ── Media ─────────────────────────────────────────────
 
         @app.get("/media", dependencies=[Depends(_check_token)])
-        def serve_media(path: str = ""):  # type: ignore[no-untyped-def]
-            """Serve media files by absolute path."""
+        def serve_media(path: str = "", proxy: int = 0):  # type: ignore[no-untyped-def]
+            """Serve media files by absolute path.
+
+            For synced storage, videos and large files redirect to a
+            short-lived presigned URL so the browser streams them directly
+            (with seeking); everything else is fetched once into the local
+            cache. ``proxy=1`` forces the cache (same-origin, e.g. for
+            drawing video frames on a canvas).
+            """
             if not path:
                 return JSONResponse({"error": "not found"}, status_code=404)
             candidate = os.path.realpath(path)
@@ -1352,13 +1400,34 @@ class WebOutput(BaseOutput):
                 return JSONResponse({"error": "not found"}, status_code=404)
             if os.path.isfile(candidate):
                 return FileResponse(candidate)
+            if remote is not None and not proxy:
+                url = remote.direct_url(candidate)
+                if url:
+                    return RedirectResponse(url, status_code=307)
+            if _local_media(candidate):
+                return FileResponse(candidate)
             return JSONResponse({"error": "not found"}, status_code=404)
 
         @app.get("/media/thumb", dependencies=[Depends(_check_token)])
         def serve_media_thumb(path: str = "", w: int = 640):  # type: ignore[no-untyped-def]
             """Downscaled image, or a video's first frame, for grid previews."""
             candidate = os.path.realpath(path)
-            if not path or not _path_is_under(candidate, _get_media_roots(self._reader)) or not os.path.isfile(candidate):
+            if not path or not _path_is_under(candidate, _get_media_roots(self._reader)):
+                return JSONResponse({"error": "not found"}, status_code=404)
+            if (
+                remote is not None
+                and not os.path.isfile(candidate)
+                and _is_video_path(candidate)
+            ):
+                # Poster straight from storage: ffmpeg reads only the first
+                # frame over HTTP instead of downloading the whole video.
+                try:
+                    thumb = _remote_video_poster(remote, candidate, _thumb_bucket(w))
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    thumb = None
+                if thumb is not None:
+                    return FileResponse(thumb)
+            if not _local_media(candidate):
                 return JSONResponse({"error": "not found"}, status_code=404)
             try:
                 thumb = _media_thumbnail(candidate, _thumb_bucket(w))
@@ -1374,7 +1443,7 @@ class WebOutput(BaseOutput):
         @app.get("/api/video-timeline", dependencies=[Depends(_check_token)])
         def video_timeline(path: str = ""):
             candidate = os.path.realpath(path)
-            if not path or not _path_is_under(candidate, _get_media_roots(self._reader)) or not os.path.isfile(candidate):
+            if not path or not _path_is_under(candidate, _get_media_roots(self._reader)) or not _local_media(candidate):
                 return JSONResponse({"error": "not found"}, status_code=404)
             try:
                 stat = os.stat(candidate)
@@ -1386,7 +1455,7 @@ class WebOutput(BaseOutput):
 
         normalized_pf = (
             str(Path(self.project_folder).resolve())
-            if self.project_folder is not None
+            if self.project_folder is not None and not self.is_remote
             else None
         )
 
@@ -1401,6 +1470,8 @@ class WebOutput(BaseOutput):
                     resume=True,
                     report=False,
                     track_status=False,
+                    # One writer per request: syncing would re-upload every time.
+                    sync="",
                 )
             return SummaryWriter(
                 _central_ingest_log_dir(name, project_name),
@@ -1410,9 +1481,16 @@ class WebOutput(BaseOutput):
                 resume=True,
                 report=False,
                 track_status=False,
+                sync="",
             )
 
         def _ingest_project(project: str) -> str:
+            if self.is_remote:
+                raise HTTPException(
+                    status_code=400,
+                    detail="this dashboard shows synced storage; log runs with "
+                    "VIBETRACK_SYNC on the training machine instead of remote ingest",
+                )
             # Central mode turns the project into a directory name.
             if normalized_pf is not None:
                 return project

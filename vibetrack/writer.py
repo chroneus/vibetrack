@@ -129,6 +129,66 @@ def _track_open_writer(writer: "SummaryWriter") -> None:
         _ATEXIT_REGISTERED = True
 
 
+_SIGTERM_INSTALLED = False
+
+
+def _install_sigterm_handler() -> None:
+    """Make SIGTERM (e.g. a spot-instance preemption) finish open runs.
+
+    Installed only by writers that sync to storage, and only over the
+    default handler: open runs are recorded as ``interrupted`` and their
+    final upload runs before the process exits as it would have. An
+    existing Python handler is chained, ``SIG_IGN`` is respected.
+    """
+    global _SIGTERM_INSTALLED
+    if _SIGTERM_INSTALLED or threading.current_thread() is not threading.main_thread():
+        return
+    import signal
+
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is None:
+        return
+    try:
+        previous = signal.getsignal(sigterm)
+    except (ValueError, OSError):
+        return
+    if previous == signal.SIG_IGN:
+        return
+
+    def _on_sigterm(signum: int, frame: Any) -> None:
+        for writer in list(_OPEN_WRITERS):
+            try:
+                writer._finalize(KeyboardInterrupt("SIGTERM"))
+            except Exception:
+                pass
+        if callable(previous):
+            previous(signum, frame)
+            return
+        signal.signal(sigterm, signal.SIG_DFL)
+        os.kill(os.getpid(), sigterm)
+
+    try:
+        signal.signal(sigterm, _on_sigterm)
+    except (ValueError, OSError):
+        return
+    _SIGTERM_INSTALLED = True
+
+
+#: Runs that fail, are interrupted or log nothing within this many seconds of
+#: starting are deleted at close (``VIBETRACK_DISCARD_FAILED_SECS``; 0 keeps them).
+DISCARD_FAILED_SECS = 60.0
+
+
+def _env_seconds(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _env_flag(name: str, default: bool = True) -> bool:
     value = os.environ.get(name)
     if value is None or not value.strip():
@@ -585,6 +645,8 @@ class SummaryWriter:
         resume: bool = False,
         report: Optional[bool] = None,
         track_status: bool = True,
+        sync: Optional[str] = None,
+        discard_failed_secs: Optional[float] = None,
     ) -> None:
         """Open (or resume) an experiment row in the central / project DB.
 
@@ -625,6 +687,21 @@ class SummaryWriter:
                 ``VIBETRACK_REPORT`` environment variable (default on).
             track_status: Record the run lifecycle (running / finished /
                 failed / interrupted), process, command line and git commit.
+            sync: Also upload the run to object storage, e.g.
+                ``"s3://bucket/prefix?endpoint=https://minio:9000"`` (any
+                S3-compatible store) or ``"file:///mnt/shared/runs"``. Rows
+                added since the last pass go up every
+                ``VIBETRACK_SYNC_INTERVAL`` seconds (default 60), plus a final
+                snapshot on close, failure or SIGTERM. ``None`` follows the
+                ``VIBETRACK_SYNC`` environment variable; ``""`` disables it.
+                Open synced runs anywhere with ``vibetrack s3://bucket/prefix``.
+            discard_failed_secs: A run this writer creates that fails, is
+                interrupted or logs nothing within this many seconds of
+                starting (an early bug, a wrong argument, Ctrl-C) is deleted
+                at close: rows, media and any synced copy. ``None`` follows
+                ``VIBETRACK_DISCARD_FAILED_SECS`` (default 60); ``0`` keeps
+                every run. Runs that log data and finish, and resumed runs,
+                are always kept.
         """
         # Resolve log_dir — mimic TensorBoard's default behaviour
         if log_dir is None:
@@ -657,9 +734,15 @@ class SummaryWriter:
         self._track_status = track_status
         self._owner_pid = os.getpid()
         self._started = False
+        self._started_at: Optional[float] = None
+        #: This writer created the experiment (not a resume of an older one).
+        self._created_run = False
+        self._discard_failed_secs = discard_failed_secs
         self._finalized = False
         self._last_heartbeat = 0.0
         self._metric_defs: Dict[str, Dict[str, Any]] = {}
+        self._sync: Any = None
+        self._sync_ok: Optional[bool] = None
 
         # Adapter dispatch state (populated by .to(...))
         self._dispatchers: List[_Dispatcher] = []
@@ -727,6 +810,7 @@ class SummaryWriter:
                     project=self._project,
                     log_dir=self.log_dir,
                 )
+                self._created_run = True
 
             if not self._pending:
                 self._mark_started()
@@ -759,6 +843,18 @@ class SummaryWriter:
                 self._handle_runtime_error("store initial hparams", exc)
 
         _track_open_writer(self)
+
+        sync_uri = sync if sync is not None else os.environ.get("VIBETRACK_SYNC", "")
+        if sync_uri and sync_uri.strip():
+            try:
+                from .sync import RunSync
+
+                self._sync = RunSync(self, sync_uri.strip())
+                self._sync.start()
+                _install_sigterm_handler()
+            except Exception as exc:
+                self._sync = None
+                self._handle_runtime_error("start storage sync", exc)
 
         if system_metrics_interval > 0:
             try:
@@ -2265,10 +2361,22 @@ class SummaryWriter:
                 self._mark_ended(run_exc)
             except Exception as err:
                 self._handle_runtime_error("record run status", err)
-            try:
-                self._print_report()
-            except Exception as err:
-                self._handle_runtime_error("print run report", err)
+            if self._should_discard(run_exc):
+                try:
+                    self._discard_run(run_exc)
+                except Exception as err:
+                    self._handle_runtime_error("discard early-failed run", err)
+            else:
+                if self._sync is not None:
+                    # After _mark_ended, so the uploaded snapshot has the outcome.
+                    try:
+                        self._sync_ok = self._sync.close()
+                    except Exception as err:
+                        self._handle_runtime_error("final storage sync", err)
+                try:
+                    self._print_report()
+                except Exception as err:
+                    self._handle_runtime_error("print run report", err)
         try:
             if self._db is not None:
                 self._db.close()
@@ -2318,6 +2426,7 @@ class SummaryWriter:
             from ._runmeta import process_info
 
             now = time.time()
+            self._started_at = now
             info = process_info()
             if self._db.get_run_info(self._exp_id) is not None:
                 info["resumed_at"] = now
@@ -2402,6 +2511,85 @@ class SummaryWriter:
             heartbeat=now,
         )
 
+    def _discard_limit(self) -> float:
+        if self._discard_failed_secs is not None:
+            return float(self._discard_failed_secs)
+        return _env_seconds("VIBETRACK_DISCARD_FAILED_SECS", DISCARD_FAILED_SECS)
+
+    def _should_discard(self, exc: Optional[BaseException]) -> bool:
+        """True for a run this writer created that never got going.
+
+        Within the limit: it failed, was interrupted, or logged nothing (a
+        script that exited during setup, e.g. on a bad argument).
+        """
+        if not self._created_run or self._started_at is None or self._db is None:
+            return False
+        limit = self._discard_limit()
+        if limit <= 0 or time.time() - self._started_at >= limit:
+            return False
+        from ._runmeta import exit_status
+
+        if exit_status(exc)[0] in ("failed", "interrupted"):
+            return True
+        return self._logged_nothing()
+
+    def _logged_nothing(self) -> bool:
+        """No data besides the config and system metrics."""
+        from .insights import SYSTEM_PREFIXES
+
+        db = self._db
+        assert db is not None
+        if db._precache_active:
+            db._materialize()  # remaps self._exp_id to the stored row
+        counts = db.run_marks(self._exp_id)
+        if any(n for table, (_, n) in counts.items() if table not in ("hparams", "scalars")):
+            return False
+        if not counts["scalars"][1]:
+            return True
+        return all(t.startswith(SYSTEM_PREFIXES) for t in db.get_scalar_tags(self._exp_id))
+
+    def _discard_run(self, exc: Optional[BaseException]) -> None:
+        """Delete the run everywhere: synced copy, rows, media files."""
+        from ._runmeta import exit_status
+        from .db import remove_experiment_files
+
+        status, error = exit_status(exc)
+        elapsed = time.time() - (self._started_at or time.time())
+        if self._sync is not None:
+            try:
+                self._sync.discard()
+            except Exception as err:
+                self._handle_runtime_error("discard synced run", err)
+        db = self._db
+        assert db is not None
+        if db._precache_active:
+            db._materialize()  # remaps self._exp_id to the stored row
+        remove_experiment_files(db.delete_experiment(self._exp_id) or "", db)
+
+        wanted = self._report if self._report is not None else _env_flag("VIBETRACK_REPORT")
+        if not wanted:
+            return
+        from .insights import fmt_duration
+
+        head = f"== vibetrack: run {self._run_name!r} "
+        took = fmt_duration(elapsed)
+        if status == "failed":
+            head += f"FAILED after {took}"
+            reason = str((error or {}).get("error") or "").strip()
+            if reason:
+                head += f": {reason.splitlines()[0]}"
+        elif status == "interrupted":
+            head += f"interrupted after {took}"
+        else:
+            head += f"ended after {took} without logging anything"
+        print(
+            f"{head} | project {self._project!r}\n"
+            f"discarded: runs that fail, are interrupted or log nothing within "
+            f"{self._discard_limit():g}s are not kept (keep them: VIBETRACK_DISCARD_FAILED_SECS=0)",
+            file=sys.stderr,
+            flush=True,
+        )
+
     def _print_report(self) -> None:
         """Print the end-of-run digest that coding agents read from stderr."""
         if self._db is None or self._pending:
@@ -2419,6 +2607,13 @@ class SummaryWriter:
             else None
         )
         text = end_of_run_report(self._db, self._exp_id, project_folder=folder)
+        if text and self._sync is not None and self._sync_ok:
+            import shlex
+
+            from .storage import display_uri
+
+            uri = self._sync.uri
+            text += f"\nSynced to {display_uri(uri)}; view anywhere: vibetrack {shlex.quote(uri)}"
         if text:
             print(text, file=sys.stderr, flush=True)
 
@@ -2451,6 +2646,7 @@ class SummaryWriter:
                     log_dir=new_log_dir,
                 )
                 self._run_name = new_name
+                self._created_run = True
             self._pending = False
             self._pending_existing_id = None
             self._pending_max_step = None

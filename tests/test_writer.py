@@ -343,7 +343,8 @@ class TestSummaryWriter:
         assert len(db.get_scalars(exp["id"], "v")) == 1
         db.close()
 
-    def test_config_stored(self, project_folder):
+    def test_config_stored(self, project_folder, monkeypatch):
+        monkeypatch.setenv("VIBETRACK_DISCARD_FAILED_SECS", "0")  # a run that logs nothing
         run_dir = str(project_folder / "configured")
         cfg = {"lr": 0.001, "epochs": 10}
         with SummaryWriter(run_dir, config=cfg, project_folder=str(project_folder)):
@@ -779,7 +780,8 @@ class TestSummaryWriter:
         assert len(rows) == 1
         db.close()
 
-    def test_concurrent_startup_same_run_does_not_error(self, project_folder):
+    def test_concurrent_startup_same_run_does_not_error(self, project_folder, monkeypatch):
+        monkeypatch.setenv("VIBETRACK_DISCARD_FAILED_SECS", "0")  # runs that log nothing
         log_dir = str(project_folder / "shared_run")
         errors = []
 

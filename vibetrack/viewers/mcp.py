@@ -442,6 +442,11 @@ def _compare_image_lpips_payload(
             "candidate_experiment": candidate.name,
         }
 
+    # Synced (s3://) projects fetch media on first use.
+    for exp, entry in ((reference, reference_entry), (candidate, candidate_entry)):
+        fetch = getattr(exp, "ensure_local", None)
+        if callable(fetch):
+            fetch(entry.get("abs_path", ""))
     reference_img, reference_error = _load_rgb_image(
         reference_entry.get("abs_path", "")
     )

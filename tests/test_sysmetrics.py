@@ -216,8 +216,9 @@ class TestGPUCollector:
 
 
 class TestWriterIntegration:
-    def test_system_metrics_logged(self, tmp_path):
+    def test_system_metrics_logged(self, tmp_path, monkeypatch):
         """System metrics appear as scalars after running for a bit."""
+        monkeypatch.setenv("VIBETRACK_DISCARD_FAILED_SECS", "0")  # logs only system metrics
         log_dir = str(tmp_path / "runs" / "sysint")
         w = SummaryWriter(
             log_dir,
@@ -296,8 +297,9 @@ class TestWriterIntegration:
         assert any("system/" in t for t in tags), f"Expected system tags, got: {tags}"
         db.close()
 
-    def test_metrics_accumulate_over_multiple_intervals(self, tmp_path):
+    def test_metrics_accumulate_over_multiple_intervals(self, tmp_path, monkeypatch):
         """Running for multiple collection intervals must produce multiple rows per tag."""
+        monkeypatch.setenv("VIBETRACK_DISCARD_FAILED_SECS", "0")  # logs only system metrics
         log_dir = str(tmp_path / "runs" / "multiinterval")
         w = SummaryWriter(
             log_dir,

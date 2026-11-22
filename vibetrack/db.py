@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import logging
+import shutil
 import sqlite3
 import threading
 import time
@@ -127,6 +129,47 @@ CREATE TABLE IF NOT EXISTS run_info (
 """
 
 
+#: Per-experiment tables a synced run carries, with their data columns
+#: (everything except ``experiment_id``). ``run_info`` travels separately.
+RUN_TABLES: Dict[str, Tuple[str, ...]] = {
+    "scalars": ("tag", "step", "value", "wall_time"),
+    "texts": ("tag", "step", "value", "wall_time"),
+    "images": ("tag", "step", "path", "wall_time"),
+    "histograms": ("tag", "step", "bins", "counts", "wall_time"),
+    "hparams": ("key", "value"),
+    "audio": ("tag", "step", "path", "sample_rate", "wall_time"),
+    "video": ("tag", "step", "path", "wall_time"),
+    "artifacts": ("tag", "step", "path", "metadata", "wall_time"),
+}
+
+
+def _relative_media_path(path: Any, log_dir: str) -> Any:
+    """*path* relative to *log_dir* when it is an absolute path inside it."""
+    if not isinstance(path, str) or not log_dir or not os.path.isabs(path):
+        return path
+    prefix = log_dir.rstrip("/\\") + os.sep
+    return path[len(prefix):] if path.startswith(prefix) else path
+
+
+def _create_plain_db(path: Path) -> None:
+    """Create a schema-only database in rollback-journal mode.
+
+    Snapshots are shipped as one file, so they must not keep rows in a WAL
+    side file.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.executescript(_SCHEMA_SQL)
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+            (str(_SCHEMA_VERSION),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def central_db_dir() -> Path:
     """Return ``~/.vibetrack/``."""
     return Path.home() / ".vibetrack"
@@ -140,6 +183,35 @@ def central_db_path() -> Path:
 def open_central_db() -> "Database":
     """Open (or create) the system-wide central database."""
     return Database(central_db_path())
+
+
+def log_dir_in_use(db: Any, log_dir: str) -> bool:
+    """True if any experiment still in *db* (any project) uses *log_dir*."""
+    target = os.path.realpath(log_dir)
+    return any(
+        row["log_dir"] and os.path.realpath(row["log_dir"]) == target
+        for row in db.list_experiments()
+    )
+
+
+def remove_experiment_files(log_dir: str, db: Any = None) -> None:
+    """Remove a deleted experiment's media, and its run directory if now empty.
+
+    Call after the experiment's rows are deleted. Skipped while another
+    experiment in *db* still uses the same directory: older remote-ingest
+    servers gave same-named runs in different projects one shared
+    ``log_dir``, so its media belongs to both.
+    """
+    if not log_dir:
+        return
+    if db is not None and log_dir_in_use(db, log_dir):
+        _log.info("keeping %s: still used by another experiment", log_dir)
+        return
+    shutil.rmtree(os.path.join(log_dir, "media"), ignore_errors=True)
+    try:
+        os.rmdir(log_dir)
+    except OSError:
+        pass
 
 
 class Database:
@@ -164,6 +236,10 @@ class Database:
         # manual release/re-acquire pattern, which leaked the lock if
         # the re-acquire ever failed.
         self._lock = threading.RLock()
+        #: Set by readers of a synced (s3:// / file://) project: called with
+        #: an absolute media path, fetches the file if needed and returns
+        #: whether it now exists locally. ``None`` for ordinary databases.
+        self.fetch_media: Optional[Callable[[str], bool]] = None
 
         # ── Precache state ──────────────────────────────────────
         self._precache_secs = precache_secs
@@ -942,6 +1018,318 @@ class Database:
                 (new_log_dir, experiment_id),
             )
             return cur.rowcount > 0
+
+    # ── Single-run export / import (storage sync) ───────────────
+    #
+    # A synced run travels as a one-experiment snapshot DB plus deltas of
+    # rows added after it. Copies use ATTACH + INSERT … SELECT, so they stay
+    # fast for runs with millions of scalars.
+
+    def run_marks(self, experiment_id: int) -> Dict[str, Tuple[int, int]]:
+        """``{table: (max rowid, row count)}`` for one experiment's rows."""
+        out: Dict[str, Tuple[int, int]] = {}
+        with self._connect() as conn:
+            for table in RUN_TABLES:
+                row = conn.execute(
+                    f"SELECT COALESCE(MAX(rowid), 0), COUNT(*) FROM {table} "
+                    "WHERE experiment_id=?",
+                    (experiment_id,),
+                ).fetchone()
+                out[table] = (int(row[0]), int(row[1]))
+        return out
+
+    def run_delta(
+        self,
+        experiment_id: int,
+        since: Dict[str, int],
+        log_dir: str = "",
+    ) -> Tuple[Dict[str, List[list]], Dict[str, int]]:
+        """Rows added after *since* (``{table: rowid}``) and the new marks.
+
+        Media paths under *log_dir* come back relative to it.
+        """
+        rows_out: Dict[str, List[list]] = {}
+        marks: Dict[str, int] = {}
+        with self._connect() as conn:
+            for table, cols in RUN_TABLES.items():
+                last = int(since.get(table, 0))
+                rows = conn.execute(
+                    f"SELECT rowid, {', '.join(cols)} FROM {table} "
+                    "WHERE experiment_id=? AND rowid>? ORDER BY rowid",
+                    (experiment_id, last),
+                ).fetchall()
+                marks[table] = int(rows[-1][0]) if rows else last
+                if not rows:
+                    continue
+                path_idx = cols.index("path") if "path" in cols else -1
+                out_rows = []
+                for r in rows:
+                    vals = list(r[1:])
+                    if path_idx >= 0:
+                        vals[path_idx] = _relative_media_path(vals[path_idx], log_dir)
+                    out_rows.append(vals)
+                rows_out[table] = out_rows
+        return rows_out, marks
+
+    def export_experiment(
+        self,
+        experiment_id: int,
+        dest: str | Path,
+        meta: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, int]:
+        """Write one experiment into a new database file at *dest*.
+
+        The copy gets experiment id 1, media paths relative to its log_dir,
+        and *meta* in its ``meta`` table. Returns the ``{table: rowid}``
+        marks the copy is consistent with (for later :meth:`run_delta`).
+        """
+        dest = Path(dest)
+        if dest.exists():
+            dest.unlink()
+        _create_plain_db(dest)
+        conn = self._get_conn()
+        conn.commit()
+        conn.execute("ATTACH DATABASE ? AS snap", (str(dest),))
+        try:
+            marks: Dict[str, int] = {}
+            conn.execute("BEGIN")
+            exp = conn.execute(
+                "SELECT log_dir FROM experiments WHERE id=?", (experiment_id,)
+            ).fetchone()
+            if exp is None:
+                raise KeyError(f"no experiment {experiment_id}")
+            log_dir = str(exp[0] or "")
+            conn.execute(
+                "INSERT INTO snap.experiments(id, name, project, log_dir, config, created_at) "
+                "SELECT 1, name, project, log_dir, config, created_at "
+                "FROM main.experiments WHERE id=?",
+                (experiment_id,),
+            )
+            for table, cols in RUN_TABLES.items():
+                row = conn.execute(
+                    f"SELECT COALESCE(MAX(rowid), 0) FROM main.{table} WHERE experiment_id=?",
+                    (experiment_id,),
+                ).fetchone()
+                marks[table] = int(row[0])
+                col_sql = ", ".join(cols)
+                conn.execute(
+                    f"INSERT INTO snap.{table}(experiment_id, {col_sql}) "
+                    f"SELECT 1, {col_sql} FROM main.{table} "
+                    "WHERE experiment_id=? AND rowid<=? ORDER BY rowid",
+                    (experiment_id, marks[table]),
+                )
+                if "path" in cols and log_dir:
+                    prefix = log_dir.rstrip("/\\") + os.sep
+                    conn.execute(
+                        f"UPDATE snap.{table} SET path=substr(path, ?) "
+                        "WHERE substr(path, 1, ?)=?",
+                        (len(prefix) + 1, len(prefix), prefix),
+                    )
+            conn.execute(
+                "INSERT INTO snap.run_info"
+                "(experiment_id, status, started_at, ended_at, heartbeat, info) "
+                "SELECT 1, status, started_at, ended_at, heartbeat, info "
+                "FROM main.run_info WHERE experiment_id=?",
+                (experiment_id,),
+            )
+            for key, value in (meta or {}).items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO snap.meta(key, value) VALUES (?, ?)",
+                    (key, str(value)),
+                )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("DETACH DATABASE snap")
+        return marks
+
+    @contextmanager
+    def transaction(
+        self, attach: Optional[Dict[str, str | Path]] = None
+    ) -> Iterator[sqlite3.Connection]:
+        """One ``BEGIN IMMEDIATE`` write transaction on this thread's connection.
+
+        Commits when the block ends, rolls back if it raises. *attach* maps
+        schema names to database files attached for the duration (SQLite
+        cannot attach inside a transaction). Holding the write lock from the
+        first read makes read-check-write sequences safe across processes.
+        """
+        if self._precache_active:
+            self._materialize()
+        conn = self._get_conn()
+        conn.commit()
+        attached: List[str] = []
+        try:
+            for alias, path in (attach or {}).items():
+                if not alias.isidentifier():
+                    raise ValueError(f"invalid schema name {alias!r}")
+                conn.execute(f"ATTACH DATABASE ? AS {alias}", (str(path),))
+                attached.append(alias)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except BaseException:
+                conn.rollback()
+                raise
+            conn.commit()
+        finally:
+            for alias in attached:
+                conn.execute(f"DETACH DATABASE {alias}")
+
+    def import_snapshot(
+        self,
+        src: str | Path,
+        *,
+        replace_id: Optional[int] = None,
+        name: Optional[str] = None,
+        project: Optional[str] = None,
+        log_dir: str = "",
+    ) -> int:
+        """Import the single experiment in snapshot *src*; return its new id.
+
+        *replace_id* is deleted in the same transaction, so readers never see
+        the run missing or half-imported. A ``(project, name)`` already used
+        by another experiment gets the next ``" (N)"`` suffix.
+        """
+        with self.transaction(attach={"src": src}) as conn:
+            return self.import_attached_snapshot(
+                conn, replace_id=replace_id, name=name, project=project, log_dir=log_dir
+            )
+
+    def import_attached_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        replace_id: Optional[int] = None,
+        name: Optional[str] = None,
+        project: Optional[str] = None,
+        log_dir: str = "",
+    ) -> int:
+        """:meth:`import_snapshot` inside ``transaction(attach={"src": ...})``."""
+        exp = conn.execute(
+            "SELECT id, name, project, config, created_at FROM src.experiments "
+            "ORDER BY id LIMIT 1"
+        ).fetchone()
+        if exp is None:
+            raise ValueError("snapshot holds no experiment")
+        src_id = int(exp["id"])
+        if replace_id is not None:
+            self.delete_rows_in(conn, replace_id)
+        target_project = exp["project"] if project is None else project
+        target_name = self._free_name(
+            conn, exp["name"] if name is None else name, target_project
+        )
+        cur = conn.execute(
+            "INSERT INTO main.experiments(name, project, log_dir, config, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (target_name, target_project, log_dir, exp["config"], exp["created_at"]),
+        )
+        new_id = int(cur.lastrowid)  # type: ignore[arg-type]
+        for table, cols in RUN_TABLES.items():
+            col_sql = ", ".join(cols)
+            conn.execute(
+                f"INSERT INTO main.{table}(experiment_id, {col_sql}) "
+                f"SELECT ?, {col_sql} FROM src.{table} WHERE experiment_id=? "
+                "ORDER BY rowid",
+                (new_id, src_id),
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO main.run_info"
+            "(experiment_id, status, started_at, ended_at, heartbeat, info) "
+            "SELECT ?, status, started_at, ended_at, heartbeat, info "
+            "FROM src.run_info WHERE experiment_id=?",
+            (new_id, src_id),
+        )
+        return new_id
+
+    def apply_delta(
+        self,
+        experiment_id: int,
+        rows: Dict[str, List[list]],
+        run_info: Optional[Dict[str, Any]] = None,
+        config: Any = None,
+    ) -> None:
+        """Append rows produced by :meth:`run_delta`, in one transaction."""
+        with self.transaction() as conn:
+            self.apply_delta_in(conn, experiment_id, rows, run_info=run_info, config=config)
+
+    def apply_delta_in(
+        self,
+        conn: sqlite3.Connection,
+        experiment_id: int,
+        rows: Dict[str, List[list]],
+        run_info: Optional[Dict[str, Any]] = None,
+        config: Any = None,
+    ) -> None:
+        """:meth:`apply_delta` inside a caller's :meth:`transaction`."""
+        for table, table_rows in rows.items():
+            cols = RUN_TABLES.get(table)
+            if cols is None or not table_rows:
+                continue
+            verb = "INSERT OR REPLACE" if table == "hparams" else "INSERT"
+            marks = ", ".join("?" for _ in range(len(cols) + 1))
+            conn.executemany(
+                f"{verb} INTO {table}(experiment_id, {', '.join(cols)}) VALUES ({marks})",
+                [(experiment_id, *r[: len(cols)]) for r in table_rows if len(r) >= len(cols)],
+            )
+        if run_info is not None:
+            self._write_run_info(conn, experiment_id, run_info)
+        if config is not None:
+            conn.execute(
+                "UPDATE experiments SET config=? WHERE id=?",
+                (json.dumps(config) if not isinstance(config, str) else config, experiment_id),
+            )
+
+    def set_name_and_project(self, experiment_id: int, name: str, project: str) -> str:
+        """Set an experiment's name/project, suffixing on collision; return the name."""
+        with self.transaction() as conn:
+            return self.set_name_and_project_in(conn, experiment_id, name, project)
+
+    def set_name_and_project_in(
+        self, conn: sqlite3.Connection, experiment_id: int, name: str, project: str
+    ) -> str:
+        """:meth:`set_name_and_project` inside a caller's :meth:`transaction`."""
+        row = conn.execute(
+            "SELECT name, project FROM experiments WHERE id=?", (experiment_id,)
+        ).fetchone()
+        if row is None:
+            return name
+        if row["name"] == name and row["project"] == project:
+            return name
+        final = self._free_name(conn, name, project, exclude_id=experiment_id)
+        conn.execute(
+            "UPDATE experiments SET name=?, project=? WHERE id=?",
+            (final, project, experiment_id),
+        )
+        return final
+
+    @staticmethod
+    def delete_rows_in(conn: sqlite3.Connection, experiment_id: int) -> None:
+        """Delete one experiment and its rows inside a caller's :meth:`transaction`."""
+        for table in list(RUN_TABLES) + ["run_info"]:
+            conn.execute(f"DELETE FROM main.{table} WHERE experiment_id=?", (experiment_id,))
+        conn.execute("DELETE FROM main.experiments WHERE id=?", (experiment_id,))
+
+    @staticmethod
+    def _free_name(
+        conn: sqlite3.Connection, name: str, project: str, exclude_id: Optional[int] = None
+    ) -> str:
+        taken = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM main.experiments WHERE project=? AND id IS NOT ? "
+                "AND (name=? OR name LIKE ?)",
+                (project, exclude_id, name, f"{name} (%"),
+            )
+        }
+        if name not in taken:
+            return name
+        n = 2
+        while f"{name} ({n})" in taken:
+            n += 1
+        return f"{name} ({n})"
 
     # ── Scalars ─────────────────────────────────────────────────
 

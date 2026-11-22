@@ -152,7 +152,7 @@ def exit_status(exc: Optional[BaseException]) -> Tuple[str, Optional[Dict[str, A
     if exc is None:
         return "finished", None
     if isinstance(exc, KeyboardInterrupt):
-        return "interrupted", {"error": "KeyboardInterrupt"}
+        return "interrupted", {"error": str(exc) or "KeyboardInterrupt"}
     if isinstance(exc, SystemExit):
         if exc.code in (0, None):
             return "finished", None

@@ -162,6 +162,12 @@ With `vibetrack[all]`, `vibetrack` (the dashboard) also serves MCP at
 ## Reference
 
 - Disable the end-of-run report: `VIBETRACK_REPORT=0` or `init(..., report=False)`.
+- A run that fails, is interrupted or logs nothing within 60 s is deleted on close (stderr says
+  `discarded`), so it is missing from `ls`. Read the traceback from the script's
+  output; keep such runs with `VIBETRACK_DISCARD_FAILED_SECS=0`.
 - Skip git metadata: `VIBETRACK_GIT=0`.
+- Runs synced to S3-compatible storage (`VIBETRACK_SYNC=s3://bucket/prefix?endpoint=…`):
+  pass the same location as `--project-folder` to `ls` / `show` / `compare` / `open`.
+  `show` downloads the latest images so their paths can be opened.
 - Media files: `<log_dir>/media/<tag>/<step>.<ext>`; `log_dir` defaults to `./<project>/<name>`.
 - Full API: https://github.com/chroneus/vibetrack/blob/main/docs/API.md

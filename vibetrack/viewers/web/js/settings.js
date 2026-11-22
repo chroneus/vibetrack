@@ -98,6 +98,31 @@ function _wireSettingsInputs() {
 
 // ── Project Info ────────────────────────────────────────────
 function buildProjectInfo() {
+  // Runs from synced storage (s3://, file://) live in a local cache: show
+  // where they are stored instead of offering to move cache folders.
+  fetch('/api/info').then(r => r.ok ? r.json() : {}).catch(() => ({})).then(info => {
+    if (info && info.storage) _buildStorageInfo(info.storage);
+    else _buildLogDirInfo();
+  });
+}
+
+function _buildStorageInfo(storage) {
+  const card = document.getElementById('project-info-card');
+  const content = document.getElementById('project-info-content');
+  if (!card || !content) return;
+  card.style.display = '';
+  content.innerHTML = '';
+  const row = document.createElement('div');
+  row.className = 'settings-row';
+  row.innerHTML = '<label style="min-width:auto;flex:none;">Storage</label>';
+  const value = document.createElement('code');
+  value.textContent = storage;
+  value.style.cssText = 'flex:1;font-size:0.82em;';
+  row.appendChild(value);
+  content.appendChild(row);
+}
+
+function _buildLogDirInfo() {
   // Show parent (project) directories, not individual timestamped run dirs
   const parentDirs = [...new Set(DATA.map(e => {
     const d = e.log_dir; if (!d) return null;

@@ -39,6 +39,16 @@ def _record(tmp_path, name="run"):
         return exp.run_info(), insights.run_status(exp)
 
 
+@pytest.fixture(autouse=True)
+def keep_early_failures(monkeypatch):
+    """These tests inspect how failed runs are recorded, so keep them.
+
+    Discarding runs that fail within the first minute is tested in
+    ``TestDiscardEarlyFailures``.
+    """
+    monkeypatch.setenv("VIBETRACK_DISCARD_FAILED_SECS", "0")
+
+
 def _script_env():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
@@ -212,6 +222,199 @@ class TestProcessExit:
         assert rec["status"] == "running"  # never closed...
         assert st["status"] == "crashed"  # ...but the process is gone
         assert "process exited" in st["error"]
+
+
+def _names(tmp_path):
+    db = Database(tmp_path / "proj" / "vibetrack.db")
+    try:
+        return sorted(r["name"] for r in db.list_experiments())
+    finally:
+        db.close()
+
+
+def _image():
+    np = pytest.importorskip("numpy")
+    return np.full((4, 4, 3), 100, dtype=np.uint8)
+
+
+class TestDiscardEarlyFailures:
+    """Runs that fail or are interrupted in their first minute are not kept."""
+
+    @pytest.fixture(autouse=True)
+    def default_limit(self, monkeypatch):
+        monkeypatch.delenv("VIBETRACK_DISCARD_FAILED_SECS", raising=False)
+
+    def test_early_exception_deletes_run_and_media(self, tmp_path, capsys):
+        with pytest.raises(ValueError):
+            with _writer(tmp_path, name="keep", report=False) as w:
+                w.add_scalar("loss", 1.0, 0)
+            with _writer(tmp_path, name="buggy") as w:
+                w.add_scalar("loss", 1.0, 0)
+                w.add_image("img", _image(), 0, dataformats="HWC")
+                log_dir = Path(w.log_dir)
+                assert (log_dir / "media").is_dir()
+                raise ValueError("bad shape")
+        assert _names(tmp_path) == ["keep"]
+        assert not log_dir.exists()
+        err = capsys.readouterr().err
+        assert "run 'buggy' FAILED after 0s: ValueError: bad shape" in err
+        assert "discarded" in err and "VIBETRACK_DISCARD_FAILED_SECS=0" in err
+
+    def test_early_ctrl_c_is_discarded(self, tmp_path):
+        with pytest.raises(KeyboardInterrupt):
+            with _writer(tmp_path) as w:
+                w.add_scalar("loss", 1.0, 0)
+                raise KeyboardInterrupt
+        assert _names(tmp_path) == []
+
+    def test_short_finished_run_is_kept(self, tmp_path):
+        with _writer(tmp_path) as w:
+            w.add_scalar("loss", 1.0, 0)
+        assert _names(tmp_path) == ["run"]
+
+    def test_failure_after_the_limit_is_kept(self, tmp_path):
+        with pytest.raises(ValueError):
+            with _writer(tmp_path, discard_failed_secs=0.2) as w:
+                w.add_scalar("loss", 1.0, 0)
+                time.sleep(0.3)
+                raise ValueError("late")
+        rec, _ = _record(tmp_path)
+        assert rec["status"] == "failed"
+
+    @pytest.mark.parametrize("how", ["kwarg", "env"])
+    def test_zero_keeps_every_run(self, tmp_path, monkeypatch, how):
+        kwargs = {"discard_failed_secs": 0} if how == "kwarg" else {}
+        if how == "env":
+            monkeypatch.setenv("VIBETRACK_DISCARD_FAILED_SECS", "0")
+        with pytest.raises(ValueError):
+            with _writer(tmp_path, **kwargs) as w:
+                w.add_scalar("loss", 1.0, 0)
+                raise ValueError("boom")
+        assert _names(tmp_path) == ["run"]
+
+    def test_resumed_run_failing_early_is_kept(self, tmp_path):
+        with _writer(tmp_path) as w:
+            w.add_scalar("loss", 1.0, 0)
+        with pytest.raises(ValueError):
+            with _writer(tmp_path, resume=True) as w:
+                w.add_scalar("loss", 2.0, 1)
+                raise ValueError("boom")
+        rec, _ = _record(tmp_path)
+        assert rec["status"] == "failed"
+        with RunReader(str(tmp_path / "proj")) as reader:
+            assert len(reader.experiment("run").scalars("loss")) == 2
+
+    def test_restarted_run_failing_early_keeps_the_original(self, tmp_path):
+        with _writer(tmp_path) as w:
+            w.add_scalar("loss", 1.0, 5)
+        with pytest.raises(ValueError):
+            with _writer(tmp_path) as w:
+                w.add_scalar("loss", 2.0, 0)  # step <= 5: a new "run (2)"
+                raise ValueError("boom")
+        assert _names(tmp_path) == ["run"]
+
+    def test_media_of_a_shared_log_dir_is_kept(self, tmp_path):
+        shared = str(tmp_path / "logs" / "shared")
+        with SummaryWriter(shared, name="a", project="demo", project_folder=str(tmp_path / "proj"),
+                           system_metrics_interval=0) as w:
+            w.add_image("img", _image(), 0, dataformats="HWC")
+        with pytest.raises(ValueError):
+            with SummaryWriter(shared, name="b", project="demo",
+                               project_folder=str(tmp_path / "proj"),
+                               system_metrics_interval=0) as w:
+                w.add_image("img", _image(), 1, dataformats="HWC")
+                raise ValueError("boom")
+        assert _names(tmp_path) == ["a"]
+        assert (Path(shared) / "media" / "img" / "0.png").is_file()
+
+    def test_run_that_logged_nothing_is_discarded(self, tmp_path, capsys):
+        with _writer(tmp_path, config={"lr": 0.1}):
+            pass  # config only: the script stopped before its first step
+        assert _names(tmp_path) == []
+        assert "ended after 0s without logging anything" in capsys.readouterr().err
+
+    def test_run_with_only_system_metrics_is_discarded(self, tmp_path):
+        w = _writer(tmp_path)
+        w._db.add_scalar(w.experiment_id, "system/cpu_percent", 5.0, 0)
+        w.close()
+        assert _names(tmp_path) == []
+
+    @pytest.mark.parametrize("log", ["text", "hparams-metric"])
+    def test_any_logged_data_keeps_a_finished_run(self, tmp_path, log):
+        with _writer(tmp_path) as w:
+            if log == "text":
+                w.add_text("notes", "hello", 0)
+            else:
+                w.add_hparams({"lr": 0.1}, {"hparam/acc": 0.5})
+        assert _names(tmp_path) == ["run"]
+
+    def test_exit_on_bad_argument_is_discarded(self, tmp_path):
+        """``sys.exit(2)`` during setup (argparse) is not even recorded as failed."""
+        script = tmp_path / "train.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""
+                import sys, vibetrack
+                vibetrack.init(project="demo", name="run", project_folder={str(tmp_path / 'proj')!r},
+                               log_dir={str(tmp_path / 'logs' / 'run')!r}, system_metrics_interval=0)
+                sys.exit(2)
+                """
+            )
+        )
+        env = _script_env()
+        env.pop("VIBETRACK_DISCARD_FAILED_SECS", None)
+        proc = subprocess.run([sys.executable, str(script)], env=env, capture_output=True, text=True)
+        assert proc.returncode == 2
+        assert _names(tmp_path) == []
+
+    @pytest.mark.skipif(not hasattr(signal, "SIGINT") or os.name == "nt", reason="POSIX only")
+    def test_ctrl_c_in_a_real_process_is_discarded(self, tmp_path):
+        script = tmp_path / "train.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""
+                import time, vibetrack
+                vibetrack.init(project="demo", name="run", project_folder={str(tmp_path / 'proj')!r},
+                               log_dir={str(tmp_path / 'logs' / 'run')!r}, system_metrics_interval=0)
+                vibetrack.log({{"loss": 1.0}}, step=0)
+                print("ready", flush=True)
+                time.sleep(60)
+                """
+            )
+        )
+        env = _script_env()
+        env.pop("VIBETRACK_DISCARD_FAILED_SECS", None)
+        proc = subprocess.Popen(
+            [sys.executable, str(script)], env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        assert proc.stdout.readline().strip() == "ready"
+        proc.send_signal(signal.SIGINT)
+        _, err = proc.communicate(timeout=30)
+        assert "interrupted after" in err and "discarded" in err
+        assert _names(tmp_path) == []
+
+    def test_uncaught_exception_at_exit_is_discarded(self, tmp_path):
+        script = tmp_path / "train.py"
+        script.write_text(
+            textwrap.dedent(
+                f"""
+                import vibetrack
+                vibetrack.init(project="demo", name="run", project_folder={str(tmp_path / 'proj')!r},
+                               log_dir={str(tmp_path / 'logs' / 'run')!r}, system_metrics_interval=0)
+                vibetrack.log({{"loss": 1.0}}, step=0)
+                raise RuntimeError("CUDA out of memory")
+                """
+            )
+        )
+        env = _script_env()
+        env.pop("VIBETRACK_DISCARD_FAILED_SECS", None)
+        proc = subprocess.run([sys.executable, str(script)], env=env, capture_output=True, text=True)
+        assert proc.returncode != 0
+        assert "RuntimeError: CUDA out of memory" in proc.stderr  # Python's traceback
+        assert "discarded" in proc.stderr
+        assert _names(tmp_path) == []
+        assert not (tmp_path / "logs" / "run").exists()
 
 
 class TestReport:

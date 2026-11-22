@@ -1,4 +1,5 @@
-"""Agent-friendly CLI commands: ``ls``, ``show``, ``compare``, ``open``, ``guide``.
+"""Agent-friendly CLI commands: ``ls``, ``show``, ``compare``, ``open``, ``guide``,
+plus ``push`` / ``pull`` for object storage (``s3://``, ``file://``).
 
 Dispatched from :func:`vibetrack.cli.main` before the viewer parser, so
 ``vibetrack``, ``vibetrack PROJECT_FOLDER`` and friends behave as before.
@@ -21,8 +22,9 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 from . import insights
 from .reader import ExperimentReader, RunReader
+from .storage import is_remote_uri
 
-COMMANDS = ("ls", "show", "compare", "open", "guide")
+COMMANDS = ("ls", "show", "compare", "open", "guide", "push", "pull")
 
 _GUIDE_FILE = Path(__file__).with_name("agent_guide.md")
 _AGENTS_START = "<!-- vibetrack:start -->"
@@ -65,11 +67,13 @@ def _emit_json(payload: Any) -> None:
 
 def _open_reader(args: argparse.Namespace) -> Tuple[RunReader, Optional[str]]:
     folder = args.project_folder or os.environ.get("VIBETRACK_PROJECT_FOLDER") or None
-    if folder is not None:
+    if folder is not None and not is_remote_uri(folder):
         folder = str(Path(folder).expanduser().resolve())
         if Path(folder).name == "vibetrack.db":
             folder = str(Path(folder).parent)
     reader = RunReader(folder)
+    if reader.remote is not None and reader.remote.last_error:
+        raise CommandError(f"Cannot read {folder}: {reader.remote.last_error}")
     if reader.db is None:
         where = f"{folder}/vibetrack.db" if folder else str(reader.db_path)
         hint = _local_db_hint() if folder is None else ""
@@ -149,6 +153,24 @@ def cmd_ls(args: argparse.Namespace) -> int:
     return 0
 
 
+_FETCH_KINDS = ("image", "figure", "audio")
+
+
+def _fetch_latest_media(exp: ExperimentReader, ov: Any) -> None:
+    """Download a synced run's latest images so the listed paths can be opened.
+
+    Videos and artifacts can be large, so they stay in storage until opened
+    in the dashboard (which streams videos directly).
+    """
+    for kind, tags in (ov.get("media") or {}).items():
+        if kind not in _FETCH_KINDS:
+            continue
+        for entry in tags.values():
+            path = entry.get("latest")
+            if isinstance(path, str):
+                exp.ensure_local(path)
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     reader, folder = _open_reader(args)
     if args.run:
@@ -163,6 +185,8 @@ def cmd_show(args: argparse.Namespace) -> int:
             raise CommandError("No runs found.")
         exp = pool[0]
     ov = insights.run_overview(exp, include_system=args.system)
+    if reader.remote is not None:
+        _fetch_latest_media(exp, ov)
     if args.json:
         _emit_json(ov)
     else:
@@ -370,6 +394,39 @@ def cmd_guide(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_push(args: argparse.Namespace) -> int:
+    from .db import Database
+    from .reader import RunReader as _Reader
+    from .sync import push_runs
+
+    targets = list(args.targets)
+    dest_idx = next((i for i, t in enumerate(targets) if is_remote_uri(t)), None)
+    if dest_idx is None:
+        raise CommandError("push needs a destination such as s3://bucket/prefix or file:///path")
+    before, uri, runs = targets[:dest_idx], targets[dest_idx], targets[dest_idx + 1:]
+    if len(before) > 1:
+        raise CommandError("push takes at most one PROJECT_FOLDER before the destination")
+    folder = before[0] if before else args.project_folder
+    db_path = _Reader._resolve_db_path(folder)
+    if not db_path.exists():
+        raise CommandError(f"No vibetrack database at {db_path}.")
+    db = Database(db_path)
+    try:
+        return push_runs(db, uri, project=args.project, names=runs or None,
+                         remove_local=args.remove_local, out=_emit)
+    finally:
+        db.close()
+
+
+def cmd_pull(args: argparse.Namespace) -> int:
+    from .sync import pull
+
+    if not is_remote_uri(args.source):
+        raise CommandError("pull needs a source such as s3://bucket/prefix or file:///path")
+    dest = str(Path(args.dest).expanduser().resolve())
+    return pull(args.source, dest, out=_emit)
+
+
 # ── Parser ───────────────────────────────────────────────────────
 
 
@@ -378,7 +435,7 @@ def _add_scope(parser: argparse.ArgumentParser) -> None:
         "--project-folder",
         default=None,
         metavar="DIR",
-        help="Folder holding a project-local vibetrack.db (default: central ~/.vibetrack/vibetrack.db; env VIBETRACK_PROJECT_FOLDER)",
+        help="Folder holding a project-local vibetrack.db, or synced storage such as s3://bucket/prefix (default: central ~/.vibetrack/vibetrack.db; env VIBETRACK_PROJECT_FOLDER)",
     )
     parser.add_argument("-p", "--project", default=None, help="Only runs of this project")
 
@@ -423,6 +480,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", default=".", help="Project root for --install (default: .)")
     p.add_argument("--no-agents-md", action="store_true", help="With --install: skip AGENTS.md")
     p.set_defaults(func=cmd_guide)
+
+    p = sub.add_parser(
+        "push",
+        help="Upload runs to object storage: push [PROJECT_FOLDER] s3://bucket/prefix [RUN ...]",
+    )
+    p.add_argument("targets", nargs="+", metavar="ARG",
+                   help="[PROJECT_FOLDER] DESTINATION [RUN ...]; DESTINATION is s3://… or file://…")
+    _add_scope(p)
+    p.add_argument("--remove-local", action="store_true",
+                   help="Delete each run's local rows and media once its upload is verified")
+    p.set_defaults(func=cmd_push)
+
+    p = sub.add_parser("pull", help="Copy all runs (with media) from object storage into a folder")
+    p.add_argument("source", help="s3://bucket/prefix or file:///path")
+    p.add_argument("dest", help="Folder to create or update; open it later with `vibetrack DEST`")
+    p.set_defaults(func=cmd_pull)
     return parser
 
 

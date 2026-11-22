@@ -9,6 +9,8 @@ Key features:
 - Send experiment results elsewhere: Telegram, Slack, Jupyter, Gradio, and MCP.
 - Run locally while receiving experiment data over the network via REST API.
 - Use open formats: experiment data is stored in SQLite and local files.
+- Sync runs to any S3-compatible storage (MinIO, R2, B2, Ceph, AWS…) while
+  they train, and open them from anywhere: `vibetrack s3://bucket/prefix`.
 - Compare image-to-image results.
 - Use a rich UI to show, hide, delete, and customize runs.
 - TensorBoard SummaryWriter compatible drop-in APIs.
@@ -165,6 +167,28 @@ flowchart TB
 
 # FAQ
 
+## How do I store runs on S3 / MinIO and view them from anywhere?
+
+Set one environment variable on the training machine. Any S3-compatible store
+works, and there is nothing extra to install:
+
+```bash
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+export VIBETRACK_SYNC="s3://ml-runs/team?endpoint=https://minio.lab:9000"
+python train.py
+```
+
+New rows go up every minute, and the final snapshot on close or SIGTERM.
+Many machines can share one bucket. On any other machine:
+
+```bash
+vibetrack "s3://ml-runs/team?endpoint=https://minio.lab:9000"
+```
+
+Videos stream straight from the bucket, and renames and deletes in the
+dashboard are written back. See [STORAGE.md](https://github.com/chroneus/vibetrack/blob/main/docs/STORAGE.md)
+for providers, settings, `push` / `pull` and the bucket layout.
+
 ## How do I collect results from another server?
 
 Run a vibetrack ingest server on the machine that should receive results:
@@ -260,6 +284,10 @@ vibetrack show [RUN]                # One run in detail (default: latest)
 vibetrack compare [RUN|GLOB ...]    # Rank runs, diff params, compare metrics
 vibetrack open [RUN ...]            # Open the dashboard on runs (starts it if needed)
 vibetrack guide [--install]         # Instructions for AI coding agents
+
+vibetrack s3://bucket/prefix        # Dashboard on runs synced to S3-compatible storage
+vibetrack push [DIR] s3://…         # Upload existing runs (--remove-local to archive)
+vibetrack pull s3://… DIR           # Offline copy of synced runs, with media
 ```
 
 `ls`, `show` and `compare` accept `--json`. Add `--project-folder DIR` for

@@ -85,11 +85,11 @@ def load_config(project: Optional[str] = None) -> Dict[str, Any]:
     return result
 
 
-# Sections holding notification credentials and destinations (bot tokens,
-# webhooks, chat/channel ids). The web API neither returns nor overwrites
+# Sections holding credentials and destinations (bot tokens, webhooks,
+# chat/channel ids, S3 keys and endpoints). The web API neither returns nor overwrites
 # them: anyone who can reach it could otherwise read the tokens, or point
 # notifications (with logged media) at their own chat.
-CREDENTIAL_SECTIONS = ("telegram", "slack")
+CREDENTIAL_SECTIONS = ("telegram", "slack", "s3")
 
 
 def _stored_scope(project: Optional[str]) -> Dict[str, Any]:

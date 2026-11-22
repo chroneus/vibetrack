@@ -1033,7 +1033,9 @@ function _vidOpenCompare() {
   const videos = sel.map((s, i) => {
     const cell = document.createElement('div'); cell.className = 'vid-cmp-cell';
     const v = document.createElement('video');
-    v.preload = 'metadata'; v.muted = true; v.playsInline = true; v.src = mediaUrl(s.path);
+    v.preload = 'metadata'; v.muted = true; v.playsInline = true;
+    // proxy=1: same-origin even for synced storage, so frames can be drawn to a canvas.
+    v.src = mediaUrl(s.path) + '&proxy=1';
     const lbl = document.createElement('div'); lbl.className = 'cell-label';
     const title = document.createElement('strong');
     title.textContent = String.fromCharCode(65 + i) + ' · ' + s.exp;

@@ -107,6 +107,11 @@ vibetrack/
   or `__exit__`); an atexit hook closes still-open writers using
   `sys.last_value`; readers report a `running` run whose pid is gone as
   `crashed`. Ingest writers pass `track_status=False, report=False`.
+  A run the writer created (not a resume) that ends `failed` / `interrupted`,
+  or logged nothing but config and system metrics, within
+  `VIBETRACK_DISCARD_FAILED_SECS` (default 60) of starting is deleted
+  in `_finalize` — rows, media (`db.remove_experiment_files`) and the synced
+  copy (`RunSync.discard`) — instead of the final sync and report.
 - **Agent output**: `insights.py` is the single source for `vibetrack ls /
   show / compare`, the end-of-run report printed to stderr on close
   (`VIBETRACK_REPORT=0` disables it), the web Runs tab (`run` key of each
